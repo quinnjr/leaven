@@ -44,10 +44,10 @@
     "graphql": "^16.0.0"
   },
   "devDependencies": {
-    "@nestjs/common": "^11.0.20",
-    "@nestjs/core": "^11.0.20",
-    "@nestjs/graphql": "^13.0.6",
-    "@nestjs/testing": "^11.0.20",
+    "@nestjs/common": "^11.1.19",
+    "@nestjs/core": "^11.1.19",
+    "@nestjs/graphql": "^13.2.5",
+    "@nestjs/testing": "^11.1.19",
     "graphql": "^16.12.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",
