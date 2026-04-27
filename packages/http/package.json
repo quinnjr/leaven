@@ -44,7 +44,7 @@
     "@leaven-graphql/core": "workspace:*",
     "@leaven-graphql/context": "workspace:*",
     "@leaven-graphql/errors": "workspace:*",
-    "graphql": "^16.8.0"
+    "graphql": "^16.13.2"
   },
   "devDependencies": {
     "@types/bun": "^1.3.12",
