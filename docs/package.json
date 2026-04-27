@@ -42,7 +42,7 @@
     "@angular/cli": "^21.2.7",
     "@angular/compiler-cli": "^21.2.9",
     "@tailwindcss/postcss": "^4.2.2",
-    "jsdom": "^27.1.0",
+    "jsdom": "^29.1.0",
     "postcss": "^8.5.10",
     "tailwindcss": "^4.2.2",
     "typescript": "~5.9.2",
