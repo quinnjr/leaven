@@ -16,6 +16,8 @@
     "composite": true,
     "noEmit": true,
     "noFallthroughCasesInSwitch": true,
-    "noImplicitReturns": true
+    "noImplicitReturns": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true
   }
 }
