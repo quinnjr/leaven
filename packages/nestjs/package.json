@@ -33,7 +33,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@graphql-tools/schema": "^10.1.0",
+    "@graphql-tools/schema": "^10.1.1",
     "@leaven-graphql/context": "workspace:*",
     "@leaven-graphql/core": "workspace:*",
     "@leaven-graphql/errors": "workspace:*",
