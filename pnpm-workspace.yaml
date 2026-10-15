@@ -12,5 +12,8 @@ packages:
 # stopped reading that field, and ignores it with only a warning — overrides
 # declared there look applied but silently are not.
 overrides:
+  # magic-string >= 1.4 (via @angular/build 22.2) imports encodeRangeMappings,
+  # added in sourcemap-codec 1.6; older resolutions break the docs build.
+  '@jridgewell/sourcemap-codec': '^1.6.0'
   'ws@>=8.0.0 <8.21.0': '^8.21.1'
   'ws@>=7.0.0 <7.5.11': '^7.5.11'
