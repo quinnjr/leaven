@@ -1,6 +1,6 @@
 {
   "name": "@leaven-graphql/http",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Bun HTTP server integration for Leaven GraphQL",
   "type": "module",
   "main": "./src/index.ts",

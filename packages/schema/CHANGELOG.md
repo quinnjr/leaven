@@ -1,5 +1,11 @@
 # @leaven-graphql/schema
 
+## 0.2.1
+
+### Patch Changes
+
+- ec4f43e: Stop bundling dependencies into published builds. Every package now builds with `bun build --packages external`, so `graphql` and sibling `@leaven-graphql/*` packages are imported instead of inlined. Previously each package carried its own copy of graphql-js, so any schema built with the consumer's `graphql` failed with "Cannot use GraphQLSchema … from another module or realm". `graphql` is now a peer dependency only (and a dev dependency for builds/tests), so a single copy is shared with the application.
+
 ## 0.2.0
 
 ### Minor Changes

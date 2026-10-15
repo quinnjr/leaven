@@ -1,6 +1,6 @@
 {
   "name": "@leaven-graphql/errors",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Error handling utilities for Leaven GraphQL",
   "type": "module",
   "main": "./src/index.ts",
