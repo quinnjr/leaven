@@ -10,6 +10,7 @@
     "test:watch": "bun test packages/ --watch",
     "test:coverage": "bun test packages/ --coverage --coverage-reporter=text --coverage-reporter=lcov",
     "build": "pnpm -r build",
+    "check:dist": "bun run scripts/check-dist.ts",
     "clean": "pnpm -r clean",
     "lint": "eslint packages/",
     "lint:fix": "eslint packages/ --fix",
