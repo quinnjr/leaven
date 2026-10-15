@@ -1,6 +1,6 @@
 {
   "name": "@leaven-graphql/schema",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Schema building utilities for Leaven GraphQL",
   "type": "module",
   "main": "./src/index.ts",
