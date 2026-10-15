@@ -146,6 +146,9 @@ jobs:
       - name: Build packages
         run: pnpm build
 
+      - name: Check built packages
+        run: pnpm check:dist
+
   benchmark:
     name: Benchmark
     runs-on: ubuntu-latest
