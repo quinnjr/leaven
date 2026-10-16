@@ -7,6 +7,8 @@
  * Implements graphql-ws protocol
  */
 
+import { escapeLog } from '@leaven-graphql/core';
+
 /**
  * Message types as defined by graphql-ws protocol
  */
@@ -203,7 +205,9 @@ export function parseMessage(
     }
 
     if (typeof message.type !== 'string' || !VALID_MESSAGE_TYPES.has(message.type)) {
-      throw new Error(`Invalid message type: ${String(message.type)}`);
+      // Escaped and kept short: the handler sends this back as the close
+      // reason, which the WebSocket protocol caps at 123 bytes.
+      throw new Error(`Invalid message type: ${escapeLog(message.type, 12)}`);
     }
 
     if (

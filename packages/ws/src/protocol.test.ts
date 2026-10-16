@@ -99,6 +99,19 @@ describe('parseMessage', () => {
     expect(() => parseMessage('{"type":42}')).toThrow(/Invalid message type: 42/);
   });
 
+  test('should escape and bound an unknown type echoed in the error', () => {
+    let message = '';
+    try {
+      parseMessage(JSON.stringify({ type: `bad\n${'x'.repeat(500)}` }));
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message.startsWith('Invalid message type: bad\\n')).toBe(true);
+    expect(message).not.toContain('\n');
+    // The handler uses this as a WebSocket close reason, capped at 123 bytes
+    expect(new TextEncoder().encode(message).length).toBeLessThanOrEqual(123);
+  });
+
   test('should throw for invalid type', () => {
     expect(() => parseMessage('{"type":"invalid"}')).toThrow(/Invalid message type/);
   });

@@ -8,6 +8,7 @@
 import type { DocumentNode, GraphQLSchema } from 'graphql';
 import {
   LeavenExecutor,
+  escapeLog,
   type ExecutorConfig,
   type GraphQLRequest,
   type GraphQLResponse,
@@ -154,7 +155,7 @@ export class SubscriptionManager {
     // Never overwrite a registered id: the displaced subscription's iterator
     // would be orphaned, still running with nothing left to return() it
     if (existing?.has(subscriptionId)) {
-      throw new Error(`Subscription ${subscriptionId} already exists`);
+      throw new Error(`Subscription ${escapeLog(subscriptionId)} already exists`);
     }
 
     // Create subscription entry
@@ -226,13 +227,13 @@ export class SubscriptionManager {
               // keep a timeout distinguishable from a natural completion.
               logWarning(
                 this.logger,
-                `Subscription ${subscriptionId} timed out after ${this.subscriptionTimeout}ms`
+                `Subscription ${escapeLog(subscriptionId)} timed out after ${this.subscriptionTimeout}ms`
               );
               onComplete();
             }
           } catch (error) {
             this.logger.error(
-              `Error completing timed-out subscription ${subscriptionId}:`,
+              `Error completing timed-out subscription ${escapeLog(subscriptionId)}:`,
               error
             );
           } finally {

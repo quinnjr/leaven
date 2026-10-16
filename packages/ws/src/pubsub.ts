@@ -5,6 +5,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
+import { escapeLog } from '@leaven-graphql/core';
 import type { WebSocketLogger } from './logger';
 
 /**
@@ -102,7 +103,7 @@ export class PubSub implements PubSubEngine {
     }
 
     if (topicSubscribers.size >= this.maxSubscribersPerTopic) {
-      throw new Error(`Maximum subscribers reached for topic: ${topic}`);
+      throw new Error(`Maximum subscribers reached for topic: ${escapeLog(topic)}`);
     }
 
     const subscriber: Subscriber<T> = {
