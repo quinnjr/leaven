@@ -36,3 +36,6 @@ overrides:
   'proxy-addr@<2.0.8': '^2.0.8'
   'source-map-js@>=1.0.0 <1.2.2': '^1.2.2'
   'undici@>=8.0.0 <8.10.2': '^8.10.2'
+  # GHSA-7mx3-vvmw-hjmv (high): prototype pollution in mergeDeep. Reaches us
+  # via @nestjs/graphql and @graphql-tools/schema (nestjs package).
+  '@graphql-tools/utils@<=12.0.0': '^12.0.1'
