@@ -91,6 +91,20 @@ interface ConnectionState {
   initializing: boolean;
   /** Set synchronously at the start of `handleClose` */
   closed: boolean;
+  /**
+   * Operations accepted but not yet registered with the subscription
+   * manager, by id. A client `complete` for one of these cancels it, so when
+   * its setup resumes it registers nothing (and any iterator it obtained is
+   * returned) even if the id has since been reused.
+   */
+  pending: Map<string, PendingOperation>;
+}
+
+/**
+ * Cancellation token for one in-flight operation.
+ */
+interface PendingOperation {
+  cancelled: boolean;
 }
 
 /**
@@ -136,7 +150,7 @@ export class WebSocketHandler<TContext = unknown> {
   private stateOf(socket: ServerWebSocket<WebSocketContext>): ConnectionState {
     let state = this.states.get(socket);
     if (!state) {
-      state = { initializing: false, closed: false };
+      state = { initializing: false, closed: false, pending: new Map() };
       this.states.set(socket, state);
     }
     return state;
@@ -193,7 +207,7 @@ export class WebSocketHandler<TContext = unknown> {
       initialized: false,
       subscriptions: new Set(),
     };
-    this.states.set(socket, { initializing: false, closed: false });
+    this.states.set(socket, { initializing: false, closed: false, pending: new Map() });
 
     // Set connection init timeout
     const timeout = setTimeout(() => {
@@ -338,10 +352,30 @@ export class WebSocketHandler<TContext = unknown> {
       return;
     }
 
+    // Enforce the per-connection limit here too, counting operations still
+    // being set up: the manager only sees an operation once its hooks and
+    // context factory have run, so without this a burst of frames would run
+    // all of that work before any of them hit the manager's limit.
+    if (socket.data.subscriptions.size >= this.subscriptionManager.subscriptionLimit) {
+      socket.send(
+        formatMessage(
+          createErrorMessage(id, [{ message: 'Maximum subscriptions per connection reached' }])
+        )
+      );
+      return;
+    }
+
     // Register the ID synchronously, BEFORE any await, so a concurrent
     // Subscribe frame with the same ID is caught by the duplicate check
     // above while this one is still setting up
     socket.data.subscriptions.add(id);
+    const token: PendingOperation = { cancelled: false };
+    state.pending.set(id, token);
+    const settle = (): void => {
+      if (state.pending.get(id) === token) {
+        state.pending.delete(id);
+      }
+    };
 
     const request: GraphQLRequest = {
       query: payload.query,
@@ -351,8 +385,10 @@ export class WebSocketHandler<TContext = unknown> {
     };
 
     // Whether this operation was abandoned while it awaited: the socket
-    // closed. Nothing may be sent or registered for it after that.
-    const abandoned = (): boolean => state.closed;
+    // closed, or the client completed the id (which may since have been
+    // reused by a newer operation). Nothing may be sent, registered or
+    // cleaned up for it after that: the id is no longer this operation's.
+    const abandoned = (): boolean => state.closed || token.cancelled;
 
     try {
       // Call onSubscribe hook
@@ -386,6 +422,7 @@ export class WebSocketHandler<TContext = unknown> {
           socket.send(formatMessage(createCompleteMessage(id)));
         }
 
+        settle();
         socket.data.subscriptions.delete(id);
         this.invokeHook('onComplete hook', () => this.onComplete?.(socket, id));
         return;
@@ -411,8 +448,12 @@ export class WebSocketHandler<TContext = unknown> {
           this.invokeHook('onComplete hook', () => this.onComplete?.(socket, id));
         }
       );
+      // Registered (or already finished): a client complete is now handled
+      // by the manager's unsubscribe, which returns the iterator
+      settle();
     } catch (error) {
       if (abandoned()) return;
+      settle();
       // Per graphql-ws, operation setup failures are reported as an Error
       // message on the offending ID — the connection (and its other
       // subscriptions) must stay open
@@ -447,6 +488,15 @@ export class WebSocketHandler<TContext = unknown> {
     socket: ServerWebSocket<WebSocketContext>,
     subscriptionId: string
   ): void {
+    // Cancel an operation that is still being set up, so it registers
+    // nothing when it resumes
+    const state = this.stateOf(socket);
+    const pending = state.pending.get(subscriptionId);
+    if (pending) {
+      pending.cancelled = true;
+      state.pending.delete(subscriptionId);
+    }
+
     socket.data.subscriptions.delete(subscriptionId);
     // Scoped to THIS connection: operation ids are unique per connection, so
     // an unscoped teardown would drop another client's subscription
@@ -463,7 +513,12 @@ export class WebSocketHandler<TContext = unknown> {
     // Flag the close synchronously, before anything else: operations still
     // awaiting onConnect, a context factory or the executor check it when
     // they resume and must not register anything on a dead socket.
-    this.stateOf(socket).closed = true;
+    const state = this.stateOf(socket);
+    state.closed = true;
+    for (const pending of state.pending.values()) {
+      pending.cancelled = true;
+    }
+    state.pending.clear();
 
     // Clear timeouts/timers
     const initTimeout = this.initTimeouts.get(connectionId);

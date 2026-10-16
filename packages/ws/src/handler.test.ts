@@ -624,6 +624,102 @@ describe('WebSocketHandler', () => {
     });
   });
 
+  describe('subscription id reuse', () => {
+    test('should cancel a pending subscribe completed by the client before reusing its id', async () => {
+      const probes: IteratorProbe[] = [];
+      let contexts = 0;
+      const handler = createHandler(
+        {
+          // Only the first operation is slow to build its context
+          context: async () => {
+            if (contexts++ === 0) {
+              await new Promise((resolve) => setTimeout(resolve, 30));
+            }
+            return {};
+          },
+        },
+        probes
+      );
+      const socket = createFakeSocket();
+      await openAndInit(handler, socket);
+
+      const first = handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+      await handler.handleMessage(socket, '{"id":"sub-1","type":"complete"}');
+      await handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+      await first;
+
+      // The cancelled first operation never created a source stream, and did
+      // not overwrite the second one's registration
+      expect(probes.length).toBe(1);
+      expect(probes[0]!.returned).toBe(false);
+      expect(managerOf(handler).subscriptionCount).toBe(1);
+      expect(socket.data.subscriptions.has('sub-1')).toBe(true);
+      expect(socket.closed).toBeNull();
+      expect(frames(socket).some((f) => f.type === 'error')).toBe(false);
+
+      // Nothing was orphaned: closing releases the one live stream
+      await handler.handleClose(socket);
+      await waitFor(() => probes[0]!.returned);
+    });
+
+    test('should return the iterator of a pending subscribe completed during executor.subscribe', async () => {
+      const probes: IteratorProbe[] = [];
+      const handler = createHandler({}, probes);
+      const socket = createFakeSocket();
+      await openAndInit(handler, socket);
+
+      const first = handler.handleMessage(socket, SUBSCRIBE_SLOW);
+      await waitFor(() => probes.length === 1);
+      await handler.handleMessage(socket, '{"id":"sub-1","type":"complete"}');
+      await handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+      await first;
+
+      await waitFor(() => probes[0]!.returned);
+      expect(probes.length).toBe(2);
+      expect(probes[1]!.returned).toBe(false);
+      expect(managerOf(handler).subscriptionCount).toBe(1);
+      expect(managerOf(handler).getSubscription(socket.data.connectionId, 'sub-1')?.request.query).toBe(
+        'subscription { forever }'
+      );
+
+      await handler.handleClose(socket);
+    });
+
+    test('should count pending subscriptions against maxSubscriptionsPerConnection', async () => {
+      let contexts = 0;
+      const handler = createHandler({
+        subscriptionManager: { maxSubscriptionsPerConnection: 1 },
+        context: async () => {
+          contexts++;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          return {};
+        },
+      });
+      const socket = createFakeSocket();
+      await openAndInit(handler, socket);
+
+      await Promise.all([
+        handler.handleMessage(socket, SUBSCRIBE_FOREVER),
+        handler.handleMessage(
+          socket,
+          '{"id":"sub-2","type":"subscribe","payload":{"query":"subscription { forever }"}}'
+        ),
+      ]);
+
+      // The second was refused before any work was done for it
+      expect(contexts).toBe(1);
+      const errorFrames = frames(socket).filter((f) => f.type === 'error');
+      expect(errorFrames.map((f) => f.id)).toEqual(['sub-2']);
+      expect(errorFrames[0]?.payload?.[0]?.message).toMatch(
+        /Maximum subscriptions per connection reached/
+      );
+      expect(socket.data.subscriptions.has('sub-1')).toBe(true);
+      expect(socket.data.subscriptions.has('sub-2')).toBe(false);
+
+      await handler.handleClose(socket);
+    });
+  });
+
   describe('query and mutation operations', () => {
     // graphql-ws carries EVERY operation on a Subscribe frame; a query or
     // mutation gets a single Next followed by Complete

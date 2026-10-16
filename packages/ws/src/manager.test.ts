@@ -285,6 +285,73 @@ describe('SubscriptionManager', () => {
       manager.clear();
     });
 
+    test('should refuse to overwrite an existing subscription id', async () => {
+      const probes: IteratorProbe[] = [];
+      const manager = new SubscriptionManager({ schema: createTestSchema(probes) });
+
+      const original = await manager.subscribe(
+        'conn-1',
+        'sub-1',
+        { query: 'subscription { forever }' },
+        undefined,
+        () => {},
+        () => {},
+        () => {}
+      );
+
+      await expect(
+        manager.subscribe(
+          'conn-1',
+          'sub-1',
+          { query: 'subscription { forever }' },
+          undefined,
+          () => {},
+          () => {},
+          () => {}
+        )
+      ).rejects.toThrow(/already exists/);
+
+      // The original is untouched and still owns the id
+      expect(manager.getSubscription('conn-1', 'sub-1')).toBe(original);
+      expect(probes.length).toBe(1);
+      expect(probes[0]!.returned).toBe(false);
+
+      manager.clear();
+      expect(probes[0]!.returned).toBe(true);
+    });
+
+    test('should count pending subscriptions toward the per-connection limit', async () => {
+      const manager = new SubscriptionManager({
+        schema: createTestSchema(),
+        maxSubscriptionsPerConnection: 1,
+      });
+
+      const pending = manager.subscribe(
+        'conn-1',
+        'sub-1',
+        { query: 'subscription { slow }' },
+        undefined,
+        () => {},
+        () => {},
+        () => {}
+      );
+
+      await expect(
+        manager.subscribe(
+          'conn-1',
+          'sub-2',
+          { query: 'subscription { forever }' },
+          undefined,
+          () => {},
+          () => {},
+          () => {}
+        )
+      ).rejects.toThrow(/Maximum subscriptions per connection reached/);
+
+      await pending;
+      manager.clear();
+    });
+
     test('should track subscription status and metadata', async () => {
       const manager = new SubscriptionManager({ schema: createTestSchema() });
 

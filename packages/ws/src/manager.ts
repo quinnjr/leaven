@@ -95,6 +95,14 @@ export class SubscriptionManager {
   }
 
   /**
+   * Maximum number of subscriptions (pending or active) one connection may
+   * hold.
+   */
+  public get subscriptionLimit(): number {
+    return this.maxSubscriptionsPerConnection;
+  }
+
+  /**
    * Execute a single-result operation (query or mutation) on the same
    * executor that serves subscriptions, so both transports honour the same
    * limits and share the same caches.
@@ -119,10 +127,17 @@ export class SubscriptionManager {
     onComplete: () => void,
     onError: (errors: readonly { message: string }[]) => void
   ): Promise<Subscription> {
-    // Check subscription limit
+    // Check subscription limit. Entries are registered synchronously below,
+    // before the executor is awaited, so pending subscriptions count too.
     const existing = this.connections.get(connectionId);
     if (existing && existing.size >= this.maxSubscriptionsPerConnection) {
       throw new Error('Maximum subscriptions per connection reached');
+    }
+
+    // Never overwrite a registered id: the displaced subscription's iterator
+    // would be orphaned, still running with nothing left to return() it
+    if (existing?.has(subscriptionId)) {
+      throw new Error(`Subscription ${subscriptionId} already exists`);
     }
 
     // Create subscription entry
