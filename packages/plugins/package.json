@@ -1,6 +1,6 @@
 {
   "name": "@leaven-graphql/plugins",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Plugin system for Leaven GraphQL",
   "type": "module",
   "main": "./src/index.ts",
