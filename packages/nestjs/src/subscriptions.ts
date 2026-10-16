@@ -40,6 +40,7 @@ import {
 } from '@nestjs/common';
 import { parse, getOperationAST, type DocumentNode } from 'graphql';
 import type { ServerWebSocket } from 'bun';
+import { isValidOperationId } from '@leaven-graphql/ws';
 import { LeavenDriver, type HandlerResult } from './driver';
 import { wrapWithFilter, SUBSCRIPTION_FILTER_KEY } from './decorators';
 import {
@@ -520,6 +521,13 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
         typeof (parsed as { type?: unknown }).type !== 'string'
       ) {
         socket.close(4400, 'Bad Request');
+        return;
+      }
+      const { type, id } = parsed as { type: string; id?: unknown };
+      // Operation ids are client-chosen and end up in close reasons and log
+      // lines; reject anything outside the shared allow-list up front.
+      if ((type === 'subscribe' || type === 'complete') && !isValidOperationId(id)) {
+        socket.close(4400, 'Invalid message');
         return;
       }
       message = parsed as GraphQLWSMessage;
