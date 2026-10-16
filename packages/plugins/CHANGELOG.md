@@ -1,5 +1,12 @@
 # @leaven-graphql/plugins
 
+## 0.2.2
+
+### Patch Changes
+
+- Updated dependencies [6e305fc]
+  - @leaven-graphql/core@0.2.2
+
 ## 0.2.1
 
 ### Patch Changes

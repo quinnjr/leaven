@@ -1,6 +1,6 @@
 {
   "name": "@leaven-graphql/ws",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "WebSocket subscriptions support for Leaven GraphQL",
   "type": "module",
   "main": "./src/index.ts",
