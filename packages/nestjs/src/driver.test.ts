@@ -394,6 +394,35 @@ describe('LeavenDriver', () => {
       expect(logged.length).toBe(0);
     });
 
+    test('should bound the memo by bytes and skip oversized documents', async () => {
+      const internals = driver as unknown as {
+        analysisCache: Map<string, unknown>;
+        analysisBytes: number;
+      };
+      const perEntryCap = LeavenDriver.MAX_ANALYSIS_BYTES / 10;
+      // A comment pads the document without adding tokens
+      const oversized = `{ hello }\n#${'x'.repeat(Math.ceil(perEntryCap / 2))}`;
+
+      await driver.execute(oversized, undefined, makeContext());
+      expect(internals.analysisCache.size).toBe(0);
+      expect(internals.analysisBytes).toBe(0);
+
+      await driver.execute('{ hello }', undefined, makeContext());
+      expect(internals.analysisCache.size).toBe(1);
+      expect(internals.analysisBytes).toBeGreaterThan(0);
+
+      // Fill well past the byte budget with documents just under the cap
+      const nearCap = Math.floor(perEntryCap / 2) - 200;
+      for (let i = 0; i < 15; i++) {
+        await driver.execute(`{ hello }\n#${i}${'y'.repeat(nearCap)}`, undefined, makeContext());
+      }
+      expect(internals.analysisBytes).toBeLessThanOrEqual(LeavenDriver.MAX_ANALYSIS_BYTES);
+      expect(internals.analysisCache.size).toBeLessThan(16);
+
+      await driver.clearCaches();
+      expect(internals.analysisBytes).toBe(0);
+    });
+
     test('should key the memo by operation name', async () => {
       const query = 'query A { hello } query B { hello echo(message: "x") }';
 
