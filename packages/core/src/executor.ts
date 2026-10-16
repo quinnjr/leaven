@@ -536,7 +536,12 @@ export class LeavenExecutor {
         this.validationRules ? { rules: this.validationRules } : undefined
       );
 
-      this.cacheDocument(cacheKey, document, validation, parsed.cached);
+      // Only valid documents are cached. Caching rejects would let a client
+      // fill the cache with junk queries (evicting real entries, or growing a
+      // shared Redis without bound) at no cost beyond a failed request.
+      if (validation.valid) {
+        this.cacheDocument(cacheKey, document, validation, parsed.cached);
+      }
     }
 
     if (this.metricsEnabled) {

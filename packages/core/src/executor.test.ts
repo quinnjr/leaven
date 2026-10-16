@@ -8,6 +8,7 @@
 import { describe, test, expect, beforeEach, spyOn } from 'bun:test';
 import {
   buildSchema,
+  parse,
   GraphQLError,
   type GraphQLFormattedError,
 } from 'graphql';
@@ -579,6 +580,60 @@ describe('LeavenExecutor', () => {
       expect(warm.metrics?.documentCached).toBe(true);
       expect(warm.metrics?.validationCached).toBe(true);
       expect(calls).toEqual(['setWithValidation']);
+    });
+  });
+
+  describe('invalid document caching', () => {
+    test('should not cache a document that fails validation', async () => {
+      const cache = new DocumentCache();
+      const strict = new LeavenExecutor({ schema, rootValue, cache });
+
+      const result = await strict.execute({ query: '{ doesNotExist }' });
+      expect(result.response.errors).toBeDefined();
+
+      // Junk queries must not be able to fill (and evict real entries from)
+      // the document cache.
+      expect(cache.size).toBe(0);
+    });
+
+    test('should still cache a document that passes validation', async () => {
+      const cache = new DocumentCache();
+      const strict = new LeavenExecutor({ schema, rootValue, cache });
+
+      await strict.execute({ query: '{ hello }' });
+      expect(cache.size).toBe(1);
+    });
+
+    test('should not attach an invalid verdict to an already cached document', async () => {
+      const writes: string[] = [];
+      // A backend holding the document but no verdict, as `set()` leaves it
+      const documentOnly: IDocumentCache = {
+        get: () => null,
+        set: () => undefined,
+        getWithValidation: (key) => ({
+          document: parse(key.slice(key.indexOf('\x00') + 1)),
+        }),
+        setValidation: () => {
+          writes.push('setValidation');
+        },
+        setWithValidation: () => {
+          writes.push('setWithValidation');
+        },
+        has: () => false,
+        delete: () => false,
+        clear: () => undefined,
+        size: 0,
+        getStats: () => ({ size: 0, maxSize: 0, hitRate: 0, totalHits: 0, entries: 0 }),
+      };
+
+      const recorder = new LeavenExecutor({ schema, rootValue, cache: documentOnly });
+      const result = await recorder.execute({ query: '{ doesNotExist }' });
+      expect(result.response.errors).toBeDefined();
+      expect(writes).toEqual([]);
+
+      // A valid document still gets its verdict recorded
+      await recorder.execute({ query: '{ hello }' });
+      expect(writes).toEqual(['setValidation']);
     });
   });
 
