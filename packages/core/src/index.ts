@@ -34,4 +34,6 @@ export type { CompilerOptions, CompiledField, CompiledFragment } from './compile
 export { OperationRegistry, createOperationRegistry } from './registry';
 export type { OperationRegistryConfig, RegisteredOperation } from './registry';
 
+export { escapeLog, LOG_VALUE_MAX_LENGTH } from './escape-log';
+
 export * from './types';
