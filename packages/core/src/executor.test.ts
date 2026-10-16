@@ -19,7 +19,7 @@ import {
 } from '@leaven-graphql/errors';
 import { LeavenExecutor, createExecutor } from './executor';
 import type { GraphQLResponse } from './types';
-import { DocumentCache, type IDocumentCache } from './cache';
+import { DocumentCache, AST_BYTES_PER_QUERY_CHAR, type IDocumentCache } from './cache';
 
 const schema = buildSchema(`
   type Query {
@@ -729,6 +729,73 @@ describe('LeavenExecutor', () => {
 
       expect(cache.size).toBe(1);
       expect(compiledCount(executor)).toBe(1);
+    });
+
+    test('should not create entries for an operationName the document lacks', async () => {
+      const executor = limited(new DocumentCache());
+
+      for (let i = 0; i < 20; i++) {
+        const result = await executor.execute({
+          query: 'query A { hello }',
+          operationName: `Nope${i}`,
+        });
+        expect(result.response.errors).toBeDefined();
+      }
+      expect(compiledCount(executor)).toBe(0);
+    });
+
+    test('should not create entries when no operation can be selected', async () => {
+      const executor = limited(new DocumentCache());
+
+      const result = await executor.execute({ query: 'query A { hello } query B { hello }' });
+      expect(result.response.errors).toBeDefined();
+      expect(compiledCount(executor)).toBe(0);
+    });
+
+    test('should share one entry between a named and an implicit selection of one operation', async () => {
+      const executor = limited(new DocumentCache());
+
+      await executor.execute({ query: 'query A { hello }', operationName: 'A' });
+      await executor.execute({ query: 'query A { hello }' });
+      const third = await executor.execute({ query: 'query A { hello }', operationName: 'A' });
+
+      expect(third.response.errors).toBeUndefined();
+      expect(compiledCount(executor)).toBe(1);
+    });
+
+    test('should keep separate entries for different operations of one document', async () => {
+      const executor = limited(new DocumentCache());
+      const query = 'query A { hello } query B { b: hello }';
+
+      const a = await executor.execute({ query, operationName: 'A' });
+      const b = await executor.execute({ query, operationName: 'B' });
+
+      expect(a.response.data).toEqual({ hello: 'Hello, World!' });
+      expect(b.response.data).toEqual({ b: 'Hello, World!' });
+      expect(compiledCount(executor)).toBe(2);
+    });
+
+    test('should not cache the plan of a query above the per-entry byte cap', async () => {
+      const executor = limited(new DocumentCache());
+      const padding = '#'.padEnd(
+        Math.ceil(LeavenExecutor.MAX_COMPILED_BYTES / 10 / AST_BYTES_PER_QUERY_CHAR),
+        'x'
+      );
+
+      const result = await executor.execute({ query: `{ hello }\n${padding}` });
+      expect(result.response.errors).toBeUndefined();
+      expect(compiledCount(executor)).toBe(0);
+    });
+
+    test('should report compiled-cache bytes and limits', async () => {
+      const executor = limited(new DocumentCache());
+      await executor.execute({ query: '{ hello }' });
+
+      const { compiled } = await executor.getCacheStats();
+      expect(compiled.size).toBe(1);
+      expect(compiled.maxSize).toBe(1000);
+      expect(compiled.bytes).toBe('{ hello }'.length * AST_BYTES_PER_QUERY_CHAR);
+      expect(compiled.maxBytes).toBe(32 * 1024 * 1024);
     });
 
     test('should apply the same rule to subscriptions', async () => {

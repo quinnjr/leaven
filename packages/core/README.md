@@ -71,7 +71,7 @@ console.log(stats);
 //     bytes: 2_016_000, // estimated retained bytes
 //     maxBytes: 33_554_432
 //   },
-//   compiled: { size: 38, maxSize: 1000 }
+//   compiled: { size: 38, maxSize: 1000, bytes: 1_824_000, maxBytes: 33_554_432 }
 // }
 ```
 
@@ -86,6 +86,13 @@ be exceeded, and a single entry estimated above `maxBytes / 10` (about 11,000
 characters at the 32 MiB default) is never cached, so one oversized query
 cannot flush the cache. Raise `maxBytes` if you rely on caching larger
 documents.
+
+The compiled-query cache follows the same rules with fixed limits
+(`LeavenExecutor.MAX_COMPILED_QUERIES` = 1000 plans,
+`LeavenExecutor.MAX_COMPILED_BYTES` = 32 MiB). It is keyed by the operation the
+document actually selects, so an `operationName` the document does not contain
+never creates an entry. Neither cache stores a query until it has passed
+validation, the depth limit and the complexity budget.
 
 **`hitRate` is not a percentage.** It is `totalHits / size` — the average number
 of times each cached entry has been reused. Misses are not tracked at all, so
@@ -310,7 +317,7 @@ class LeavenExecutor {
   // Document and compiled-query cache statistics
   getCacheStats(): Promise<{
     document: CacheStats | null;
-    compiled: { size: number; maxSize: number };
+    compiled: { size: number; maxSize: number; bytes: number; maxBytes: number };
   }>;
 
   // Clear both the document cache and the compiled-query cache

@@ -187,7 +187,7 @@ console.log(result.response.data);
 // Check cache stats (async - custom caches may be remote)
 const stats = await executor.getCacheStats();
 console.log(stats);
-// { document: { size: 42, hits: 156, ... }, compiled: { size: 12, maxSize: 1000 } }`;
+// { document: { size: 42, hits: 156, ... }, compiled: { size: 12, maxSize: 1000, bytes: ..., maxBytes: 33554432 } }`;
 
   hooksCode = `const executor = new LeavenExecutor({
   schema,
