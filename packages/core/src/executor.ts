@@ -372,7 +372,8 @@ export class LeavenExecutor {
    * Parse a GraphQL query, reusing the cached document when one exists.
    *
    * Nothing is written back here: a cold parse defers its cache write until
-   * validation has run, so the document and its verdict land in a single
+   * validation and the complexity budget have both passed, so only admitted
+   * documents are stored, and the document and its verdict land in a single
    * {@link IDocumentCache.setWithValidation} call. See
    * {@link LeavenExecutor.cacheDocument}.
    *
@@ -445,7 +446,7 @@ export class LeavenExecutor {
     query: string,
     document: DocumentNode,
     operationName?: string
-  ): { compiled: CompiledQuery; cached: boolean } {
+  ): { compiled: CompiledQuery; cached: boolean; admit?: () => void } {
     // Key by the raw query string (already in hand) rather than
     // re-serializing the AST on every execution.
     const key = this.getCacheKey(query, operationName);
@@ -465,16 +466,19 @@ export class LeavenExecutor {
       this.compilerOptions
     );
 
-    // Evict the least recently used entry when the cache is full
-    if (this.compiledQueries.size >= LeavenExecutor.MAX_COMPILED_QUERIES) {
-      const oldest = this.compiledQueries.keys().next().value;
-      if (oldest !== undefined) {
-        this.compiledQueries.delete(oldest);
+    // Not stored yet: the caller admits the plan only once it has passed the
+    // complexity budget, so a rejected query never occupies (or evicts) a slot.
+    const admit = (): void => {
+      // Evict the least recently used entry when the cache is full
+      if (this.compiledQueries.size >= LeavenExecutor.MAX_COMPILED_QUERIES) {
+        const oldest = this.compiledQueries.keys().next().value;
+        if (oldest !== undefined) {
+          this.compiledQueries.delete(oldest);
+        }
       }
-    }
-
-    this.compiledQueries.set(key, compiled);
-    return { compiled, cached: false };
+      this.compiledQueries.set(key, compiled);
+    };
+    return { compiled, cached: false, admit };
   }
 
   /**
@@ -535,13 +539,6 @@ export class LeavenExecutor {
         document,
         this.validationRules ? { rules: this.validationRules } : undefined
       );
-
-      // Only valid documents are cached. Caching rejects would let a client
-      // fill the cache with junk queries (evicting real entries, or growing a
-      // shared Redis without bound) at no cost beyond a failed request.
-      if (validation.valid) {
-        this.cacheDocument(cacheKey, document, validation, parsed.cached);
-      }
     }
 
     if (this.metricsEnabled) {
@@ -556,13 +553,16 @@ export class LeavenExecutor {
       return { errors: validation.errors.map((e) => e.toJSON()) };
     }
 
-    // Check complexity if compiler is enabled
+    // Check complexity if compiler is enabled. The compiled plan is only
+    // stored once it is known to be within budget (see below).
+    let admitCompiled: (() => void) | undefined;
     if (this.compilerOptions) {
-      const { compiled, cached } = this.getCompiledQuery(
+      const { compiled, cached, admit } = this.getCompiledQuery(
         request.query,
         document,
         request.operationName
       );
+      admitCompiled = admit;
       telemetry.queryCached = cached;
       if (this.compilerOptions.calculateComplexity) {
         telemetry.complexity = compiled.complexity;
@@ -587,6 +587,16 @@ export class LeavenExecutor {
           ],
         };
       }
+    }
+
+    // Only now, with validation, the depth limit (enforced at parse time) and
+    // the complexity budget all passed, may anything be cached. Caching
+    // earlier would let a client fill either cache with rejected queries
+    // (evicting real entries, or growing a shared Redis without bound) at no
+    // cost beyond a failed request.
+    admitCompiled?.();
+    if (!cachedValidation) {
+      this.cacheDocument(cacheKey, document, validation, parsed.cached);
     }
 
     return { document };

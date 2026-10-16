@@ -637,6 +637,113 @@ describe('LeavenExecutor', () => {
     });
   });
 
+  describe('caching only after every check passes', () => {
+    /** Entries in the executor's private compiled-query cache */
+    const compiledCount = (executor: LeavenExecutor): number =>
+      (executor as unknown as { compiledQueries: { size: number } }).compiledQueries.size;
+
+    const limited = (cache: IDocumentCache): LeavenExecutor =>
+      new LeavenExecutor({ schema, rootValue, cache, maxComplexity: 2, maxDepth: 3 });
+
+    test('should cache neither the document nor the plan of an invalid query', async () => {
+      const cache = new DocumentCache();
+      const executor = limited(cache);
+
+      const result = await executor.execute({ query: '{ doesNotExist }' });
+      expect(result.response.errors).toBeDefined();
+
+      expect(cache.size).toBe(0);
+      expect(compiledCount(executor)).toBe(0);
+    });
+
+    test('should cache neither the document nor the plan of an over-complexity query', async () => {
+      const cache = new DocumentCache();
+      const executor = limited(cache);
+
+      const result = await executor.execute({
+        query: '{ a: hello b: hello c: hello d: hello e: hello }',
+      });
+      expect(result.response.errors?.[0]?.extensions?.code).toBe(ErrorCode.COMPLEXITY_LIMIT);
+
+      expect(cache.size).toBe(0);
+      expect(compiledCount(executor)).toBe(0);
+    });
+
+    test('should reject an over-complexity query again on repeat, still uncached', async () => {
+      const cache = new DocumentCache();
+      const executor = limited(cache);
+      const query = '{ a: hello b: hello c: hello d: hello e: hello }';
+
+      for (let i = 0; i < 3; i++) {
+        const result = await executor.execute({ query });
+        expect(result.response.errors?.[0]?.extensions?.code).toBe(ErrorCode.COMPLEXITY_LIMIT);
+      }
+      expect(cache.size).toBe(0);
+      expect(compiledCount(executor)).toBe(0);
+    });
+
+    test('should cache neither the document nor the plan of an over-depth query', async () => {
+      const cache = new DocumentCache();
+      const executor = new LeavenExecutor({ schema, rootValue, cache, maxComplexity: 100, maxDepth: 1 });
+
+      const result = await executor.execute({ query: '{ user(id: "1") { id } }' });
+      expect(result.response.errors).toBeDefined();
+
+      expect(cache.size).toBe(0);
+      expect(compiledCount(executor)).toBe(0);
+    });
+
+    test('should not attach a verdict to a cached document when complexity fails', async () => {
+      const writes: string[] = [];
+      const documentOnly: IDocumentCache = {
+        get: () => null,
+        set: () => undefined,
+        getWithValidation: (key) => ({
+          document: parse(key.slice(key.indexOf('\x00') + 1)),
+        }),
+        setValidation: () => {
+          writes.push('setValidation');
+        },
+        setWithValidation: () => {
+          writes.push('setWithValidation');
+        },
+        has: () => false,
+        delete: () => false,
+        clear: () => undefined,
+        size: 0,
+        getStats: () => ({ size: 0, maxSize: 0, hitRate: 0, totalHits: 0, entries: 0 }),
+      };
+      const executor = limited(documentOnly);
+
+      await executor.execute({ query: '{ a: hello b: hello c: hello d: hello e: hello }' });
+      expect(writes).toEqual([]);
+      expect(compiledCount(executor)).toBe(0);
+    });
+
+    test('should cache both once a query passes validation and complexity', async () => {
+      const cache = new DocumentCache();
+      const executor = limited(cache);
+
+      const result = await executor.execute({ query: '{ hello }' });
+      expect(result.response.errors).toBeUndefined();
+
+      expect(cache.size).toBe(1);
+      expect(compiledCount(executor)).toBe(1);
+    });
+
+    test('should apply the same rule to subscriptions', async () => {
+      const cache = new DocumentCache();
+      const executor = new LeavenExecutor({ schema, rootValue, cache, maxComplexity: 0 });
+
+      const result = await executor.subscribe({ query: 'subscription { countdown(from: 1) }' });
+      expect((result as GraphQLResponse).errors?.[0]?.extensions?.code).toBe(
+        ErrorCode.COMPLEXITY_LIMIT
+      );
+      expect(cache.size).toBe(0);
+      expect(compiledCount(executor)).toBe(0);
+    });
+  });
+
   describe('caught error formatting', () => {
     /** Force the executor's catch path by throwing from a lifecycle hook */
     const executorThrowing = (error: unknown): LeavenExecutor =>
