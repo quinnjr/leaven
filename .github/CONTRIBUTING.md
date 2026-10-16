@@ -248,6 +248,23 @@ description.
 Urgent fixes to a released version go on a `hotfix/` branch cut from `main`,
 merged to both `main` and `develop`.
 
+### npm authentication
+
+The publish job uses [npm trusted publishing](https://docs.npmjs.com/trusted-publishers)
+(OIDC), not a stored `NPM_TOKEN`. Each package on npmjs.com trusts the
+`quinnjr/leaven` repository's `release.yml` workflow, and CI exchanges its
+GitHub OIDC token for a short-lived publish token. Provenance is attached
+automatically.
+
+The trust relationship is set per package. After adding a new package, publish
+it once by hand (`pnpm publish --access public --otp <code>` from its
+directory), then register the workflow for it, logged in to npm with 2FA:
+
+```bash
+pnpm trust:npm --dry-run   # preview
+pnpm trust:npm             # register every public package
+```
+
 ## Package Development
 
 When creating or modifying packages:
