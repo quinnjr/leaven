@@ -101,7 +101,6 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
-          registry-url: 'https://registry.npmjs.org'
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -115,11 +114,24 @@ jobs:
       - name: Run tests
         run: pnpm test
 
+      # npm trusted publishing (OIDC): no NPM_TOKEN. The npm CLI exchanges this
+      # job's GitHub OIDC token (`id-token: write` above) for a short-lived
+      # publish token, per package, against the trusted publisher configured
+      # on npmjs.com (repo quinnjr/leaven, workflow release.yml). Provenance
+      # is generated automatically. pnpm 10 hands the upload to the `npm` on
+      # PATH, which must be >= 11.5.1 for OIDC; Node 24 bundles one.
+      - name: Check npm supports trusted publishing
+        run: |
+          v=$(npm --version)
+          echo "npm $v"
+          [ "$(printf '%s\n' 11.5.1 "$v" | sort -V | head -1)" = 11.5.1 ] || {
+            echo "::error::npm $v is older than 11.5.1 and cannot publish via OIDC"
+            exit 1
+          }
+
       - name: Publish to npm
         uses: changesets/action@v1
         with:
           publish: pnpm release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
