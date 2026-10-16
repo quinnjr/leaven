@@ -24,6 +24,8 @@ export {
   createErrorMessage,
   createCompleteMessage,
   createPongMessage,
+  isValidOperationId,
+  OPERATION_ID_PATTERN,
   type ConnectionInitMessage,
   type ConnectionAckMessage,
   type SubscribeMessage,
