@@ -19,6 +19,7 @@ import {
   type WebSocketContext,
   type WebSocketHandlerConfig,
 } from './handler';
+import type { SubscriptionManager } from './manager';
 
 /** Records whether an iterator was released via return() */
 interface IteratorProbe {
@@ -157,9 +158,26 @@ function createTestSchema(
             return feed.iterator;
           },
         },
+        // Like `forever`, but the source stream takes 20ms to set up, which
+        // leaves a window for the socket to close or the id to be completed
+        slow: {
+          type: GraphQLInt,
+          subscribe: async () => {
+            const probe: IteratorProbe = { returned: false };
+            probes.push(probe);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            return neverEndingIterator(probe);
+          },
+        },
       },
     }),
   });
+}
+
+/** Reach the handler's subscription manager for bookkeeping assertions */
+function managerOf(handler: WebSocketHandler): SubscriptionManager {
+  return (handler as unknown as { subscriptionManager: SubscriptionManager })
+    .subscriptionManager;
 }
 
 interface Frame {
@@ -238,6 +256,8 @@ const SUBSCRIBE_COUNT =
   '{"id":"sub-1","type":"subscribe","payload":{"query":"subscription { count }"}}';
 const SUBSCRIBE_FOREVER =
   '{"id":"sub-1","type":"subscribe","payload":{"query":"subscription { forever }"}}';
+const SUBSCRIBE_SLOW =
+  '{"id":"sub-1","type":"subscribe","payload":{"query":"subscription { slow }"}}';
 
 describe('WebSocketHandler', () => {
   describe('handleOpen', () => {
@@ -555,6 +575,52 @@ describe('WebSocketHandler', () => {
       expect(socket.data.subscriptions.size).toBe(0);
 
       await handler.handleClose(socket);
+    });
+  });
+
+  describe('subscribe after close', () => {
+    test('should register nothing when the socket closed while the context was built', async () => {
+      const probes: IteratorProbe[] = [];
+      const handler = createHandler(
+        {
+          context: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            return {};
+          },
+        },
+        probes
+      );
+      const socket = createFakeSocket();
+      await openAndInit(handler, socket);
+
+      const subscribing = handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+      await handler.handleClose(socket);
+      const sentAtClose = socket.sent.length;
+      await subscribing;
+
+      // Either the source stream was never created or it was released
+      expect(probes.every((probe) => probe.returned)).toBe(true);
+      expect(managerOf(handler).subscriptionCount).toBe(0);
+      expect(managerOf(handler).connectionCount).toBe(0);
+      expect(socket.sent.length).toBe(sentAtClose);
+    });
+
+    test('should return the iterator when the socket closed during executor.subscribe', async () => {
+      const probes: IteratorProbe[] = [];
+      const handler = createHandler({}, probes);
+      const socket = createFakeSocket();
+      await openAndInit(handler, socket);
+
+      const subscribing = handler.handleMessage(socket, SUBSCRIBE_SLOW);
+      // Let the subscribe reach the (slow) source stream setup
+      await waitFor(() => probes.length === 1);
+      await handler.handleClose(socket);
+      await subscribing;
+
+      await waitFor(() => probes[0]!.returned);
+      expect(probes[0]!.returned).toBe(true);
+      expect(managerOf(handler).subscriptionCount).toBe(0);
+      expect(managerOf(handler).connectionCount).toBe(0);
     });
   });
 

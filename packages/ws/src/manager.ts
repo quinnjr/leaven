@@ -147,6 +147,20 @@ export class SubscriptionManager {
       // Execute the subscription
       const result = await this.executor.subscribe(request, context);
 
+      // The subscription may have been torn down while the executor ran: the
+      // client completed the id, or the connection closed. Its entry is then
+      // gone (or, after an id reuse, belongs to a newer subscription), so
+      // release the source stream and register nothing.
+      if (!this.isCurrent(subscription)) {
+        subscription.status = 'completed';
+        if (Symbol.asyncIterator in Object(result)) {
+          void (result as AsyncIterableIterator<GraphQLResponse>)
+            .return?.()
+            ?.catch(() => {});
+        }
+        return subscription;
+      }
+
       // Check if it's an error result (a plain response object, not an async iterable)
       if (!(Symbol.asyncIterator in Object(result))) {
         subscription.status = 'error';
@@ -174,7 +188,7 @@ export class SubscriptionManager {
             // Notify the client before tearing down so the subscription does
             // not vanish silently: mark it completed and emit a Complete frame.
             const timedOut = this.getSubscription(connectionId, subscriptionId);
-            if (timedOut && timedOut.status === 'active') {
+            if (timedOut === subscription && timedOut.status === 'active') {
               timedOut.status = 'completed';
               // The client sees a plain `complete` either way, so log here to
               // keep a timeout distinguishable from a natural completion.
@@ -189,7 +203,9 @@ export class SubscriptionManager {
               error
             );
           } finally {
-            this.unsubscribe(connectionId, subscriptionId);
+            if (this.isCurrent(subscription)) {
+              this.unsubscribe(connectionId, subscriptionId);
+            }
           }
         }, this.subscriptionTimeout);
       }
@@ -202,8 +218,7 @@ export class SubscriptionManager {
 
       // Start consuming the iterator
       this.consumeIterator(
-        connectionId,
-        subscriptionId,
+        subscription,
         iterator,
         onNext,
         onComplete,
@@ -212,6 +227,11 @@ export class SubscriptionManager {
 
       return subscription;
     } catch (error) {
+      // A subscription torn down mid-setup has nobody left to report to
+      if (!this.isCurrent(subscription)) {
+        subscription.status = 'completed';
+        return subscription;
+      }
       subscription.status = 'error';
       const message = error instanceof Error ? error.message : 'Subscription failed';
       onError([{ message }]);
@@ -221,35 +241,43 @@ export class SubscriptionManager {
   }
 
   /**
+   * Whether this exact subscription object is still the one registered under
+   * its connection and id. An id lookup alone is not enough: after a
+   * teardown the id can be registered again by a NEWER subscription.
+   */
+  private isCurrent(subscription: Subscription): boolean {
+    return this.getSubscription(subscription.connectionId, subscription.id) === subscription;
+  }
+
+  /**
    * Consume an async iterator and call callbacks
    */
   private async consumeIterator(
-    connectionId: string,
-    subscriptionId: string,
+    subscription: Subscription,
     iterator: AsyncIterableIterator<GraphQLResponse>,
     onNext: (result: GraphQLResponse) => void,
     onComplete: () => void,
     onError: (errors: readonly { message: string }[]) => void
   ): Promise<void> {
+    const { connectionId, id: subscriptionId } = subscription;
     try {
       for await (const result of iterator) {
-        const subscription = this.getSubscription(connectionId, subscriptionId);
-        if (!subscription || subscription.status !== 'active') {
+        // Identity, not just the id: a reused id belongs to a newer
+        // subscription whose client must never see this stream's events
+        if (!this.isCurrent(subscription) || subscription.status !== 'active') {
           break;
         }
 
         onNext(result);
       }
 
-      const subscription = this.getSubscription(connectionId, subscriptionId);
-      if (subscription) {
+      if (this.isCurrent(subscription)) {
         subscription.status = 'completed';
         onComplete();
         this.unsubscribe(connectionId, subscriptionId);
       }
     } catch (error) {
-      const subscription = this.getSubscription(connectionId, subscriptionId);
-      if (subscription) {
+      if (this.isCurrent(subscription)) {
         subscription.status = 'error';
         const message = error instanceof Error ? error.message : 'Subscription error';
         onError([{ message }]);

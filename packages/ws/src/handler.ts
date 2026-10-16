@@ -330,6 +330,7 @@ export class WebSocketHandler<TContext = unknown> {
     message: SubscribeMessage
   ): Promise<void> {
     const { id, payload } = message;
+    const state = this.stateOf(socket);
 
     // Check if subscription ID already exists
     if (socket.data.subscriptions.has(id)) {
@@ -349,14 +350,20 @@ export class WebSocketHandler<TContext = unknown> {
       extensions: payload.extensions,
     };
 
+    // Whether this operation was abandoned while it awaited: the socket
+    // closed. Nothing may be sent or registered for it after that.
+    const abandoned = (): boolean => state.closed;
+
     try {
       // Call onSubscribe hook
       await this.onSubscribe?.(socket, id, request);
+      if (abandoned()) return;
 
       // Build context
       let context: TContext | undefined;
       if (this.contextFactory) {
         context = await this.contextFactory(socket, request);
+        if (abandoned()) return;
       }
 
       // A Subscribe frame is the graphql-ws transport for EVERY operation,
@@ -366,6 +373,7 @@ export class WebSocketHandler<TContext = unknown> {
       // operation."
       if (!this.isSubscriptionOperation(request)) {
         const response = await this.subscriptionManager.execute(request, context);
+        if (abandoned()) return;
 
         // Errors raised BEFORE execution (validation, variable coercion) are
         // an Error message; errors raised DURING execution ride inside the
@@ -404,6 +412,7 @@ export class WebSocketHandler<TContext = unknown> {
         }
       );
     } catch (error) {
+      if (abandoned()) return;
       // Per graphql-ws, operation setup failures are reported as an Error
       // message on the offending ID — the connection (and its other
       // subscriptions) must stay open

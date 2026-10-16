@@ -136,6 +136,16 @@ function createTestSchema(
             return feed.iterator;
           },
         },
+        // Like `forever`, but the source stream takes 20ms to set up
+        slow: {
+          type: GraphQLInt,
+          subscribe: async () => {
+            const probe: IteratorProbe = { returned: false };
+            probes.push(probe);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            return neverEndingIterator(probe);
+          },
+        },
         nested: {
           type: new GraphQLObjectType({
             name: 'Nested',
@@ -297,6 +307,34 @@ describe('SubscriptionManager', () => {
       expect(manager.connectionCount).toBe(1);
 
       manager.clear();
+    });
+  });
+
+  describe('teardown during setup', () => {
+    test('should release the iterator when the connection closed during executor.subscribe', async () => {
+      const probes: IteratorProbe[] = [];
+      const manager = new SubscriptionManager({ schema: createTestSchema(probes) });
+      const calls: string[] = [];
+
+      const subscribing = manager.subscribe(
+        'conn-1',
+        'sub-1',
+        { query: 'subscription { slow }' },
+        undefined,
+        () => calls.push('next'),
+        () => calls.push('complete'),
+        () => calls.push('error')
+      );
+      await waitFor(() => probes.length === 1);
+      manager.unsubscribeConnection('conn-1');
+
+      const subscription = await subscribing;
+
+      await waitFor(() => probes[0]!.returned);
+      expect(subscription.status).toBe('completed');
+      expect(manager.subscriptionCount).toBe(0);
+      expect(manager.connectionCount).toBe(0);
+      expect(calls).toEqual([]);
     });
   });
 
