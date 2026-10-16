@@ -466,6 +466,10 @@ function createErrorMessage(
 function createCompleteMessage(id: string): CompleteMessage;
 function createPongMessage(payload?: Record<string, unknown>): PongMessage;
 
+/** `/^[A-Za-z0-9_.:-]{1,64}$/`: the accepted shape of a client operation id */
+const OPERATION_ID_PATTERN: RegExp;
+function isValidOperationId(id: unknown): id is string;
+
 interface ParseMessageOptions {
   /**
    * Require a string `id` on the types that carry one (`subscribe`, `next`,
@@ -494,7 +498,11 @@ const message = parseMessage(data, { requireId: false });
 
 `parseMessage` throws on invalid JSON, on JSON that is not an object, on a
 missing or unknown `type`, and — unless `requireId` is `false` — on a missing
-`id`.
+`id`, or on a `subscribe`/`complete` id that does not match
+`OPERATION_ID_PATTERN` (`Invalid message`). The server closes the socket with
+4400 in every one of those cases. Ids are client-chosen and reach close
+reasons and log lines, so the allow-list keeps control characters and
+oversized strings out of both; UUIDs, counters and `prefix:n` ids all pass.
 
 ### Message Types
 

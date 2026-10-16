@@ -15,6 +15,8 @@ import {
   createErrorMessage,
   createCompleteMessage,
   createPongMessage,
+  isValidOperationId,
+  OPERATION_ID_PATTERN,
 } from './protocol';
 
 describe('MessageType', () => {
@@ -97,6 +99,19 @@ describe('parseMessage', () => {
     expect(() => parseMessage('{"type":42}')).toThrow(/Invalid message type: 42/);
   });
 
+  test('should escape and bound an unknown type echoed in the error', () => {
+    let message = '';
+    try {
+      parseMessage(JSON.stringify({ type: `bad\n${'x'.repeat(500)}` }));
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message.startsWith('Invalid message type: bad\\n')).toBe(true);
+    expect(message).not.toContain('\n');
+    // The handler uses this as a WebSocket close reason, capped at 123 bytes
+    expect(new TextEncoder().encode(message).length).toBeLessThanOrEqual(123);
+  });
+
   test('should throw for invalid type', () => {
     expect(() => parseMessage('{"type":"invalid"}')).toThrow(/Invalid message type/);
   });
@@ -163,6 +178,71 @@ describe('parseMessage', () => {
     );
     expect(parseMessage('{"type":"ping"}').type).toBe(MessageType.Ping);
     expect(parseMessage('{"type":"pong"}').type).toBe(MessageType.Pong);
+  });
+});
+
+describe('operation id validation', () => {
+  const valid = ['1', 'sub-1', 'a.b:c_d-E', 'x'.repeat(64), '0f8fad5b-d9cb-469f-a165-70867728950e'];
+  const invalid = [
+    '',
+    'x'.repeat(65),
+    'sub 1',
+    'evil\nINFO forged log line',
+    'evil\r\nx',
+    'tab\there',
+    'nul\u0000',
+    'del\u007f',
+    'emoji\u{1F600}',
+    'caf\u00e9',
+    'semi;colon',
+    'slash/x',
+  ];
+
+  test('should expose the id pattern', () => {
+    expect(OPERATION_ID_PATTERN.source).toBe('^[A-Za-z0-9_.:-]{1,64}$');
+  });
+
+  test.each(valid)('isValidOperationId accepts %p', (id) => {
+    expect(isValidOperationId(id)).toBe(true);
+  });
+
+  test.each(invalid)('isValidOperationId rejects %p', (id) => {
+    expect(isValidOperationId(id)).toBe(false);
+  });
+
+  test('isValidOperationId rejects non-strings', () => {
+    expect(isValidOperationId(1)).toBe(false);
+    expect(isValidOperationId(undefined)).toBe(false);
+    expect(isValidOperationId(null)).toBe(false);
+  });
+
+  test.each(invalid)('parseMessage rejects subscribe id %p', (id) => {
+    const frame = JSON.stringify({ id, type: 'subscribe', payload: { query: '{ a }' } });
+    expect(() => parseMessage(frame)).toThrow(/^Invalid message$/);
+  });
+
+  test.each(invalid)('parseMessage rejects complete id %p', (id) => {
+    expect(() => parseMessage(JSON.stringify({ id, type: 'complete' }))).toThrow(
+      /^Invalid message$/
+    );
+  });
+
+  test.each(valid)('parseMessage accepts subscribe/complete id %p', (id) => {
+    expect(parseMessage(JSON.stringify({ id, type: 'complete' })).type).toBe(
+      MessageType.Complete
+    );
+    const frame = JSON.stringify({ id, type: 'subscribe', payload: { query: '{ a }' } });
+    expect(parseMessage(frame).type).toBe(MessageType.Subscribe);
+  });
+
+  test('parseMessage leaves server -> client ids alone when requireId is false', () => {
+    // A client parsing server frames must not be torn down over an id it
+    // did not choose; the format rule guards what a server accepts.
+    expect(
+      parseMessage(JSON.stringify({ id: 'a b', type: 'next', payload: {} }), {
+        requireId: false,
+      }).type
+    ).toBe(MessageType.Next);
   });
 });
 

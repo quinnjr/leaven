@@ -17,6 +17,7 @@ import {
   LeavenExecutor,
   calculateQueryDepth,
   compileQuery,
+  escapeLog,
   type ExecutorConfig,
   type ParseOptions,
 } from '@leaven-graphql/core';
@@ -69,10 +70,21 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
   private static readonly MAX_ANALYSIS_ENTRIES = 1000;
 
   /**
+   * Estimated memory budget of the analysis memo: 8 MiB. An entry's cost is
+   * its key, which holds the whole query text (estimated at 2 bytes per
+   * UTF-16 code unit plus a fixed 64 for the map slot and result), and an
+   * entry above a tenth of the budget is never memoized.
+   */
+  public static readonly MAX_ANALYSIS_BYTES = 8 * 1024 * 1024;
+
+  /**
    * LRU of {@link QueryAnalysis} keyed by query string and operation name.
    * Cleared whenever the schema changes, since complexity is schema-dependent.
    */
   private readonly analysisCache = new Map<string, QueryAnalysis>();
+
+  /** Estimated bytes held by {@link analysisCache} */
+  private analysisBytes = 0;
 
   constructor(options: LeavenModuleOptions) {
     this.options = options;
@@ -101,7 +113,7 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
       await this.executor.clearCaches();
       this.executor = null;
     }
-    this.analysisCache.clear();
+    this.clearAnalysisCache();
   }
 
   /**
@@ -163,7 +175,7 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
 
     // Complexity is schema-dependent, so a new schema invalidates every
     // memoized analysis.
-    this.analysisCache.clear();
+    this.clearAnalysisCache();
 
     this.executor = new LeavenExecutor(config);
   }
@@ -361,7 +373,8 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
       }
 
       throw new ValidationError(
-        `Unsupported content type "${contentType || '(none)'}": use application/json or application/graphql`
+        `Unsupported content type "${contentType ? escapeLog(contentType, 64) : '(none)'}": ` +
+          'use application/json or application/graphql'
       );
     }
 
@@ -499,17 +512,39 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Store an analysis result, evicting the least recently used entry when the
-   * cache is full.
+   * Store an analysis result, evicting least recently used entries until
+   * both {@link MAX_ANALYSIS_ENTRIES} and {@link MAX_ANALYSIS_BYTES} hold.
+   * A key above a tenth of the byte budget is not memoized at all.
    */
   private memoizeAnalysis(key: string, analysis: QueryAnalysis): void {
-    if (this.analysisCache.size >= LeavenDriver.MAX_ANALYSIS_ENTRIES) {
-      const oldest = this.analysisCache.keys().next().value;
-      if (oldest !== undefined) {
-        this.analysisCache.delete(oldest);
-      }
+    const bytes = LeavenDriver.analysisEntryBytes(key);
+    if (bytes > LeavenDriver.MAX_ANALYSIS_BYTES / 10) return;
+
+    if (this.analysisCache.delete(key)) {
+      this.analysisBytes -= bytes;
+    }
+    while (
+      this.analysisCache.size > 0 &&
+      (this.analysisCache.size >= LeavenDriver.MAX_ANALYSIS_ENTRIES ||
+        this.analysisBytes + bytes > LeavenDriver.MAX_ANALYSIS_BYTES)
+    ) {
+      const oldest = this.analysisCache.keys().next().value as string;
+      this.analysisCache.delete(oldest);
+      this.analysisBytes -= LeavenDriver.analysisEntryBytes(oldest);
     }
     this.analysisCache.set(key, analysis);
+    this.analysisBytes += bytes;
+  }
+
+  /** Estimated bytes one memo entry retains. See {@link MAX_ANALYSIS_BYTES}. */
+  private static analysisEntryBytes(key: string): number {
+    return key.length * 2 + 64;
+  }
+
+  /** Empty the analysis memo, keeping its byte count in step */
+  private clearAnalysisCache(): void {
+    this.analysisCache.clear();
+    this.analysisBytes = 0;
   }
 
   /**
@@ -574,7 +609,7 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
    * a rejecting cache unhandled.
    */
   public async clearCaches(): Promise<void> {
-    this.analysisCache.clear();
+    this.clearAnalysisCache();
     await this.executor?.clearCaches();
   }
 }

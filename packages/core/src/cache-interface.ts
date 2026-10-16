@@ -44,6 +44,13 @@ export interface CacheStats {
   totalHits: number;
   /** Number of entries (alias for `size` — same accuracy caveat) */
   entries: number;
+  /**
+   * Estimated bytes retained by the cached entries. Reported by the
+   * in-memory `DocumentCache`; backends that cannot estimate it omit it.
+   */
+  bytes?: number;
+  /** Configured memory budget in bytes, when the backend has one */
+  maxBytes?: number;
 }
 
 /**

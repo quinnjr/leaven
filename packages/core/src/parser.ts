@@ -19,6 +19,7 @@ import {
 import { DepthLimitError, ErrorCode } from '@leaven-graphql/errors';
 
 import type { OperationType, ParsedRequest, GraphQLRequest } from './types';
+import { escapeLog } from './escape-log';
 
 /**
  * Hard upper bound on the number of AST nodes a single static-analysis pass
@@ -311,7 +312,7 @@ export function parseRequest(
   if (!operation) {
     throw new Error(
       request.operationName
-        ? `Operation "${request.operationName}" not found in document`
+        ? `Operation "${escapeLog(request.operationName)}" not found in document`
         : 'No operation found in document'
     );
   }
