@@ -923,11 +923,15 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
    * Determine whether a query string is a streaming `subscription` operation.
    *
    * Parse failures return `false` so that syntax errors surface through the
-   * normal execution/error path instead of being masked here.
+   * normal execution/error path instead of being masked here. That includes
+   * an exceeded `parseOptions.maxTokens`: the parse here applies the same
+   * token budget as the executor (default 10000), so an oversized document is
+   * never lexed in full, and the executor then reports the limit.
    */
   private isSubscriptionOperation(query: string, operationName?: string): boolean {
     try {
-      const document = parse(query);
+      const { graphqlOptions, maxTokens } = this.driver.getParseOptions();
+      const document = parse(query, { ...graphqlOptions, maxTokens });
       return getOperationAST(document, operationName)?.operation === 'subscription';
     } catch {
       return false;

@@ -29,4 +29,10 @@ Security hardening for the playground, the executor caches and the WebSocket tra
 - **nestjs**: the NestJS subscription transport gets the same
   `connection_init` fix: a second init while `onConnect` is running closes
   with 4429, and a socket closed during `onConnect` is neither acknowledged
-  nor given a keep-alive timer.
+  nor given a keep-alive timer. A new `parseOptions` option (core
+  `ParseOptions` shape) on `LeavenModule` and `LeavenGraphQLDriver` sets the
+  parser limits, with `maxTokens` defaulting to 10000 (`Infinity` opts out).
+  It is applied by the executor, the guard query analysis and the
+  subscription transport's synchronous operation-type detection, which
+  previously used an unbounded `parse()`; an over-limit document is rejected
+  through the executor's normal error response.

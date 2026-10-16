@@ -948,6 +948,64 @@ describe('SubscriptionManager security (connection params)', () => {
   });
 });
 
+describe('SubscriptionManager parse limits (LeavenModuleOptions.parseOptions)', () => {
+  /** Payload of the single `next` frame answering operation `id` */
+  function nextErrors(socket: MockWebSocket, id: string): Array<{ message: string }> {
+    const next = sentOfType(socket, 'next').find((frame) => frame.id === id);
+    return ((next?.payload as { errors?: Array<{ message: string }> }) ?? {}).errors ?? [];
+  }
+
+  test('applies a default maxTokens of 10000 to operation-type detection and execution', async () => {
+    const harness = await createManager();
+    const socket = await initConnection(harness.manager);
+
+    socket.simulateMessage(
+      JSON.stringify({
+        type: 'subscribe',
+        id: '1',
+        payload: { query: `subscription { ${'countdown '.repeat(10_001)} }` },
+      })
+    );
+    await waitFor(() => sentOfType(socket, 'complete').length > 0);
+
+    // Reported through the executor's error path, not thrown out of the handler
+    expect(nextErrors(socket, '1')[0]?.message).toMatch(/tokens/i);
+    expect(socket.readyState).toBe(1);
+    expect(harness.manager.getSubscriptionCount()).toBe(0);
+
+    await destroyHarness(harness);
+  });
+
+  test('honours a configured parseOptions.maxTokens', async () => {
+    const harness = await createManager(undefined, undefined, {
+      parseOptions: { maxTokens: 5 },
+    });
+    const socket = await initConnection(harness.manager);
+
+    socket.simulateMessage(
+      JSON.stringify({
+        type: 'subscribe',
+        id: '1',
+        payload: { query: 'subscription { countdown countdown countdown countdown }' },
+      })
+    );
+    await waitFor(() => sentOfType(socket, 'complete').length > 0);
+
+    expect(nextErrors(socket, '1')[0]?.message).toMatch(/tokens/i);
+    expect(socket.readyState).toBe(1);
+
+    // A document within the budget still runs
+    socket.simulateMessage(
+      JSON.stringify({ type: 'subscribe', id: '2', payload: { query: '{ hello }' } })
+    );
+    await waitFor(() => sentOfType(socket, 'next').some((frame) => frame.id === '2'));
+    const ok = sentOfType(socket, 'next').find((frame) => frame.id === '2');
+    expect((ok?.payload as { data?: { hello?: string } }).data?.hello).toBe('world');
+
+    await destroyHarness(harness);
+  });
+});
+
 describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)', () => {
   test('onConnect returning false closes the connection with 4401', async () => {
     const harness = await createManager({ onConnect: () => false });
@@ -1669,11 +1727,13 @@ function createTestSchema(probe?: StreamProbe): GraphQLSchema {
 
 async function createManager(
   subscriptions?: SubscriptionConfig,
-  probe?: StreamProbe
+  probe?: StreamProbe,
+  extra: Partial<LeavenModuleOptions> = {}
 ): Promise<TestHarness> {
   const options: LeavenModuleOptions = {
     schema: createTestSchema(probe),
     subscriptions,
+    ...extra,
   };
 
   const driver = new LeavenDriver(options);

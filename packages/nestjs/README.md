@@ -596,6 +596,7 @@ export class SchemaService {
 | `cache` | `DocumentCacheConfig \| boolean` | - | Document cache configuration |
 | `maxComplexity` | `number` | - | Maximum query complexity. Enforced by the executor before any resolver runs — an over-budget document is rejected with a `ComplexityError` |
 | `maxDepth` | `number` | - | Maximum query depth. **Only recorded on the context** (as `_queryDepth`) for `DepthGuard`, so it is not enforced on `LeavenModule`'s HTTP path — see the caveat under [Features](#features). The `LeavenGraphQLDriver` path enforces it in the executor |
+| `parseOptions` | `ParseOptions` | `{ maxTokens: 10000 }` | Parser limits (core executor shape). Applied by the executor, the guard query analysis and the subscription transport's operation-type detection, so an oversized document is never parsed in full; over the limit it is rejected through the executor's normal error response. Set `maxTokens: Infinity` to opt out |
 | `metrics` | `boolean` | `false` | Enable execution metrics |
 | `context` | `ContextFactory` | - | Custom context factory |
 | `formatError` | `FormatErrorFn` | - | Error formatting function |
@@ -704,6 +705,7 @@ constructs a `LeavenExecutor` over it and serves `POST <path>` (plus
 | `metrics` | `boolean` | Collect per-operation metrics and expose them under `extensions.metrics` |
 | `maxComplexity` | `number` | Rejected by the executor before any resolver runs |
 | `maxDepth` | `number` | Rejected by the executor at parse time |
+| `parseOptions` | `ParseOptions` | Parser limits for the executor. `maxTokens` defaults to `10000`; `Infinity` opts out |
 | `playground` | `boolean` | Serve GraphiQL on `GET <path>` |
 | `subscriptionEndpoint` | `string` | WebSocket endpoint advertised to GraphiQL |
 | `formatError` | `(error) => error` | Final transformation applied to every response error |
