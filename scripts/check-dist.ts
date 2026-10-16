@@ -1,5 +1,5 @@
 /**
- * Verifies the built `dist/` output of every package.
+ * Verifies the built `dist/` output and publish metadata of every package.
  *
  * Published packages must import their dependencies instead of inlining them.
  * An inlined copy of `graphql` makes every schema built with the consumer's
@@ -18,6 +18,20 @@ import { join } from 'node:path';
 const root = join(import.meta.dir, '..');
 const packagesDir = join(root, 'packages');
 const failures: string[] = [];
+const REPOSITORY_URL = 'https://github.com/quinnjr/leaven.git';
+
+// 0. npm provenance (trusted publishing) rejects a package whose repository.url does not match the
+//    GitHub repository that built it, so every package must declare it.
+for (const name of readdirSync(packagesDir)) {
+  const manifest = Bun.file(join(packagesDir, name, 'package.json'));
+  if (!(await manifest.exists())) continue;
+  const { repository } = (await manifest.json()) as { repository?: { url?: string; directory?: string } };
+  if (repository?.url !== REPOSITORY_URL || repository.directory !== `packages/${name}`) {
+    failures.push(
+      `${name}: package.json repository must be { "url": "${REPOSITORY_URL}", "directory": "packages/${name}" }, got ${JSON.stringify(repository)}`,
+    );
+  }
+}
 
 // 1. No package may inline a dependency (bun marks inlined modules with their node_modules path).
 for (const name of readdirSync(packagesDir)) {
