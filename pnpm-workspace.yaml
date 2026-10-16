@@ -17,3 +17,22 @@ overrides:
   '@jridgewell/sourcemap-codec': '^1.6.0'
   'ws@>=8.0.0 <8.21.0': '^8.21.1'
   'ws@>=7.0.0 <7.5.11': '^7.5.11'
+  # GHSA-5p4m-2wfm-xmqj / GHSA-2883-xcg3-v3hh (high): CPU exhaustion in js-yaml
+  # merge-key and !!omap handling. Fixed in 4.3.2 and 3.15.2; js-yaml only
+  # reaches us transitively (lint/docs tooling).
+  'js-yaml@>=4.0.0 <4.3.2': '^4.3.2'
+  'js-yaml@>=3.0.0 <3.15.2': '^3.15.2'
+  # High/critical advisories reported by `pnpm audit`, all reaching us
+  # transitively through dev tooling (eslint, changesets, commitlint, docs)
+  # or the nestjs package's dev-only @nestjs/platform-express. None of these
+  # are dependencies of the published packages.
+  'brace-expansion@<1.1.20': '^1.1.20'
+  'brace-expansion@>=4.0.0 <5.0.11': '^5.0.11'
+  'fast-uri@>=3.0.0 <3.1.7': '^3.1.7'
+  'flatted@<3.4.2': '^3.4.2'
+  'minimatch@<3.1.4': '^3.1.4'
+  'multer@<2.3.0': '^2.3.0'
+  'path-to-regexp@>=8.0.0 <8.4.0': '^8.4.0'
+  'proxy-addr@<2.0.8': '^2.0.8'
+  'source-map-js@>=1.0.0 <1.2.2': '^1.2.2'
+  'undici@>=8.0.0 <8.10.2': '^8.10.2'
