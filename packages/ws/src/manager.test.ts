@@ -136,6 +136,16 @@ function createTestSchema(
             return feed.iterator;
           },
         },
+        // Like `forever`, but the source stream takes 20ms to set up
+        slow: {
+          type: GraphQLInt,
+          subscribe: async () => {
+            const probe: IteratorProbe = { returned: false };
+            probes.push(probe);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            return neverEndingIterator(probe);
+          },
+        },
         nested: {
           type: new GraphQLObjectType({
             name: 'Nested',
@@ -275,6 +285,73 @@ describe('SubscriptionManager', () => {
       manager.clear();
     });
 
+    test('should refuse to overwrite an existing subscription id', async () => {
+      const probes: IteratorProbe[] = [];
+      const manager = new SubscriptionManager({ schema: createTestSchema(probes) });
+
+      const original = await manager.subscribe(
+        'conn-1',
+        'sub-1',
+        { query: 'subscription { forever }' },
+        undefined,
+        () => {},
+        () => {},
+        () => {}
+      );
+
+      await expect(
+        manager.subscribe(
+          'conn-1',
+          'sub-1',
+          { query: 'subscription { forever }' },
+          undefined,
+          () => {},
+          () => {},
+          () => {}
+        )
+      ).rejects.toThrow(/already exists/);
+
+      // The original is untouched and still owns the id
+      expect(manager.getSubscription('conn-1', 'sub-1')).toBe(original);
+      expect(probes.length).toBe(1);
+      expect(probes[0]!.returned).toBe(false);
+
+      manager.clear();
+      expect(probes[0]!.returned).toBe(true);
+    });
+
+    test('should count pending subscriptions toward the per-connection limit', async () => {
+      const manager = new SubscriptionManager({
+        schema: createTestSchema(),
+        maxSubscriptionsPerConnection: 1,
+      });
+
+      const pending = manager.subscribe(
+        'conn-1',
+        'sub-1',
+        { query: 'subscription { slow }' },
+        undefined,
+        () => {},
+        () => {},
+        () => {}
+      );
+
+      await expect(
+        manager.subscribe(
+          'conn-1',
+          'sub-2',
+          { query: 'subscription { forever }' },
+          undefined,
+          () => {},
+          () => {},
+          () => {}
+        )
+      ).rejects.toThrow(/Maximum subscriptions per connection reached/);
+
+      await pending;
+      manager.clear();
+    });
+
     test('should track subscription status and metadata', async () => {
       const manager = new SubscriptionManager({ schema: createTestSchema() });
 
@@ -297,6 +374,34 @@ describe('SubscriptionManager', () => {
       expect(manager.connectionCount).toBe(1);
 
       manager.clear();
+    });
+  });
+
+  describe('teardown during setup', () => {
+    test('should release the iterator when the connection closed during executor.subscribe', async () => {
+      const probes: IteratorProbe[] = [];
+      const manager = new SubscriptionManager({ schema: createTestSchema(probes) });
+      const calls: string[] = [];
+
+      const subscribing = manager.subscribe(
+        'conn-1',
+        'sub-1',
+        { query: 'subscription { slow }' },
+        undefined,
+        () => calls.push('next'),
+        () => calls.push('complete'),
+        () => calls.push('error')
+      );
+      await waitFor(() => probes.length === 1);
+      manager.unsubscribeConnection('conn-1');
+
+      const subscription = await subscribing;
+
+      await waitFor(() => probes[0]!.returned);
+      expect(subscription.status).toBe('completed');
+      expect(manager.subscriptionCount).toBe(0);
+      expect(manager.connectionCount).toBe(0);
+      expect(calls).toEqual([]);
     });
   });
 
@@ -362,6 +467,60 @@ describe('SubscriptionManager', () => {
       expect(manager.getSubscription('conn-1', 'sub-1')).toBeUndefined();
       await waitFor(() => probes[0]!.returned);
       expect(probes[0]!.returned).toBe(true);
+    });
+  });
+
+  describe('logger', () => {
+    test('should log timeouts through the injected logger', async () => {
+      const warns: unknown[][] = [];
+      const manager = new SubscriptionManager({
+        schema: createTestSchema(),
+        subscriptionTimeout: 10,
+        logger: { error: () => {}, warn: (...args: unknown[]) => warns.push(args) },
+      });
+      const consoleSpy = spyOn(console, 'warn').mockImplementation(() => {});
+
+      try {
+        await manager.subscribe(
+          'conn-1',
+          'sub-1',
+          { query: 'subscription { forever }' },
+          undefined,
+          () => {},
+          () => {},
+          () => {}
+        );
+        await waitFor(() => warns.length > 0);
+        expect(String(warns[0]![0])).toMatch(/timed out/);
+        expect(consoleSpy).not.toHaveBeenCalled();
+      } finally {
+        consoleSpy.mockRestore();
+        manager.clear();
+      }
+    });
+
+    test('should fall back to logger.error when the logger has no warn', async () => {
+      const errors: unknown[][] = [];
+      const manager = new SubscriptionManager({
+        schema: createTestSchema(),
+        subscriptionTimeout: 10,
+        logger: { error: (...args: unknown[]) => errors.push(args) },
+      });
+
+      await manager.subscribe(
+        'conn-1',
+        'sub-1',
+        { query: 'subscription { forever }' },
+        undefined,
+        () => {},
+        () => {
+          throw new Error('hook exploded');
+        },
+        () => {}
+      );
+      await waitFor(() => errors.length >= 2);
+      expect(errors.some((call) => String(call[0]).includes('timed out'))).toBe(true);
+      expect(errors.some((call) => String(call[0]).includes('Error completing'))).toBe(true);
     });
   });
 

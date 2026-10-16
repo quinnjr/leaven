@@ -283,6 +283,11 @@ interface WebSocketHandlerConfig<TContext = unknown> {
   keepAliveInterval?: number;
   /** Forwarded to the SubscriptionManager (minus `schema`) */
   subscriptionManager?: Omit<SubscriptionManagerConfig, 'schema'>;
+  /**
+   * Destination for diagnostics such as failing hooks (default `console`).
+   * Passed on to the SubscriptionManager unless it sets its own.
+   */
+  logger?: WebSocketLogger;
   /** Return false to reject the connection with 4403 */
   onConnect?: (
     socket: ServerWebSocket<WebSocketContext>,
@@ -313,7 +318,22 @@ interface WebSocketContext {
 Close codes follow the protocol: `4400` invalid message, `4401` unauthorized
 (operation before `connection_init`), `4403` rejected by `onConnect`, `4408`
 init timeout, `4409` duplicate subscription id, `4429` repeated
-`connection_init`.
+`connection_init` (including a second one sent while `onConnect` for the
+first is still running).
+
+An operation is tracked from the moment its `subscribe` frame arrives. A
+client `complete` for an operation that is still setting up cancels it, and
+an operation still setting up when the socket closes is abandoned: in both
+cases nothing is registered and any source stream it obtained is returned.
+Operations still setting up count toward `maxSubscriptionsPerConnection`.
+
+```typescript
+interface WebSocketLogger {
+  error(...args: unknown[]): void;
+  /** Optional; warnings go to `error` without it */
+  warn?(...args: unknown[]): void;
+}
+```
 
 ### SubscriptionManager
 
@@ -334,6 +354,9 @@ class SubscriptionManager {
     onError: (errors: readonly { message: string }[]) => void
   ): Promise<Subscription>;
 
+  /** Parse with the executor's limits (maxTokens, maxDepth) */
+  parse(query: string): Promise<DocumentNode>;
+
   /** Run a query or mutation on the same executor */
   execute<TContext = unknown>(
     request: GraphQLRequest,
@@ -348,6 +371,8 @@ class SubscriptionManager {
 
   readonly subscriptionCount: number;
   readonly connectionCount: number;
+  /** maxSubscriptionsPerConnection */
+  readonly subscriptionLimit: number;
 }
 
 function createSubscriptionManager(config: SubscriptionManagerConfig): SubscriptionManager;
@@ -365,6 +390,8 @@ interface SubscriptionManagerConfig {
    * `introspection: false`, `maxDepth` or `maxComplexity`.
    */
   executor?: LeavenExecutor | Omit<ExecutorConfig, 'schema'>;
+  /** Destination for timeout and callback diagnostics (default `console`) */
+  logger?: WebSocketLogger;
 }
 
 interface Subscription {
@@ -380,7 +407,9 @@ interface Subscription {
 
 Subscription ids are scoped to a connection: `graphql-ws` clients number their
 operations per connection (starting at `"1"`), so every lookup and teardown
-takes **both** the connection id and the subscription id.
+takes **both** the connection id and the subscription id. `subscribe` throws
+when the id is already registered on that connection rather than overwriting
+it.
 
 ### PubSub
 
@@ -409,6 +438,8 @@ interface PubSubConfig {
    * events instead of an unbounded queue. Unlimited by default.
    */
   maxQueueSize?: number;
+  /** Destination for subscriber callback errors (default `console`) */
+  logger?: WebSocketLogger;
 }
 ```
 

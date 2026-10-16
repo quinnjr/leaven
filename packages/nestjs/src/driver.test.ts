@@ -548,6 +548,39 @@ describe('LeavenDriver', () => {
     });
   });
 
+  describe('parseOptions', () => {
+    test('should reject documents over the default 10000-token budget', async () => {
+      driver = new LeavenDriver({ schema });
+      await driver.onModuleInit();
+
+      const result = await driver.execute(`{ ${'hello '.repeat(10_001)} }`);
+      expect(result.data).toBeUndefined();
+      expect(result.errors?.[0]?.message).toMatch(/tokens/i);
+    });
+
+    test('should apply a configured maxTokens', async () => {
+      driver = new LeavenDriver({ schema, parseOptions: { maxTokens: 3 } });
+      await driver.onModuleInit();
+
+      const result = await driver.execute('{ hello hello hello }');
+      expect(result.errors?.[0]?.message).toMatch(/tokens/i);
+      expect(driver.getParseOptions().maxTokens).toBe(3);
+    });
+
+    test('should default maxTokens to 10000', () => {
+      expect(new LeavenDriver({ schema }).getParseOptions().maxTokens).toBe(10_000);
+    });
+
+    test('should allow opting out with maxTokens: Infinity', async () => {
+      driver = new LeavenDriver({ schema, parseOptions: { maxTokens: Infinity } });
+      await driver.onModuleInit();
+
+      expect(driver.getParseOptions().maxTokens).toBe(Infinity);
+      const result = await driver.execute('{ hello hello hello }');
+      expect(result.errors).toBeUndefined();
+    });
+  });
+
   describe('subscribe', () => {
     beforeEach(async () => {
       driver = new LeavenDriver({ schema });

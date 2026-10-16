@@ -29,7 +29,7 @@
 export { LeavenModule, LEAVEN_MODULE_OPTIONS, LEAVEN_DRIVER, LEAVEN_PUBSUB } from './module';
 
 // Driver exports
-export { LeavenDriver, type HandlerResult } from './driver';
+export { LeavenDriver, DEFAULT_MAX_TOKENS, type HandlerResult } from './driver';
 
 // `@nestjs/graphql` driver bridge — the path on which NestJS guards,
 // interceptors and parameter decorators execute.

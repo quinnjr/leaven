@@ -5,7 +5,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach, spyOn } from 'bun:test';
 import { parse, GraphQLError } from 'graphql';
 import { RedisDocumentCache, createRedisCache, type RedisClient } from './cache-redis';
 
@@ -829,6 +829,46 @@ describe('RedisDocumentCache', () => {
       expect(thrown).toBeInstanceOf(Error);
       expect((thrown as Error).message).toBe('Cache clear failed after deleting 1 keys');
       expect((thrown as Error).cause).toBeInstanceOf(Error);
+    });
+  });
+
+  describe('key collisions', () => {
+    const queryA = '{ user(id: "a") { id name } }';
+    const queryB = '{ hello }';
+
+    test('should never serve the entry of one query for another, even when hashes collide', async () => {
+      const colliding = new RedisDocumentCache({
+        client: mockRedis,
+        prefix: 'test:doc:',
+        hashKey: () => 'collide',
+      });
+
+      await colliding.setWithValidation(queryA, parse(queryA), { valid: true, errors: [] });
+
+      expect(await colliding.get(queryB)).toBeNull();
+      expect(await colliding.getWithValidation(queryB)).toBeNull();
+
+      // setValidation for B must not rewrite A's entry with B's verdict
+      await colliding.setValidation(queryB, { valid: false, errors: [] });
+      expect((await colliding.getWithValidation(queryA))?.validation?.valid).toBe(true);
+    });
+
+    test('should key entries by SHA-256 rather than the 64-bit Bun.hash', async () => {
+      const spy = spyOn(Bun, 'hash').mockImplementation(() => 1n);
+      try {
+        await cache.set(queryA, parse(queryA));
+        await cache.set(queryB, parse(queryB));
+
+        const keys = Array.from(mockRedis.data.keys()).filter(
+          (k) => k.startsWith('test:doc:') && !k.includes('__stats__')
+        );
+        expect(keys.length).toBe(2);
+        for (const key of keys) {
+          expect(key).toMatch(/^test:doc:[0-9a-f]{64}$/);
+        }
+      } finally {
+        spy.mockRestore();
+      }
     });
   });
 

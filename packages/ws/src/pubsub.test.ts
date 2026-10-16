@@ -5,7 +5,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach, spyOn } from 'bun:test';
 import { PubSub, createPubSub } from './pubsub';
 
 describe('PubSub', () => {
@@ -368,5 +368,31 @@ describe('createPubSub', () => {
   test('should accept config', () => {
     const pubsub = createPubSub({ maxSubscribersPerTopic: 5 });
     expect(pubsub).toBeInstanceOf(PubSub);
+  });
+});
+
+describe('PubSub logger', () => {
+  test('should report subscriber errors through the injected logger', () => {
+    const errors: unknown[][] = [];
+    const pubsub = new PubSub({
+      wildcards: true,
+      logger: { error: (...args: unknown[]) => errors.push(args) },
+    });
+    const consoleSpy = spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      pubsub.subscribe('a.b', () => {
+        throw new Error('exact boom');
+      });
+      pubsub.subscribe('a.*', () => {
+        throw new Error('wildcard boom');
+      });
+      pubsub.publish('a.b', 1);
+
+      expect(errors.length).toBe(2);
+      expect(consoleSpy).not.toHaveBeenCalled();
+    } finally {
+      consoleSpy.mockRestore();
+    }
   });
 });

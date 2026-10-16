@@ -78,6 +78,14 @@ console.log(stats);
 of times each cached entry has been reused. Misses are not tracked at all, so
 the value is unbounded and routinely exceeds `1` on a warm cache.
 
+Only documents that pass validation are cached, so rejected queries cannot
+fill the cache. Queries longer than `directKeyMaxLength` (default 256) are
+keyed by SHA-256; every entry also keeps its full query and a lookup only hits
+on an exact match, so a key collision is a miss, never another query's
+document or verdict. Pass `hashKey` to `DocumentCache` or `createRedisCache`
+to replace the hash. The compiled-query cache, which holds complexity
+results, is keyed by the full query string and operation name.
+
 `size` (and its alias `entries`) is exact for the in-memory cache. The Redis
 cache maintains it as a counter updated on writes and deletes and cannot
 observe server-side TTL expirations, so there it is an upper bound that drifts
@@ -297,11 +305,17 @@ class LeavenExecutor {
 
   // The schema this executor was built with
   getSchema(): GraphQLSchema;
+
+  // Parse under this executor's limits (maxTokens, maxDepth), reusing a
+  // cached document; never writes to the cache
+  parse(query: string): Promise<DocumentNode>;
 }
 ```
 
-Parsing and validation are internal to `execute`/`subscribe`. To do them
-yourself, use the standalone `parseDocument(query, options)` and
+Parsing and validation are internal to `execute`/`subscribe`. A transport
+that must inspect a document first (to choose between them, say) should use
+`executor.parse(query)` so the configured parse limits still apply. To do
+both yourself, use the standalone `parseDocument(query, options)` and
 `validateDocument(schema, document, options)` exports.
 
 ### GraphQLRequest

@@ -5,7 +5,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import 'reflect-metadata';
 import type { ServerWebSocket } from 'bun';
 import { GraphQLSchema, GraphQLObjectType, GraphQLString, GraphQLInt } from 'graphql';
@@ -948,6 +948,64 @@ describe('SubscriptionManager security (connection params)', () => {
   });
 });
 
+describe('SubscriptionManager parse limits (LeavenModuleOptions.parseOptions)', () => {
+  /** Payload of the single `next` frame answering operation `id` */
+  function nextErrors(socket: MockWebSocket, id: string): Array<{ message: string }> {
+    const next = sentOfType(socket, 'next').find((frame) => frame.id === id);
+    return ((next?.payload as { errors?: Array<{ message: string }> }) ?? {}).errors ?? [];
+  }
+
+  test('applies a default maxTokens of 10000 to operation-type detection and execution', async () => {
+    const harness = await createManager();
+    const socket = await initConnection(harness.manager);
+
+    socket.simulateMessage(
+      JSON.stringify({
+        type: 'subscribe',
+        id: '1',
+        payload: { query: `subscription { ${'countdown '.repeat(10_001)} }` },
+      })
+    );
+    await waitFor(() => sentOfType(socket, 'complete').length > 0);
+
+    // Reported through the executor's error path, not thrown out of the handler
+    expect(nextErrors(socket, '1')[0]?.message).toMatch(/tokens/i);
+    expect(socket.readyState).toBe(1);
+    expect(harness.manager.getSubscriptionCount()).toBe(0);
+
+    await destroyHarness(harness);
+  });
+
+  test('honours a configured parseOptions.maxTokens', async () => {
+    const harness = await createManager(undefined, undefined, {
+      parseOptions: { maxTokens: 5 },
+    });
+    const socket = await initConnection(harness.manager);
+
+    socket.simulateMessage(
+      JSON.stringify({
+        type: 'subscribe',
+        id: '1',
+        payload: { query: 'subscription { countdown countdown countdown countdown }' },
+      })
+    );
+    await waitFor(() => sentOfType(socket, 'complete').length > 0);
+
+    expect(nextErrors(socket, '1')[0]?.message).toMatch(/tokens/i);
+    expect(socket.readyState).toBe(1);
+
+    // A document within the budget still runs
+    socket.simulateMessage(
+      JSON.stringify({ type: 'subscribe', id: '2', payload: { query: '{ hello }' } })
+    );
+    await waitFor(() => sentOfType(socket, 'next').some((frame) => frame.id === '2'));
+    const ok = sentOfType(socket, 'next').find((frame) => frame.id === '2');
+    expect((ok?.payload as { data?: { hello?: string } }).data?.hello).toBe('world');
+
+    await destroyHarness(harness);
+  });
+});
+
 describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)', () => {
   test('onConnect returning false closes the connection with 4401', async () => {
     const harness = await createManager({ onConnect: () => false });
@@ -959,6 +1017,61 @@ describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)'
 
     expect(socket.closeCode).toBe(4401);
     expect(sentOfType(socket, 'connection_ack').length).toBe(0);
+
+    await destroyHarness(harness);
+  });
+
+  test('a second connection_init while onConnect is pending closes with 4429', async () => {
+    let connects = 0;
+    const harness = await createManager({
+      keepAlive: 1000,
+      onConnect: async () => {
+        connects++;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return true;
+      },
+    });
+    const socket = createMockWebSocket();
+    await harness.manager.handleConnection(socket as unknown as WebSocket);
+
+    socket.simulateMessage(JSON.stringify({ type: 'connection_init' }));
+    socket.simulateMessage(JSON.stringify({ type: 'connection_init' }));
+    await waitFor(() => socket.readyState === 3);
+    // Let the first onConnect settle
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    expect(socket.closeCode).toBe(4429);
+    expect(connects).toBe(1);
+    expect(sentOfType(socket, 'connection_ack').length).toBe(0);
+
+    await destroyHarness(harness);
+  });
+
+  test('a socket closed during onConnect is neither acknowledged nor kept alive', async () => {
+    const harness = await createManager({
+      keepAlive: 5,
+      onConnect: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return true;
+      },
+    });
+    const socket = createMockWebSocket();
+    await harness.manager.handleConnection(socket as unknown as WebSocket);
+
+    const intervalSpy = spyOn(globalThis, 'setInterval');
+    try {
+      socket.simulateMessage(JSON.stringify({ type: 'connection_init' }));
+      socket.simulateClose();
+      await new Promise((resolve) => setTimeout(resolve, 40));
+
+      // No keep-alive timer may be started for a socket that is already
+      // gone: nothing would ever clear it
+      expect(intervalSpy).not.toHaveBeenCalled();
+    } finally {
+      intervalSpy.mockRestore();
+    }
+    expect(sentOfType(socket, 'connection_ack').length).toBe(0);
+    expect(harness.manager.getConnectionCount()).toBe(0);
 
     await destroyHarness(harness);
   });
@@ -1614,11 +1727,13 @@ function createTestSchema(probe?: StreamProbe): GraphQLSchema {
 
 async function createManager(
   subscriptions?: SubscriptionConfig,
-  probe?: StreamProbe
+  probe?: StreamProbe,
+  extra: Partial<LeavenModuleOptions> = {}
 ): Promise<TestHarness> {
   const options: LeavenModuleOptions = {
     schema: createTestSchema(probe),
     subscriptions,
+    ...extra,
   };
 
   const driver = new LeavenDriver(options);

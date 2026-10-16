@@ -18,6 +18,7 @@ import {
   calculateQueryDepth,
   compileQuery,
   type ExecutorConfig,
+  type ParseOptions,
 } from '@leaven-graphql/core';
 import { ValidationError, formatError, isLeavenError } from '@leaven-graphql/errors';
 import type {
@@ -52,6 +53,12 @@ interface QueryAnalysis {
  * This driver integrates Leaven's high-performance GraphQL execution
  * with NestJS's dependency injection and module system.
  */
+/**
+ * Default `parseOptions.maxTokens`: generous for real documents, but bounds
+ * the lexing, parsing and validation work one request can demand.
+ */
+export const DEFAULT_MAX_TOKENS = 10_000;
+
 @Injectable()
 export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
   private executor: LeavenExecutor | null = null;
@@ -113,6 +120,17 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Effective parser options: the configured `parseOptions` with `maxTokens`
+   * defaulted to {@link DEFAULT_MAX_TOKENS}.
+   */
+  public getParseOptions(): ParseOptions {
+    return {
+      ...this.options.parseOptions,
+      maxTokens: this.options.parseOptions?.maxTokens ?? DEFAULT_MAX_TOKENS,
+    };
+  }
+
+  /**
    * Get the executor instance
    */
   public getExecutor(): LeavenExecutor | null {
@@ -139,6 +157,7 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
       metrics: this.options.metrics,
       maxComplexity: this.options.maxComplexity,
       maxDepth: this.options.maxDepth,
+      parseOptions: this.getParseOptions(),
       introspection: this.isIntrospectionEnabled(),
     };
 
@@ -448,7 +467,9 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
 
     let document: DocumentNode;
     try {
-      document = typeof query === 'string' ? parse(query) : query;
+      const { graphqlOptions, maxTokens } = this.getParseOptions();
+      document =
+        typeof query === 'string' ? parse(query, { ...graphqlOptions, maxTokens }) : query;
     } catch (error) {
       if (error instanceof GraphQLError) {
         // Genuine syntax error: defer to the executor.

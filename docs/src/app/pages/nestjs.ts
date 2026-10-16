@@ -180,6 +180,11 @@ import { SeoService } from '../services/seo.service';
                 <td class="py-3">Rejected by the executor at parse time</td>
               </tr>
               <tr class="border-b border-zinc-800/50">
+                <td class="py-3 pr-4"><code class="text-pink-400">parseOptions</code></td>
+                <td class="py-3 pr-4"><code class="text-pink-400">ParseOptions</code></td>
+                <td class="py-3">Parser limits; <code class="text-pink-400">maxTokens</code> defaults to 10000 (<code class="text-pink-400">Infinity</code> opts out)</td>
+              </tr>
+              <tr class="border-b border-zinc-800/50">
                 <td class="py-3 pr-4"><code class="text-pink-400">playground</code></td>
                 <td class="py-3 pr-4"><code class="text-pink-400">boolean</code></td>
                 <td class="py-3">Serve GraphiQL on <code class="text-pink-400">GET &lt;path&gt;</code></td>

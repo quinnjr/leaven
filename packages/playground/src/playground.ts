@@ -71,13 +71,13 @@ export function renderPlayground(config: PlaygroundConfig): string {
   <title>${escapeHtml(title)}</title>
   <link
     rel="stylesheet"
-    href="https://cdn.jsdelivr.net/npm/graphql-playground-react@1.7.26/build/static/css/index.css"
+    href="https://cdn.jsdelivr.net/npm/graphql-playground-react@1.7.28/build/static/css/index.css"
   />
   <link
     rel="shortcut icon"
-    href="https://cdn.jsdelivr.net/npm/graphql-playground-react@1.7.26/build/favicon.png"
+    href="https://cdn.jsdelivr.net/npm/graphql-playground-react@1.7.28/build/favicon.png"
   />
-  <script src="https://cdn.jsdelivr.net/npm/graphql-playground-react@1.7.26/build/static/js/middleware.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/graphql-playground-react@1.7.28/build/static/js/middleware.js"></script>
   <style>
     html, body {
       margin: 0;

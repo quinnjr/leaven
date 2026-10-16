@@ -8,6 +8,7 @@
 import { GraphQLError } from 'graphql';
 import type { DocumentNode } from 'graphql';
 import type { IDocumentCache, CachedValidation, CacheStats } from './cache-interface';
+import { sha256Hex } from './cache';
 
 /**
  * Redis client interface (compatible with ioredis and node-redis)
@@ -142,6 +143,15 @@ export interface RedisCacheConfig {
    * Defaults to silent (errors are dropped).
    */
   onError?: (error: unknown, key: string) => void;
+  /**
+   * Hash used to derive an entry's Redis key from its query
+   * (default: SHA-256, hex).
+   *
+   * Each entry also stores its full query, and a read only hits when it
+   * matches, so even a colliding hash can never serve one query's document or
+   * validation verdict for another; a collision is just a miss.
+   */
+  hashKey?: (query: string) => string;
 }
 
 /**
@@ -166,6 +176,8 @@ interface SerializedEntry {
     valid: boolean;
     errors: SerializedError[];
   };
+  /** The full query string the entry was stored for */
+  q?: string;
   /** Created timestamp */
   c: number;
   /** Compressed flag */
@@ -186,6 +198,7 @@ export class RedisDocumentCache implements IDocumentCache {
   private readonly sizeKey: string;
   private readonly hitsKey: string;
   private readonly onError?: (error: unknown, key: string) => void;
+  private readonly hashKey: (query: string) => string;
 
   constructor(config: RedisCacheConfig) {
     this.client = config.client;
@@ -199,22 +212,23 @@ export class RedisDocumentCache implements IDocumentCache {
     this.sizeKey = `${statsKey}:size`;
     this.hitsKey = `${statsKey}:hits`;
     this.onError = config.onError;
+    this.hashKey = config.hashKey ?? sha256Hex;
   }
 
   /**
    * Generate a cache key for a query string
    */
   private generateKey(query: string): string {
-    const hash = Bun.hash(query).toString(36);
-    return `${this.prefix}${hash}`;
+    return `${this.prefix}${this.hashKey(query)}`;
   }
 
   /**
    * Serialize a document for Redis storage
    */
-  private serialize(document: DocumentNode, validation?: CachedValidation): string {
+  private serialize(query: string, document: DocumentNode, validation?: CachedValidation): string {
     const entry: SerializedEntry = {
       d: JSON.stringify(document),
+      q: query,
       c: Date.now(),
     };
 
@@ -273,7 +287,11 @@ export class RedisDocumentCache implements IDocumentCache {
    * and the error is reported through the optional `onError` config hook
    * (silent by default).
    */
-  private deserialize(data: string, key: string): { document: DocumentNode; validation?: CachedValidation } | null {
+  private deserialize(
+    data: string,
+    key: string,
+    query: string
+  ): { document: DocumentNode; validation?: CachedValidation } | null {
     try {
       const parsed = JSON.parse(data);
 
@@ -281,10 +299,16 @@ export class RedisDocumentCache implements IDocumentCache {
       if (parsed.z) {
         const buffer = Buffer.from(parsed.d, 'base64');
         const decompressed = Bun.gunzipSync(new Uint8Array(buffer));
-        return this.deserialize(new TextDecoder().decode(decompressed), key);
+        return this.deserialize(new TextDecoder().decode(decompressed), key, query);
       }
 
       const entry = parsed as SerializedEntry;
+      // The slot holds a different query (a key collision) or an entry
+      // written before queries were recorded: a plain miss, never a hit on
+      // someone else's document.
+      if (entry.q !== query) {
+        return null;
+      }
       const document = JSON.parse(entry.d) as DocumentNode;
 
       let validation: CachedValidation | undefined;
@@ -440,7 +464,7 @@ export class RedisDocumentCache implements IDocumentCache {
       return null;
     }
 
-    const result = this.deserialize(data, key);
+    const result = this.deserialize(data, key, query);
     if (result) {
       this.recordHit();
       return result.document;
@@ -454,7 +478,7 @@ export class RedisDocumentCache implements IDocumentCache {
    */
   public async set(query: string, document: DocumentNode): Promise<void> {
     const key = this.generateKey(query);
-    await this.writeEntry(key, this.serialize(document));
+    await this.writeEntry(key, this.serialize(query, document));
   }
 
   /**
@@ -472,7 +496,7 @@ export class RedisDocumentCache implements IDocumentCache {
       return null;
     }
 
-    const result = this.deserialize(data, key);
+    const result = this.deserialize(data, key, query);
     if (result) {
       this.recordHit();
       return result;
@@ -497,9 +521,9 @@ export class RedisDocumentCache implements IDocumentCache {
       return;
     }
 
-    const result = this.deserialize(data, key);
+    const result = this.deserialize(data, key, query);
     if (result) {
-      const serialized = this.serialize(result.document, validation);
+      const serialized = this.serialize(query, result.document, validation);
 
       // Preserve the entry's remaining lifetime so refreshing a verdict does
       // not extend it. A non-positive TTL means the key carries no expiry, or
@@ -523,7 +547,7 @@ export class RedisDocumentCache implements IDocumentCache {
     validation: CachedValidation
   ): Promise<void> {
     const key = this.generateKey(query);
-    await this.writeEntry(key, this.serialize(document, validation));
+    await this.writeEntry(key, this.serialize(query, document, validation));
   }
 
   /**
