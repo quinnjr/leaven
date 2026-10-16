@@ -17,6 +17,7 @@ import {
   LeavenExecutor,
   calculateQueryDepth,
   compileQuery,
+  escapeLog,
   type ExecutorConfig,
   type ParseOptions,
 } from '@leaven-graphql/core';
@@ -361,7 +362,8 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
       }
 
       throw new ValidationError(
-        `Unsupported content type "${contentType || '(none)'}": use application/json or application/graphql`
+        `Unsupported content type "${contentType ? escapeLog(contentType, 64) : '(none)'}": ` +
+          'use application/json or application/graphql'
       );
     }
 

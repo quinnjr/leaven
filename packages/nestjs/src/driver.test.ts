@@ -840,6 +840,26 @@ describe('LeavenDriver', () => {
       expect((caught as ValidationError).code).toBe('VALIDATION_ERROR');
     });
 
+    test('should escape and cap a hostile content type echoed in the error', async () => {
+      const request = new Request('http://localhost/graphql', {
+        method: 'POST',
+        headers: { 'Content-Type': `text/\u001b[2Jplain${'x'.repeat(1000)}` },
+        body: '{ hello }',
+      });
+
+      let caught: unknown;
+      try {
+        await driver.handleRequest(request, new Response());
+      } catch (error) {
+        caught = error;
+      }
+
+      const message = (caught as ValidationError).message;
+      expect(message).toContain('text/\\x1b[2Jplain');
+      expect(message).not.toMatch(/[\u0000-\u001f]/);
+      expect(message.length).toBeLessThan(400);
+    });
+
     test('should reject POST requests with an unsupported content type', async () => {
       const request = new Request('http://localhost/graphql', {
         method: 'POST',

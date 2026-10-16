@@ -40,6 +40,7 @@ import {
 } from '@nestjs/common';
 import { parse, getOperationAST, type DocumentNode } from 'graphql';
 import type { ServerWebSocket } from 'bun';
+import { escapeLog } from '@leaven-graphql/core';
 import { isValidOperationId } from '@leaven-graphql/ws';
 import { LeavenDriver, type HandlerResult } from './driver';
 import { wrapWithFilter, SUBSCRIPTION_FILTER_KEY } from './decorators';
@@ -826,7 +827,7 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
     // such a throw becomes an unhandled rejection that takes down every
     // connection — defeating the per-operation isolation above.
     void this.pumpStream(socket, state, id, registration, iterator).catch((error) => {
-      console.error(`Subscription pump failed for operation ${id}:`, error);
+      console.error(`Subscription pump failed for operation ${escapeLog(id)}:`, error);
       state.subscriptions.delete(id);
     });
   }
