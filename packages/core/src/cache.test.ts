@@ -5,7 +5,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach, spyOn } from 'bun:test';
 import { parse } from 'graphql';
 import { DocumentCache, createDocumentCache } from './cache';
 
@@ -376,6 +376,46 @@ describe('DocumentCache', () => {
       const query = '{ hello }'; // Longer than 5 chars
       customCache.set(query, parse(query));
       expect(customCache.has(query)).toBe(true);
+    });
+  });
+
+  describe('hashed key collisions', () => {
+    const longA = `{ user(id: "a") { id name } } # ${'a'.repeat(300)}`;
+    const longB = `{ hello } # ${'b'.repeat(300)}`;
+
+    test('should never serve the entry of one query for another, even when hashes collide', () => {
+      // Force every hashed key to collide
+      const colliding = new DocumentCache({ hashKey: () => 'collide' });
+
+      colliding.setWithValidation(longA, parse(longA), { valid: true, errors: [] });
+
+      expect(colliding.get(longB)).toBeNull();
+      expect(colliding.getWithValidation(longB)).toBeNull();
+      expect(colliding.has(longB)).toBe(false);
+      expect(colliding.delete(longB)).toBe(false);
+
+      // setValidation for B must not overwrite A's verdict
+      colliding.setValidation(longB, { valid: false, errors: [] });
+      expect(colliding.getWithValidation(longA)?.validation?.valid).toBe(true);
+
+      // A real write of B replaces the slot; A is then a miss, never B's data
+      colliding.set(longB, parse(longB));
+      expect(colliding.get(longA)).toBeNull();
+      expect(colliding.get(longB)).not.toBeNull();
+    });
+
+    test('should not key long queries by the 64-bit Bun.hash', () => {
+      const spy = spyOn(Bun, 'hash').mockImplementation(() => 1n);
+      try {
+        const fresh = new DocumentCache();
+        fresh.set(longA, parse(longA));
+        fresh.set(longB, parse(longB));
+
+        expect(fresh.size).toBe(2);
+        expect(fresh.get(longA)).not.toBe(fresh.get(longB));
+      } finally {
+        spy.mockRestore();
+      }
     });
   });
 

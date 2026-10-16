@@ -5,7 +5,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach, spyOn } from 'bun:test';
 import {
   buildSchema,
   GraphQLError,
@@ -303,6 +303,53 @@ describe('LeavenExecutor', () => {
       expect(result.response.errors![0]?.extensions?.code).toBe(
         ErrorCode.COMPLEXITY_LIMIT
       );
+    });
+  });
+
+  describe('compiled query cache identity', () => {
+    test('should not reuse the complexity of a cheap query for another on hash collision', async () => {
+      const limited = new LeavenExecutor({
+        schema,
+        rootValue,
+        cache: false,
+        maxComplexity: 2,
+      });
+
+      // Force any 64-bit Bun.hash-derived key to collide
+      const spy = spyOn(Bun, 'hash').mockImplementation(() => 1n);
+      try {
+        const cheap = await limited.execute({ query: '{ hello }' });
+        expect(cheap.response.errors).toBeUndefined();
+
+        const expensive = await limited.execute({
+          query: '{ a: hello b: hello c: hello d: hello e: hello }',
+        });
+        expect(expensive.response.data).toBeUndefined();
+        expect(expensive.response.errors?.[0]?.extensions?.code).toBe(
+          ErrorCode.COMPLEXITY_LIMIT
+        );
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    test('should not confuse query/operationName pairs that concatenate identically', async () => {
+      const limited = new LeavenExecutor({
+        schema,
+        rootValue,
+        cache: false,
+        maxComplexity: 2,
+      });
+
+      // `${query}:${operationName}` used to make these two requests share a key
+      const first = await limited.execute({ query: 'query A { hello }', operationName: 'A' });
+      expect(first.response.errors).toBeUndefined();
+
+      const second = await limited.execute({
+        query: 'query A { hello }:A',
+      });
+      // A syntax error, not a cached compiled plan
+      expect(second.response.errors?.[0]?.message).toMatch(/Syntax Error/);
     });
   });
 

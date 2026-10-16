@@ -266,13 +266,15 @@ export class LeavenExecutor {
     // Computed once: a cache entry is only reusable by an executor with the
     // same schema, the same validation rules AND the same parser options.
     // `printSchema` is memoised per schema instance because it dominates this.
-    this.validationFingerprint = Bun.hash(
-      [
-        printSchemaOnce(config.schema),
-        this.validationRules ? 'no-introspection' : 'default',
-        stableStringify(this.parseOptions),
-      ].join('|')
-    ).toString(36);
+    this.validationFingerprint = new Bun.CryptoHasher('sha256')
+      .update(
+        [
+          printSchemaOnce(config.schema),
+          this.validationRules ? 'no-introspection' : 'default',
+          stableStringify(this.parseOptions),
+        ].join('|')
+      )
+      .digest('hex');
     this.maxComplexity = config.maxComplexity;
     this.hooks = config.hooks;
     this.metricsEnabled = config.metrics ?? false;
@@ -308,12 +310,16 @@ export class LeavenExecutor {
   }
 
   /**
-   * Generate a cache key for a query
-   * Uses fast Bun.hash instead of MD5
+   * Generate the compiled-query cache key for a query and operation name.
+   *
+   * Keyed by the full strings, never by a hash: a 64-bit hash collision would
+   * let an expensive query reuse a cheap query's compiled plan and complexity
+   * verdict, bypassing `maxComplexity`. The operation name is length-prefixed
+   * so that no two (query, operationName) pairs can produce the same key.
    */
   private getCacheKey(query: string, operationName?: string): string {
-    const input = operationName ? `${query}:${operationName}` : query;
-    return Bun.hash(input).toString(36);
+    const name = operationName ?? '';
+    return `${operationName === undefined ? '-' : name.length}:${name}\x00${query}`;
   }
 
   /**
