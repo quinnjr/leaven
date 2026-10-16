@@ -9,6 +9,17 @@ import { describe, test, expect } from 'bun:test';
 import { renderPlayground, createPlaygroundHandler } from './playground';
 
 describe('renderPlayground', () => {
+  test('should load graphql-playground-react 1.7.28 (CVE-2021-41249 fix)', () => {
+    const html = renderPlayground({ endpoint: '/graphql' });
+    const versions = [...html.matchAll(/graphql-playground-react@([^/"]+)\//g)].map((m) => m[1]);
+
+    expect(versions.length).toBe(3);
+    expect(new Set(versions)).toEqual(new Set(['1.7.28']));
+    expect(html).toContain(
+      'https://cdn.jsdelivr.net/npm/graphql-playground-react@1.7.28/build/static/js/middleware.js'
+    );
+  });
+
   test('should render HTML with endpoint', () => {
     const html = renderPlayground({ endpoint: '/graphql' });
 
