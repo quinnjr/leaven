@@ -334,6 +334,82 @@ describe('WebSocketHandler', () => {
     });
   });
 
+  describe('connection_init races', () => {
+    test('should close with 4429 on a second connection_init while onConnect is pending', async () => {
+      let connects = 0;
+      const handler = createHandler({
+        onConnect: async () => {
+          connects++;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          return true;
+        },
+      });
+      const socket = createFakeSocket();
+      handler.handleOpen(socket);
+
+      // Bun dispatches back-to-back frames without awaiting the first
+      const first = handler.handleMessage(socket, '{"type":"connection_init"}');
+      const second = handler.handleMessage(socket, '{"type":"connection_init"}');
+
+      expect(socket.closed?.code).toBe(4429);
+      await Promise.all([first, second]);
+
+      // onConnect ran once; the second init never reached it
+      expect(connects).toBe(1);
+
+      await handler.handleClose(socket);
+    });
+
+    test('should never start more than one keep-alive timer per connection', async () => {
+      const intervalSpy = spyOn(globalThis, 'setInterval');
+      try {
+        const handler = createHandler({
+          keepAliveInterval: 1000,
+          onConnect: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            return true;
+          },
+        });
+        const socket = createFakeSocket();
+        handler.handleOpen(socket);
+
+        await Promise.all([
+          handler.handleMessage(socket, '{"type":"connection_init"}'),
+          handler.handleMessage(socket, '{"type":"connection_init"}'),
+        ]);
+
+        expect(intervalSpy.mock.calls.length).toBeLessThanOrEqual(1);
+
+        await handler.handleClose(socket);
+      } finally {
+        intervalSpy.mockRestore();
+      }
+    });
+
+    test('should neither ack nor start keep-alive when the socket closed during onConnect', async () => {
+      const handler = createHandler({
+        keepAliveInterval: 5,
+        onConnect: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          return true;
+        },
+      });
+      const socket = createFakeSocket();
+      handler.handleOpen(socket);
+
+      const init = handler.handleMessage(socket, '{"type":"connection_init"}');
+      await handler.handleClose(socket);
+      await init;
+
+      // Give a leaked keep-alive interval the chance to fire
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      expect(frames(socket).some((f) => f.type === 'connection_ack')).toBe(false);
+      expect(frames(socket).some((f) => f.type === 'ping')).toBe(false);
+      expect(socket.data.initialized).toBe(false);
+    });
+  });
+
   describe('ping', () => {
     test('should respond to ping with pong', async () => {
       const handler = createHandler();

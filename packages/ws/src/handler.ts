@@ -80,6 +80,20 @@ export interface WebSocketHandlerConfig<TContext = unknown> {
 }
 
 /**
+ * Handler-private lifecycle state for one socket.
+ *
+ * Kept off `socket.data` (which is the application's) and keyed by the socket
+ * object, so it outlives `handleClose`: an operation that resumes after the
+ * socket closed still finds `closed: true` rather than a fresh state.
+ */
+interface ConnectionState {
+  /** Set synchronously when connection_init processing starts */
+  initializing: boolean;
+  /** Set synchronously at the start of `handleClose` */
+  closed: boolean;
+}
+
+/**
  * WebSocket handler for Bun
  */
 export class WebSocketHandler<TContext = unknown> {
@@ -95,6 +109,7 @@ export class WebSocketHandler<TContext = unknown> {
 
   private readonly initTimeouts: Map<string, ReturnType<typeof setTimeout>>;
   private readonly keepAliveTimers: Map<string, ReturnType<typeof setInterval>>;
+  private readonly states: WeakMap<ServerWebSocket<WebSocketContext>, ConnectionState>;
 
   constructor(config: WebSocketHandlerConfig<TContext>) {
     this.schema = config.schema;
@@ -112,6 +127,30 @@ export class WebSocketHandler<TContext = unknown> {
 
     this.initTimeouts = new Map();
     this.keepAliveTimers = new Map();
+    this.states = new WeakMap();
+  }
+
+  /**
+   * Lifecycle state for a socket, created on first use.
+   */
+  private stateOf(socket: ServerWebSocket<WebSocketContext>): ConnectionState {
+    let state = this.states.get(socket);
+    if (!state) {
+      state = { initializing: false, closed: false };
+      this.states.set(socket, state);
+    }
+    return state;
+  }
+
+  /**
+   * Stop and forget a connection's keep-alive timer, if it has one.
+   */
+  private clearKeepAlive(connectionId: string): void {
+    const timer = this.keepAliveTimers.get(connectionId);
+    if (timer) {
+      clearInterval(timer);
+      this.keepAliveTimers.delete(connectionId);
+    }
   }
 
   /**
@@ -154,6 +193,7 @@ export class WebSocketHandler<TContext = unknown> {
       initialized: false,
       subscriptions: new Set(),
     };
+    this.states.set(socket, { initializing: false, closed: false });
 
     // Set connection init timeout
     const timeout = setTimeout(() => {
@@ -230,11 +270,18 @@ export class WebSocketHandler<TContext = unknown> {
     socket: ServerWebSocket<WebSocketContext>,
     params?: Record<string, unknown>
   ): Promise<void> {
-    // Reject repeated connection_init (graphql-ws close code 4429)
-    if (socket.data.initialized) {
+    const state = this.stateOf(socket);
+
+    // Reject repeated connection_init (graphql-ws close code 4429). The
+    // `initializing` flag is set synchronously, BEFORE the onConnect await:
+    // checking `initialized` alone lets a second init that arrives while the
+    // first is still in onConnect pass, run onConnect again and start a
+    // second keep-alive timer.
+    if (state.initializing || socket.data.initialized) {
       socket.close(4429, 'Too many initialisation requests');
       return;
     }
+    state.initializing = true;
 
     // Clear init timeout
     const timeout = this.initTimeouts.get(socket.data.connectionId);
@@ -246,6 +293,11 @@ export class WebSocketHandler<TContext = unknown> {
     // Check onConnect hook
     if (this.onConnect) {
       const allowed = await this.onConnect(socket, params);
+      // The socket may have closed while onConnect ran. Acknowledging it now
+      // would start a keep-alive timer that nothing ever clears.
+      if (state.closed) {
+        return;
+      }
       if (!allowed) {
         socket.close(4403, 'Forbidden');
         return;
@@ -258,8 +310,10 @@ export class WebSocketHandler<TContext = unknown> {
     // Send ack
     socket.send(formatMessage(createConnectionAck()));
 
-    // Start keep-alive
+    // Start keep-alive. Only one timer may ever exist per connection, so any
+    // existing one is cleared first.
     if (this.keepAliveInterval > 0) {
+      this.clearKeepAlive(socket.data.connectionId);
       const timer = setInterval(() => {
         socket.send(formatMessage({ type: MessageType.Ping }));
       }, this.keepAliveInterval);
@@ -397,6 +451,11 @@ export class WebSocketHandler<TContext = unknown> {
   public async handleClose(socket: ServerWebSocket<WebSocketContext>): Promise<void> {
     const { connectionId } = socket.data;
 
+    // Flag the close synchronously, before anything else: operations still
+    // awaiting onConnect, a context factory or the executor check it when
+    // they resume and must not register anything on a dead socket.
+    this.stateOf(socket).closed = true;
+
     // Clear timeouts/timers
     const initTimeout = this.initTimeouts.get(connectionId);
     if (initTimeout) {
@@ -404,11 +463,7 @@ export class WebSocketHandler<TContext = unknown> {
       this.initTimeouts.delete(connectionId);
     }
 
-    const keepAliveTimer = this.keepAliveTimers.get(connectionId);
-    if (keepAliveTimer) {
-      clearInterval(keepAliveTimer);
-      this.keepAliveTimers.delete(connectionId);
-    }
+    this.clearKeepAlive(connectionId);
 
     // Unsubscribe all subscriptions
     this.subscriptionManager.unsubscribeConnection(connectionId);
