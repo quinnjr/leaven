@@ -2,6 +2,7 @@
 '@leaven-graphql/playground': patch
 '@leaven-graphql/core': patch
 '@leaven-graphql/ws': patch
+'@leaven-graphql/nestjs': patch
 ---
 
 Security hardening for the playground, the executor caches and the WebSocket transport
@@ -25,3 +26,7 @@ Security hardening for the playground, the executor caches and the WebSocket tra
   `maxSubscriptionsPerConnection`. Operation-type detection parses with the
   executor's `maxTokens`/depth limits. `WebSocketHandler`,
   `SubscriptionManager` and `PubSub` accept a `logger` (default `console`).
+- **nestjs**: the NestJS subscription transport gets the same
+  `connection_init` fix: a second init while `onConnect` is running closes
+  with 4429, and a socket closed during `onConnect` is neither acknowledged
+  nor given a keep-alive timer.

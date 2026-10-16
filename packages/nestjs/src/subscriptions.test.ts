@@ -5,7 +5,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import 'reflect-metadata';
 import type { ServerWebSocket } from 'bun';
 import { GraphQLSchema, GraphQLObjectType, GraphQLString, GraphQLInt } from 'graphql';
@@ -959,6 +959,61 @@ describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)'
 
     expect(socket.closeCode).toBe(4401);
     expect(sentOfType(socket, 'connection_ack').length).toBe(0);
+
+    await destroyHarness(harness);
+  });
+
+  test('a second connection_init while onConnect is pending closes with 4429', async () => {
+    let connects = 0;
+    const harness = await createManager({
+      keepAlive: 1000,
+      onConnect: async () => {
+        connects++;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return true;
+      },
+    });
+    const socket = createMockWebSocket();
+    await harness.manager.handleConnection(socket as unknown as WebSocket);
+
+    socket.simulateMessage(JSON.stringify({ type: 'connection_init' }));
+    socket.simulateMessage(JSON.stringify({ type: 'connection_init' }));
+    await waitFor(() => socket.readyState === 3);
+    // Let the first onConnect settle
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    expect(socket.closeCode).toBe(4429);
+    expect(connects).toBe(1);
+    expect(sentOfType(socket, 'connection_ack').length).toBe(0);
+
+    await destroyHarness(harness);
+  });
+
+  test('a socket closed during onConnect is neither acknowledged nor kept alive', async () => {
+    const harness = await createManager({
+      keepAlive: 5,
+      onConnect: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return true;
+      },
+    });
+    const socket = createMockWebSocket();
+    await harness.manager.handleConnection(socket as unknown as WebSocket);
+
+    const intervalSpy = spyOn(globalThis, 'setInterval');
+    try {
+      socket.simulateMessage(JSON.stringify({ type: 'connection_init' }));
+      socket.simulateClose();
+      await new Promise((resolve) => setTimeout(resolve, 40));
+
+      // No keep-alive timer may be started for a socket that is already
+      // gone: nothing would ever clear it
+      expect(intervalSpy).not.toHaveBeenCalled();
+    } finally {
+      intervalSpy.mockRestore();
+    }
+    expect(sentOfType(socket, 'connection_ack').length).toBe(0);
+    expect(harness.manager.getConnectionCount()).toBe(0);
 
     await destroyHarness(harness);
   });
