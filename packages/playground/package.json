@@ -40,6 +40,11 @@
   ],
   "author": "Joseph Quinn",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/quinnjr/leaven.git",
+    "directory": "packages/playground"
+  },
   "devDependencies": {
     "@types/bun": "^1.3.14",
     "typescript": "^6.0.0"
