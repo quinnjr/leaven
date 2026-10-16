@@ -5,7 +5,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import { OperationTypeNode, getOperationAST, parse, type GraphQLSchema } from 'graphql';
+import { OperationTypeNode, getOperationAST, type DocumentNode, type GraphQLSchema } from 'graphql';
 import type { ServerWebSocket } from 'bun';
 import type { GraphQLRequest } from '@leaven-graphql/core';
 
@@ -407,7 +407,9 @@ export class WebSocketHandler<TContext = unknown> {
       // followed by Complete; routing it into graphql-js `subscribe()` would
       // fail with "Schema is not configured to execute subscription
       // operation."
-      if (!this.isSubscriptionOperation(request)) {
+      const isSubscription = await this.isSubscriptionOperation(request);
+      if (abandoned()) return;
+      if (!isSubscription) {
         const response = await this.subscriptionManager.execute(request, context);
         if (abandoned()) return;
 
@@ -473,10 +475,19 @@ export class WebSocketHandler<TContext = unknown> {
    * A document graphql-js cannot resolve to a single operation (no operations
    * at all, or several with no `operationName`) is reported as a subscription
    * so the executor produces the precise error rather than this method
-   * guessing at one.
+   * guessing at one. The same goes for a document that fails to parse.
+   *
+   * Parsing goes through the executor, so the configured `maxTokens` and
+   * depth limits apply here too; a plain `parse()` would lex an arbitrarily
+   * large document before the executor's limits ever ran.
    */
-  private isSubscriptionOperation(request: GraphQLRequest): boolean {
-    const document = parse(request.query);
+  private async isSubscriptionOperation(request: GraphQLRequest): Promise<boolean> {
+    let document: DocumentNode;
+    try {
+      document = await this.subscriptionManager.parse(request.query);
+    } catch {
+      return true;
+    }
     const operation = getOperationAST(document, request.operationName ?? null);
     return !operation || operation.operation === OperationTypeNode.SUBSCRIPTION;
   }

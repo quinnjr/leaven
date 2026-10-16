@@ -5,7 +5,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import type { GraphQLSchema } from 'graphql';
+import type { DocumentNode, GraphQLSchema } from 'graphql';
 import {
   LeavenExecutor,
   type ExecutorConfig,
@@ -100,6 +100,14 @@ export class SubscriptionManager {
    */
   public get subscriptionLimit(): number {
     return this.maxSubscriptionsPerConnection;
+  }
+
+  /**
+   * Parse a query under the managed executor's parser limits.
+   * See {@link LeavenExecutor.parse}.
+   */
+  public parse(query: string): Promise<DocumentNode> {
+    return this.executor.parse(query);
   }
 
   /**

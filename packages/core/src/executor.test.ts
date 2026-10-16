@@ -1001,6 +1001,37 @@ describe('LeavenExecutor', () => {
     });
   });
 
+  describe('parse', () => {
+    test('should parse a query', async () => {
+      const document = await executor.parse('{ hello }');
+      expect(document.kind).toBe('Document');
+    });
+
+    test('should apply the configured parse limits', async () => {
+      const limited = new LeavenExecutor({ schema, rootValue, parseOptions: { maxTokens: 3 } });
+      await expect(limited.parse('{ hello hello hello }')).rejects.toThrow(/tokens/i);
+    });
+
+    test('should apply maxDepth', async () => {
+      const limited = new LeavenExecutor({ schema, rootValue, maxDepth: 1 });
+      await expect(limited.parse('{ user(id: "1") { id } }')).rejects.toThrow(/depth/i);
+    });
+
+    test('should reuse a cached document without writing to the cache', async () => {
+      const cache = new DocumentCache();
+      const cached = new LeavenExecutor({ schema, rootValue, cache });
+
+      await cached.parse('{ hello }');
+      expect(cache.size).toBe(0);
+
+      await cached.execute({ query: '{ hello }' });
+      const getSpy = spyOn(cache, 'get');
+      await cached.parse('{ hello }');
+      expect(getSpy.mock.results[0]?.value).not.toBeNull();
+      getSpy.mockRestore();
+    });
+  });
+
   describe('subscribe', () => {
     test('should handle subscriptions', async () => {
       const result = await executor.subscribe({

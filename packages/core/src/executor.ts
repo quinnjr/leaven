@@ -848,6 +848,28 @@ export class LeavenExecutor {
   public getSchema(): GraphQLSchema {
     return this.schema;
   }
+
+  /**
+   * Parse a query under this executor's parser limits (`maxTokens`,
+   * `maxDepth`, `graphqlOptions`), reusing a cached document when one exists.
+   *
+   * For transports that must inspect a document before handing the request
+   * to {@link LeavenExecutor.execute} or {@link LeavenExecutor.subscribe}
+   * (for example to pick between them). A plain graphql-js `parse()` there
+   * would run without the limits and undo the parser's DoS protection.
+   * Nothing is written to the cache: only validated documents are cached.
+   *
+   * Throws on a syntax error or an exceeded limit.
+   */
+  public async parse(query: string): Promise<DocumentNode> {
+    if (this.cache) {
+      const cached = await resolveValue(this.cache.get(this.cacheKeyFor(query)));
+      if (cached) {
+        return cached;
+      }
+    }
+    return parseDocument(query, this.parseOptions);
+  }
 }
 
 /**

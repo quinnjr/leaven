@@ -838,6 +838,53 @@ describe('WebSocketHandler', () => {
     });
   });
 
+  describe('operation type detection', () => {
+    test('should parse with the executor limits, not an unbounded parse', async () => {
+      const handler = createHandler({
+        subscriptionManager: { executor: { parseOptions: { maxTokens: 5 } } },
+      });
+      const socket = createFakeSocket();
+      await openAndInit(handler, socket);
+
+      // Over the token budget long before the syntax error at the end: an
+      // unbounded parse lexes the whole document and reports the syntax error
+      await handler.handleMessage(
+        socket,
+        JSON.stringify({
+          id: 'op-1',
+          type: 'subscribe',
+          payload: { query: `{ ${'hello '.repeat(50)} ) }` },
+        })
+      );
+
+      const errorFrame = frames(socket).find((f) => f.type === 'error');
+      expect(errorFrame?.id).toBe('op-1');
+      expect(errorFrame?.payload?.[0]?.message).toMatch(/tokens/i);
+      expect(socket.closed).toBeNull();
+
+      await handler.handleClose(socket);
+    });
+
+    test('should still route queries through execute', async () => {
+      const handler = createHandler({
+        subscriptionManager: { executor: { parseOptions: { maxTokens: 50 } } },
+      });
+      const socket = createFakeSocket();
+      await openAndInit(handler, socket);
+
+      await handler.handleMessage(
+        socket,
+        '{"id":"op-1","type":"subscribe","payload":{"query":"{ hello }"}}'
+      );
+
+      const next = frames(socket).find((f) => f.type === 'next');
+      expect(next?.payload?.data?.hello).toBe('world');
+      expect(frames(socket).some((f) => f.type === 'complete')).toBe(true);
+
+      await handler.handleClose(socket);
+    });
+  });
+
   describe('per-connection subscription ids', () => {
     // Reference graphql-ws clients number operations per connection starting
     // at "1", so two independent sockets routinely use the same id
