@@ -1027,6 +1027,93 @@ describe('WebSocketHandler', () => {
     });
   });
 
+  describe('logger', () => {
+    function recordingLogger(): {
+      errors: unknown[][];
+      warns: unknown[][];
+      logger: { error(...args: unknown[]): void; warn(...args: unknown[]): void };
+    } {
+      const errors: unknown[][] = [];
+      const warns: unknown[][] = [];
+      return {
+        errors,
+        warns,
+        logger: {
+          error: (...args: unknown[]) => errors.push(args),
+          warn: (...args: unknown[]) => warns.push(args),
+        },
+      };
+    }
+
+    test('should report hook failures through the injected logger, not console', async () => {
+      const { errors, logger } = recordingLogger();
+      const handler = createHandler({
+        logger,
+        onComplete: async () => {
+          throw new Error('onComplete boom');
+        },
+      });
+      const socket = createFakeSocket();
+      const consoleSpy = spyOn(console, 'error').mockImplementation(() => {});
+
+      try {
+        await openAndInit(handler, socket);
+        await handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+        await handler.handleMessage(socket, '{"id":"sub-1","type":"complete"}');
+
+        await waitFor(() => errors.some((call) => String(call[0]).includes('onComplete')));
+        expect(consoleSpy).not.toHaveBeenCalled();
+      } finally {
+        consoleSpy.mockRestore();
+      }
+
+      await handler.handleClose(socket);
+    });
+
+    test('should report Bun callback failures through the injected logger', async () => {
+      const { errors, logger } = recordingLogger();
+      const handler = createHandler({
+        logger,
+        onDisconnect: async () => {
+          throw new Error('onDisconnect boom');
+        },
+      });
+      const socket = createFakeSocket();
+      const config = handler.getWebSocketConfig();
+      const consoleSpy = spyOn(console, 'error').mockImplementation(() => {});
+
+      try {
+        config.open(socket);
+        config.close(socket);
+        await waitFor(() => errors.some((call) => String(call[0]).includes('onDisconnect')));
+        expect(consoleSpy).not.toHaveBeenCalled();
+      } finally {
+        consoleSpy.mockRestore();
+      }
+    });
+
+    test('should pass its logger to the subscription manager', async () => {
+      const { warns, logger } = recordingLogger();
+      const handler = createHandler({
+        logger,
+        subscriptionManager: { subscriptionTimeout: 10 },
+      });
+      const socket = createFakeSocket();
+      const consoleSpy = spyOn(console, 'warn').mockImplementation(() => {});
+
+      try {
+        await openAndInit(handler, socket);
+        await handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+        await waitFor(() => warns.some((call) => String(call[0]).includes('timed out')));
+        expect(consoleSpy).not.toHaveBeenCalled();
+      } finally {
+        consoleSpy.mockRestore();
+      }
+
+      await handler.handleClose(socket);
+    });
+  });
+
   describe('complete', () => {
     test('should unsubscribe when the client sends complete', async () => {
       const completedIds: string[] = [];

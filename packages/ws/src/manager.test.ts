@@ -470,6 +470,60 @@ describe('SubscriptionManager', () => {
     });
   });
 
+  describe('logger', () => {
+    test('should log timeouts through the injected logger', async () => {
+      const warns: unknown[][] = [];
+      const manager = new SubscriptionManager({
+        schema: createTestSchema(),
+        subscriptionTimeout: 10,
+        logger: { error: () => {}, warn: (...args: unknown[]) => warns.push(args) },
+      });
+      const consoleSpy = spyOn(console, 'warn').mockImplementation(() => {});
+
+      try {
+        await manager.subscribe(
+          'conn-1',
+          'sub-1',
+          { query: 'subscription { forever }' },
+          undefined,
+          () => {},
+          () => {},
+          () => {}
+        );
+        await waitFor(() => warns.length > 0);
+        expect(String(warns[0]![0])).toMatch(/timed out/);
+        expect(consoleSpy).not.toHaveBeenCalled();
+      } finally {
+        consoleSpy.mockRestore();
+        manager.clear();
+      }
+    });
+
+    test('should fall back to logger.error when the logger has no warn', async () => {
+      const errors: unknown[][] = [];
+      const manager = new SubscriptionManager({
+        schema: createTestSchema(),
+        subscriptionTimeout: 10,
+        logger: { error: (...args: unknown[]) => errors.push(args) },
+      });
+
+      await manager.subscribe(
+        'conn-1',
+        'sub-1',
+        { query: 'subscription { forever }' },
+        undefined,
+        () => {},
+        () => {
+          throw new Error('hook exploded');
+        },
+        () => {}
+      );
+      await waitFor(() => errors.length >= 2);
+      expect(errors.some((call) => String(call[0]).includes('timed out'))).toBe(true);
+      expect(errors.some((call) => String(call[0]).includes('Error completing'))).toBe(true);
+    });
+  });
+
   describe('per-connection subscription ids', () => {
     // graphql-ws operation ids are unique per CONNECTION: reference clients
     // use a counter starting at "1", so two clients routinely both use "1".

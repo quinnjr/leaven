@@ -13,6 +13,8 @@ import {
   type GraphQLResponse,
 } from '@leaven-graphql/core';
 
+import { logWarning, type WebSocketLogger } from './logger';
+
 /**
  * Subscription status
  */
@@ -63,6 +65,11 @@ export interface SubscriptionManagerConfig {
    * Defaults to a new executor configured with `schema` alone.
    */
   executor?: LeavenExecutor | Omit<ExecutorConfig, 'schema'>;
+  /**
+   * Where diagnostics (subscription timeouts, failing completion callbacks)
+   * are logged. Defaults to `console`.
+   */
+  logger?: WebSocketLogger;
 }
 
 /**
@@ -83,6 +90,7 @@ export class SubscriptionManager {
   private readonly connections: Map<string, Map<string, Subscription>>;
   private readonly maxSubscriptionsPerConnection: number;
   private readonly subscriptionTimeout: number;
+  private readonly logger: WebSocketLogger;
 
   constructor(config: SubscriptionManagerConfig) {
     this.executor =
@@ -92,6 +100,7 @@ export class SubscriptionManager {
     this.connections = new Map();
     this.maxSubscriptionsPerConnection = config.maxSubscriptionsPerConnection ?? 100;
     this.subscriptionTimeout = config.subscriptionTimeout ?? 0;
+    this.logger = config.logger ?? console;
   }
 
   /**
@@ -215,13 +224,14 @@ export class SubscriptionManager {
               timedOut.status = 'completed';
               // The client sees a plain `complete` either way, so log here to
               // keep a timeout distinguishable from a natural completion.
-              console.warn(
+              logWarning(
+                this.logger,
                 `Subscription ${subscriptionId} timed out after ${this.subscriptionTimeout}ms`
               );
               onComplete();
             }
           } catch (error) {
-            console.error(
+            this.logger.error(
               `Error completing timed-out subscription ${subscriptionId}:`,
               error
             );

@@ -5,6 +5,8 @@
  * Licensed under the Apache License, Version 2.0
  */
 
+import type { WebSocketLogger } from './logger';
+
 /**
  * Subscribe function type
  */
@@ -42,6 +44,8 @@ export interface PubSubConfig {
    * without bound. Unlimited by default.
    */
   maxQueueSize?: number;
+  /** Where subscriber callback errors are logged. Defaults to `console`. */
+  logger?: WebSocketLogger;
 }
 
 /**
@@ -62,6 +66,7 @@ export class PubSub implements PubSubEngine {
   private readonly maxSubscribersPerTopic: number;
   private readonly wildcards: boolean;
   private readonly maxQueueSize: number;
+  private readonly logger: WebSocketLogger;
   private nextId: number;
 
   constructor(config: PubSubConfig = {}) {
@@ -70,6 +75,7 @@ export class PubSub implements PubSubEngine {
     this.maxSubscribersPerTopic = config.maxSubscribersPerTopic ?? 10000;
     this.wildcards = config.wildcards ?? false;
     this.maxQueueSize = config.maxQueueSize ?? Infinity;
+    this.logger = config.logger ?? console;
     this.nextId = 0;
   }
 
@@ -137,7 +143,7 @@ export class PubSub implements PubSubEngine {
         try {
           subscriber.callback(payload);
         } catch (error) {
-          console.error('Error in subscriber callback:', error);
+          this.logger.error('Error in subscriber callback:', error);
         }
       }
     }
@@ -171,7 +177,7 @@ export class PubSub implements PubSubEngine {
           try {
             subscriber.callback(payload);
           } catch (error) {
-            console.error('Error in wildcard subscriber callback:', error);
+            this.logger.error('Error in wildcard subscriber callback:', error);
           }
         }
       }

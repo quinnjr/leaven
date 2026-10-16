@@ -10,6 +10,7 @@ import type { ServerWebSocket } from 'bun';
 import type { GraphQLRequest } from '@leaven-graphql/core';
 
 import { SubscriptionManager, type SubscriptionManagerConfig } from './manager';
+import type { WebSocketLogger } from './logger';
 import {
   MessageType,
   parseMessage,
@@ -59,6 +60,12 @@ export interface WebSocketHandlerConfig<TContext = unknown> {
   keepAliveInterval?: number;
   /** Subscription manager config */
   subscriptionManager?: Omit<SubscriptionManagerConfig, 'schema'>;
+  /**
+   * Where diagnostics (failing hooks and callbacks) are logged. Defaults to
+   * `console`. Also passed to the subscription manager unless
+   * `subscriptionManager.logger` is set.
+   */
+  logger?: WebSocketLogger;
   /** Called when a connection is initialized */
   onConnect?: (
     socket: ServerWebSocket<WebSocketContext>,
@@ -120,6 +127,7 @@ export class WebSocketHandler<TContext = unknown> {
   private readonly onDisconnect?: WebSocketHandlerConfig<TContext>['onDisconnect'];
   private readonly onSubscribe?: WebSocketHandlerConfig<TContext>['onSubscribe'];
   private readonly onComplete?: WebSocketHandlerConfig<TContext>['onComplete'];
+  private readonly logger: WebSocketLogger;
 
   private readonly initTimeouts: Map<string, ReturnType<typeof setTimeout>>;
   private readonly keepAliveTimers: Map<string, ReturnType<typeof setInterval>>;
@@ -130,8 +138,10 @@ export class WebSocketHandler<TContext = unknown> {
     this.contextFactory = config.context;
     this.connectionInitTimeout = config.connectionInitTimeout ?? 3000;
     this.keepAliveInterval = config.keepAliveInterval ?? 12000;
+    this.logger = config.logger ?? console;
     this.subscriptionManager = new SubscriptionManager({
       schema: config.schema,
+      logger: this.logger,
       ...config.subscriptionManager,
     });
     this.onConnect = config.onConnect;
@@ -188,11 +198,11 @@ export class WebSocketHandler<TContext = unknown> {
       const result = invoke();
       if (result instanceof Promise) {
         result.catch((error) => {
-          console.error(`${name} failed:`, error);
+          this.logger.error(`${name} failed:`, error);
         });
       }
     } catch (error) {
-      console.error(`${name} failed:`, error);
+      this.logger.error(`${name} failed:`, error);
     }
   }
 
@@ -563,12 +573,12 @@ export class WebSocketHandler<TContext = unknown> {
       open: (socket: ServerWebSocket<WebSocketContext>) => this.handleOpen(socket),
       message: (socket: ServerWebSocket<WebSocketContext>, message: string | Buffer) => {
         void this.handleMessage(socket, message).catch((error) => {
-          console.error('WebSocket message handling failed:', error);
+          this.logger.error('WebSocket message handling failed:', error);
         });
       },
       close: (socket: ServerWebSocket<WebSocketContext>) => {
         void this.handleClose(socket).catch((error) => {
-          console.error('onDisconnect failed:', error);
+          this.logger.error('onDisconnect failed:', error);
         });
       },
     };
