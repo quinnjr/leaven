@@ -19,7 +19,7 @@ import {
 } from '@leaven-graphql/errors';
 import { LeavenExecutor, createExecutor } from './executor';
 import type { GraphQLResponse } from './types';
-import { DocumentCache, type IDocumentCache } from './cache';
+import { DocumentCache, AST_BYTES_PER_QUERY_CHAR, type IDocumentCache } from './cache';
 
 const schema = buildSchema(`
   type Query {
@@ -634,6 +634,180 @@ describe('LeavenExecutor', () => {
       // A valid document still gets its verdict recorded
       await recorder.execute({ query: '{ hello }' });
       expect(writes).toEqual(['setValidation']);
+    });
+  });
+
+  describe('caching only after every check passes', () => {
+    /** Entries in the executor's private compiled-query cache */
+    const compiledCount = (executor: LeavenExecutor): number =>
+      (executor as unknown as { compiledQueries: { size: number } }).compiledQueries.size;
+
+    const limited = (cache: IDocumentCache): LeavenExecutor =>
+      new LeavenExecutor({ schema, rootValue, cache, maxComplexity: 2, maxDepth: 3 });
+
+    test('should cache neither the document nor the plan of an invalid query', async () => {
+      const cache = new DocumentCache();
+      const executor = limited(cache);
+
+      const result = await executor.execute({ query: '{ doesNotExist }' });
+      expect(result.response.errors).toBeDefined();
+
+      expect(cache.size).toBe(0);
+      expect(compiledCount(executor)).toBe(0);
+    });
+
+    test('should cache neither the document nor the plan of an over-complexity query', async () => {
+      const cache = new DocumentCache();
+      const executor = limited(cache);
+
+      const result = await executor.execute({
+        query: '{ a: hello b: hello c: hello d: hello e: hello }',
+      });
+      expect(result.response.errors?.[0]?.extensions?.code).toBe(ErrorCode.COMPLEXITY_LIMIT);
+
+      expect(cache.size).toBe(0);
+      expect(compiledCount(executor)).toBe(0);
+    });
+
+    test('should reject an over-complexity query again on repeat, still uncached', async () => {
+      const cache = new DocumentCache();
+      const executor = limited(cache);
+      const query = '{ a: hello b: hello c: hello d: hello e: hello }';
+
+      for (let i = 0; i < 3; i++) {
+        const result = await executor.execute({ query });
+        expect(result.response.errors?.[0]?.extensions?.code).toBe(ErrorCode.COMPLEXITY_LIMIT);
+      }
+      expect(cache.size).toBe(0);
+      expect(compiledCount(executor)).toBe(0);
+    });
+
+    test('should cache neither the document nor the plan of an over-depth query', async () => {
+      const cache = new DocumentCache();
+      const executor = new LeavenExecutor({ schema, rootValue, cache, maxComplexity: 100, maxDepth: 1 });
+
+      const result = await executor.execute({ query: '{ user(id: "1") { id } }' });
+      expect(result.response.errors).toBeDefined();
+
+      expect(cache.size).toBe(0);
+      expect(compiledCount(executor)).toBe(0);
+    });
+
+    test('should not attach a verdict to a cached document when complexity fails', async () => {
+      const writes: string[] = [];
+      const documentOnly: IDocumentCache = {
+        get: () => null,
+        set: () => undefined,
+        getWithValidation: (key) => ({
+          document: parse(key.slice(key.indexOf('\x00') + 1)),
+        }),
+        setValidation: () => {
+          writes.push('setValidation');
+        },
+        setWithValidation: () => {
+          writes.push('setWithValidation');
+        },
+        has: () => false,
+        delete: () => false,
+        clear: () => undefined,
+        size: 0,
+        getStats: () => ({ size: 0, maxSize: 0, hitRate: 0, totalHits: 0, entries: 0 }),
+      };
+      const executor = limited(documentOnly);
+
+      await executor.execute({ query: '{ a: hello b: hello c: hello d: hello e: hello }' });
+      expect(writes).toEqual([]);
+      expect(compiledCount(executor)).toBe(0);
+    });
+
+    test('should cache both once a query passes validation and complexity', async () => {
+      const cache = new DocumentCache();
+      const executor = limited(cache);
+
+      const result = await executor.execute({ query: '{ hello }' });
+      expect(result.response.errors).toBeUndefined();
+
+      expect(cache.size).toBe(1);
+      expect(compiledCount(executor)).toBe(1);
+    });
+
+    test('should not create entries for an operationName the document lacks', async () => {
+      const executor = limited(new DocumentCache());
+
+      for (let i = 0; i < 20; i++) {
+        const result = await executor.execute({
+          query: 'query A { hello }',
+          operationName: `Nope${i}`,
+        });
+        expect(result.response.errors).toBeDefined();
+      }
+      expect(compiledCount(executor)).toBe(0);
+    });
+
+    test('should not create entries when no operation can be selected', async () => {
+      const executor = limited(new DocumentCache());
+
+      const result = await executor.execute({ query: 'query A { hello } query B { hello }' });
+      expect(result.response.errors).toBeDefined();
+      expect(compiledCount(executor)).toBe(0);
+    });
+
+    test('should share one entry between a named and an implicit selection of one operation', async () => {
+      const executor = limited(new DocumentCache());
+
+      await executor.execute({ query: 'query A { hello }', operationName: 'A' });
+      await executor.execute({ query: 'query A { hello }' });
+      const third = await executor.execute({ query: 'query A { hello }', operationName: 'A' });
+
+      expect(third.response.errors).toBeUndefined();
+      expect(compiledCount(executor)).toBe(1);
+    });
+
+    test('should keep separate entries for different operations of one document', async () => {
+      const executor = limited(new DocumentCache());
+      const query = 'query A { hello } query B { b: hello }';
+
+      const a = await executor.execute({ query, operationName: 'A' });
+      const b = await executor.execute({ query, operationName: 'B' });
+
+      expect(a.response.data).toEqual({ hello: 'Hello, World!' });
+      expect(b.response.data).toEqual({ b: 'Hello, World!' });
+      expect(compiledCount(executor)).toBe(2);
+    });
+
+    test('should not cache the plan of a query above the per-entry byte cap', async () => {
+      const executor = limited(new DocumentCache());
+      const padding = '#'.padEnd(
+        Math.ceil(LeavenExecutor.MAX_COMPILED_BYTES / 10 / AST_BYTES_PER_QUERY_CHAR),
+        'x'
+      );
+
+      const result = await executor.execute({ query: `{ hello }\n${padding}` });
+      expect(result.response.errors).toBeUndefined();
+      expect(compiledCount(executor)).toBe(0);
+    });
+
+    test('should report compiled-cache bytes and limits', async () => {
+      const executor = limited(new DocumentCache());
+      await executor.execute({ query: '{ hello }' });
+
+      const { compiled } = await executor.getCacheStats();
+      expect(compiled.size).toBe(1);
+      expect(compiled.maxSize).toBe(1000);
+      expect(compiled.bytes).toBe('{ hello }'.length * AST_BYTES_PER_QUERY_CHAR);
+      expect(compiled.maxBytes).toBe(32 * 1024 * 1024);
+    });
+
+    test('should apply the same rule to subscriptions', async () => {
+      const cache = new DocumentCache();
+      const executor = new LeavenExecutor({ schema, rootValue, cache, maxComplexity: 0 });
+
+      const result = await executor.subscribe({ query: 'subscription { countdown(from: 1) }' });
+      expect((result as GraphQLResponse).errors?.[0]?.extensions?.code).toBe(
+        ErrorCode.COMPLEXITY_LIMIT
+      );
+      expect(cache.size).toBe(0);
+      expect(compiledCount(executor)).toBe(0);
     });
   });
 

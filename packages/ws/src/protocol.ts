@@ -7,6 +7,8 @@
  * Implements graphql-ws protocol
  */
 
+import { escapeLog } from '@leaven-graphql/core';
+
 /**
  * Message types as defined by graphql-ws protocol
  */
@@ -121,6 +123,32 @@ const ID_REQUIRED_TYPES: ReadonlySet<string> = new Set([
   MessageType.Complete,
 ]);
 
+/** Message types whose `id` a client chooses and a server must route on */
+const CLIENT_ID_TYPES: ReadonlySet<string> = new Set([
+  MessageType.Subscribe,
+  MessageType.Complete,
+]);
+
+/**
+ * Accepted shape of a client-chosen operation id: 1-64 characters from
+ * `[A-Za-z0-9_.:-]`.
+ *
+ * Ids are picked by the client and end up as map keys, in close reasons and
+ * in log lines. The graphql-ws spec only says "unique string", so in
+ * principle a client could send newlines, ANSI escapes or a megabyte of
+ * text; this allow-list covers UUIDs, counters and the `prefix:n` styles
+ * real clients use, and nothing that can forge a log line.
+ */
+export const OPERATION_ID_PATTERN = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+/**
+ * Whether a value is an acceptable client-chosen operation id.
+ * See {@link OPERATION_ID_PATTERN}.
+ */
+export function isValidOperationId(id: unknown): id is string {
+  return typeof id === 'string' && OPERATION_ID_PATTERN.test(id);
+}
+
 /**
  * Options for {@link parseMessage}
  */
@@ -137,6 +165,9 @@ export interface ParseMessageOptions {
    * lenient peer may omit the id on `next`/`error`, and a parse throw there is
    * far more disruptive (it tears down the whole connection) than tolerating
    * the frame.
+   *
+   * When `true`, the id of a `subscribe` or `complete` frame must also match
+   * {@link OPERATION_ID_PATTERN}; anything else throws `Invalid message`.
    */
   requireId?: boolean;
 }
@@ -174,7 +205,9 @@ export function parseMessage(
     }
 
     if (typeof message.type !== 'string' || !VALID_MESSAGE_TYPES.has(message.type)) {
-      throw new Error(`Invalid message type: ${String(message.type)}`);
+      // Escaped and kept short: the handler sends this back as the close
+      // reason, which the WebSocket protocol caps at 123 bytes.
+      throw new Error(`Invalid message type: ${escapeLog(message.type, 12)}`);
     }
 
     if (
@@ -183,6 +216,13 @@ export function parseMessage(
       typeof message.id !== 'string'
     ) {
       throw new Error(`Message of type "${message.type}" must have a string id`);
+    }
+
+    // A server must also reject ids it cannot safely route or log. Only the
+    // client -> server types are checked: `next`/`error` ids are echoes of
+    // ids this side chose, and a client must not tear down over them.
+    if (requireId && CLIENT_ID_TYPES.has(message.type) && !isValidOperationId(message.id)) {
+      throw new Error('Invalid message');
     }
 
     return message as Message;

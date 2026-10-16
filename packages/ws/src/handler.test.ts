@@ -1184,6 +1184,34 @@ describe('WebSocketHandler', () => {
 
       expect(socket.closed?.code).toBe(4400);
     });
+
+    test.each(['evil\nINFO forged', 'x'.repeat(65), '', 'a b'])(
+      'should close with 4400 "Invalid message" for subscribe id %p',
+      async (id) => {
+        const handler = createHandler();
+        const socket = createFakeSocket();
+
+        await openAndInit(handler, socket);
+        await handler.handleMessage(
+          socket,
+          JSON.stringify({ id, type: 'subscribe', payload: { query: 'subscription { count }' } })
+        );
+
+        expect(socket.closed?.code).toBe(4400);
+        expect(socket.closed?.reason).toBe('Invalid message');
+      }
+    );
+
+    test('should close with 4400 "Invalid message" for a malformed complete id', async () => {
+      const handler = createHandler();
+      const socket = createFakeSocket();
+
+      await openAndInit(handler, socket);
+      await handler.handleMessage(socket, JSON.stringify({ id: 'a\r\nb', type: 'complete' }));
+
+      expect(socket.closed?.code).toBe(4400);
+      expect(socket.closed?.reason).toBe('Invalid message');
+    });
   });
 
   describe('handleClose', () => {

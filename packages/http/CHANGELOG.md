@@ -1,5 +1,13 @@
 # @leaven-graphql/http
 
+## 0.2.3
+
+### Patch Changes
+
+- Updated dependencies [801ced0]
+  - @leaven-graphql/core@0.2.3
+  - @leaven-graphql/ws@0.2.3
+
 ## 0.2.2
 
 ### Patch Changes

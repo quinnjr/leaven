@@ -54,6 +54,19 @@ describe('CompiledQuery', () => {
       expect(() => new CompiledQuery(schema, document, 'NonExistent')).toThrow();
     });
 
+    test('should escape and cap a client operation name in the error text', () => {
+      const document = parse('query GetUser { user(id: "1") { id } }');
+      let message = '';
+      try {
+        new CompiledQuery(schema, document, `Evil\nforged\u001b[2J${'x'.repeat(500)}`);
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toContain('Evil\\nforged\\x1b[2J');
+      expect(message).not.toMatch(/[\u0000-\u001f]/);
+      expect(message.length).toBeLessThan(400);
+    });
+
     test('should handle nested fields', () => {
       const document = parse('{ user(id: "1") { id name posts { title } } }');
       const compiled = new CompiledQuery(schema, document);

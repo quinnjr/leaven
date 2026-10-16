@@ -147,7 +147,17 @@ import { SeoService } from '../services/seo.service';
                 <td class="py-3 pr-4"><code class="text-green-400">parseMessage</code></td>
                 <td class="py-3">
                   Parse graphql-ws messages; <code class="text-green-400">{{ '{' }} requireId {{ '}' }}</code>
-                  defaults to <code class="text-green-400">true</code>
+                  defaults to <code class="text-green-400">true</code>, which also requires
+                  <code class="text-green-400">subscribe</code>/<code class="text-green-400">complete</code>
+                  ids to match <code class="text-green-400">OPERATION_ID_PATTERN</code>
+                </td>
+              </tr>
+              <tr class="border-b border-zinc-800/50">
+                <td class="py-3 pr-4"><code class="text-green-400">isValidOperationId</code></td>
+                <td class="py-3">
+                  Check a client operation id against
+                  <code class="text-green-400">^[A-Za-z0-9_.:-]{{ '{' }}1,64{{ '}' }}$</code>; the server closes
+                  with 4400 on anything else
                 </td>
               </tr>
               <tr class="border-b border-zinc-800/50">
@@ -378,11 +388,13 @@ const websocket = createWebSocketHandler({
   createErrorMessage,
   createCompleteMessage,
   createPongMessage,
+  isValidOperationId,
 } from '@leaven-graphql/ws';
 
 // parseMessage(data, options). requireId defaults to true, which is correct
 // for a SERVER parsing client frames: subscribe/next/error/complete without a
-// routable id are rejected. Pass { requireId: false } on the CLIENT, where a
+// routable id are rejected, and a subscribe/complete id outside
+// ^[A-Za-z0-9_.:-]{1,64}$ throws 'Invalid message' (the handler closes 4400). Pass { requireId: false } on the CLIENT, where a
 // lenient peer may omit it and a throw would tear down the connection.
 const message = parseMessage(data);
 const lenient = parseMessage(data, { requireId: false });
@@ -396,7 +408,10 @@ socket.send(formatMessage(createCompleteMessage(id)));
 
 if (message.type === MessageType.Ping) {
   socket.send(formatMessage(createPongMessage()));
-}`;
+}
+
+isValidOperationId('sub-1'); // true
+isValidOperationId('a\\nb'); // false: control characters are never accepted`;
 
   // doc-check: skip - GraphQL SDL, not TypeScript
   schemaCode = `type Subscription {

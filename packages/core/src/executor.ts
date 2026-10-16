@@ -11,6 +11,7 @@ import {
   GraphQLError,
   specifiedRules,
   NoSchemaIntrospectionCustomRule,
+  getOperationAST,
   printSchema,
   type GraphQLSchema,
   type DocumentNode,
@@ -21,7 +22,8 @@ import { ComplexityError, ErrorCode, isLeavenError } from '@leaven-graphql/error
 
 import { DocumentCache, type DocumentCacheConfig, type CachedValidation, type IDocumentCache, resolveValue } from './cache';
 import { parseDocument, validateDocument, type ParseOptions, type ValidationResult } from './parser';
-import { CompiledQuery, compileQuery, type CompilerOptions } from './compiler';
+import { type CompiledQuery, compileQuery, type CompilerOptions } from './compiler';
+import { CompiledQueryCache } from './compiled-cache';
 import type {
   Variables,
   GraphQLRequest,
@@ -236,9 +238,16 @@ export class LeavenExecutor {
   private readonly serializeExecutionError: (error: GraphQLError) => GraphQLFormattedError;
 
   /** Maximum number of compiled queries retained in the LRU cache */
-  private static readonly MAX_COMPILED_QUERIES = 1000;
+  public static readonly MAX_COMPILED_QUERIES = 1000;
 
-  private readonly compiledQueries: Map<string, CompiledQuery>;
+  /**
+   * Estimated memory budget of the compiled-query cache: 32 MiB. Plans are
+   * sized like document-cache entries (`estimateDocumentBytes`), and a plan
+   * above a tenth of this is never cached.
+   */
+  public static readonly MAX_COMPILED_BYTES = 32 * 1024 * 1024;
+
+  private readonly compiledQueries: CompiledQueryCache;
 
   constructor(config: ExecutorConfig) {
     this.schema = config.schema;
@@ -280,7 +289,10 @@ export class LeavenExecutor {
     this.metricsEnabled = config.metrics ?? false;
     this.serializeExecutionError =
       config.formatExecutionError ?? ((error: GraphQLError) => error.toJSON());
-    this.compiledQueries = new Map();
+    this.compiledQueries = new CompiledQueryCache(
+      LeavenExecutor.MAX_COMPILED_QUERIES,
+      LeavenExecutor.MAX_COMPILED_BYTES
+    );
 
     // Initialize cache
     if (config.cache === false) {
@@ -372,7 +384,8 @@ export class LeavenExecutor {
    * Parse a GraphQL query, reusing the cached document when one exists.
    *
    * Nothing is written back here: a cold parse defers its cache write until
-   * validation has run, so the document and its verdict land in a single
+   * validation and the complexity budget have both passed, so only admitted
+   * documents are stored, and the document and its verdict land in a single
    * {@link IDocumentCache.setWithValidation} call. See
    * {@link LeavenExecutor.cacheDocument}.
    *
@@ -445,16 +458,26 @@ export class LeavenExecutor {
     query: string,
     document: DocumentNode,
     operationName?: string
-  ): { compiled: CompiledQuery; cached: boolean } {
+  ): { compiled: CompiledQuery; cached: boolean; admit?: () => void } {
+    // Resolve the operation BEFORE building a key. The operation name is
+    // client-chosen: keyed on it unchecked, every request with a fresh bogus
+    // name would mint a new entry. A name the document lacks (or an
+    // ambiguous selection) has no key and is left to compileQuery to reject.
+    const operation = getOperationAST(document, operationName);
+    if (!operation) {
+      return {
+        compiled: compileQuery(this.schema, document, operationName, this.compilerOptions),
+        cached: false,
+      };
+    }
+
     // Key by the raw query string (already in hand) rather than
-    // re-serializing the AST on every execution.
-    const key = this.getCacheKey(query, operationName);
+    // re-serializing the AST, and by the name of the operation actually
+    // selected, so naming it explicitly or implicitly shares one entry.
+    const key = this.getCacheKey(query, operation.name?.value);
 
     const cached = this.compiledQueries.get(key);
     if (cached) {
-      // Refresh LRU recency (Map preserves insertion order)
-      this.compiledQueries.delete(key);
-      this.compiledQueries.set(key, cached);
       return { compiled: cached, cached: true };
     }
 
@@ -465,16 +488,12 @@ export class LeavenExecutor {
       this.compilerOptions
     );
 
-    // Evict the least recently used entry when the cache is full
-    if (this.compiledQueries.size >= LeavenExecutor.MAX_COMPILED_QUERIES) {
-      const oldest = this.compiledQueries.keys().next().value;
-      if (oldest !== undefined) {
-        this.compiledQueries.delete(oldest);
-      }
-    }
-
-    this.compiledQueries.set(key, compiled);
-    return { compiled, cached: false };
+    // Not stored yet: the caller admits the plan only once it has passed the
+    // complexity budget, so a rejected query never occupies (or evicts) a slot.
+    const admit = (): void => {
+      this.compiledQueries.set(key, query, compiled);
+    };
+    return { compiled, cached: false, admit };
   }
 
   /**
@@ -535,13 +554,6 @@ export class LeavenExecutor {
         document,
         this.validationRules ? { rules: this.validationRules } : undefined
       );
-
-      // Only valid documents are cached. Caching rejects would let a client
-      // fill the cache with junk queries (evicting real entries, or growing a
-      // shared Redis without bound) at no cost beyond a failed request.
-      if (validation.valid) {
-        this.cacheDocument(cacheKey, document, validation, parsed.cached);
-      }
     }
 
     if (this.metricsEnabled) {
@@ -556,13 +568,16 @@ export class LeavenExecutor {
       return { errors: validation.errors.map((e) => e.toJSON()) };
     }
 
-    // Check complexity if compiler is enabled
+    // Check complexity if compiler is enabled. The compiled plan is only
+    // stored once it is known to be within budget (see below).
+    let admitCompiled: (() => void) | undefined;
     if (this.compilerOptions) {
-      const { compiled, cached } = this.getCompiledQuery(
+      const { compiled, cached, admit } = this.getCompiledQuery(
         request.query,
         document,
         request.operationName
       );
+      admitCompiled = admit;
       telemetry.queryCached = cached;
       if (this.compilerOptions.calculateComplexity) {
         telemetry.complexity = compiled.complexity;
@@ -587,6 +602,16 @@ export class LeavenExecutor {
           ],
         };
       }
+    }
+
+    // Only now, with validation, the depth limit (enforced at parse time) and
+    // the complexity budget all passed, may anything be cached. Caching
+    // earlier would let a client fill either cache with rejected queries
+    // (evicting real entries, or growing a shared Redis without bound) at no
+    // cost beyond a failed request.
+    admitCompiled?.();
+    if (!cachedValidation) {
+      this.cacheDocument(cacheKey, document, validation, parsed.cached);
     }
 
     return { document };
@@ -819,14 +844,16 @@ export class LeavenExecutor {
    */
   public async getCacheStats(): Promise<{
     document: Awaited<ReturnType<IDocumentCache['getStats']>> | null;
-    compiled: { size: number; maxSize: number };
+    compiled: { size: number; maxSize: number; bytes: number; maxBytes: number };
   }> {
     const documentStats = this.cache ? await resolveValue(this.cache.getStats()) : null;
     return {
       document: documentStats,
       compiled: {
         size: this.compiledQueries.size,
-        maxSize: LeavenExecutor.MAX_COMPILED_QUERIES,
+        maxSize: this.compiledQueries.maxSize,
+        bytes: this.compiledQueries.bytes,
+        maxBytes: this.compiledQueries.maxBytes,
       },
     };
   }

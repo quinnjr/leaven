@@ -411,6 +411,53 @@ describe('SubscriptionManager protocol errors (graphql-ws)', () => {
     expect(socket.closeCode).toBe(4400);
   });
 
+  test.each(['evil\nINFO forged', 'x'.repeat(65), '', 'a b', 'del\u007f'])(
+    'closes with 4400 "Invalid message" for subscribe id %p',
+    async (id) => {
+      const socket = await initConnection(harness.manager);
+
+      socket.simulateMessage(
+        JSON.stringify({ type: 'subscribe', id, payload: { query: '{ hello }' } })
+      );
+      await waitFor(() => socket.readyState === 3);
+
+      expect(socket.closeCode).toBe(4400);
+      expect(socket.closeReason).toBe('Invalid message');
+    }
+  );
+
+  test('closes with 4400 "Invalid message" for a malformed complete id', async () => {
+    const socket = await initConnection(harness.manager);
+
+    socket.simulateMessage(JSON.stringify({ type: 'complete', id: 'a\r\nb' }));
+    await waitFor(() => socket.readyState === 3);
+
+    expect(socket.closeCode).toBe(4400);
+    expect(socket.closeReason).toBe('Invalid message');
+  });
+
+  test('closes with 4400 for a complete frame with a non-string id', async () => {
+    const socket = await initConnection(harness.manager);
+
+    socket.simulateMessage(JSON.stringify({ type: 'complete', id: 7 }));
+    await waitFor(() => socket.readyState === 3);
+
+    expect(socket.closeCode).toBe(4400);
+  });
+
+  test('accepts a well-formed operation id', async () => {
+    const socket = await initConnection(harness.manager);
+
+    socket.simulateMessage(
+      JSON.stringify({ type: 'subscribe', id: 'op:1.a_b-C', payload: { query: '{ hello }' } })
+    );
+    await waitFor(() =>
+      socket.sentMessages.some((m) => (m as { id?: unknown }).id === 'op:1.a_b-C')
+    );
+
+    expect(socket.readyState).not.toBe(3);
+  });
+
   test('closes with 4409 when a subscribe reuses an active operation id', async () => {
     const socket = await initConnection(harness.manager);
 

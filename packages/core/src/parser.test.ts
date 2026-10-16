@@ -341,6 +341,21 @@ describe('parseRequest', () => {
     ).toThrow(/not found/);
   });
 
+  test('should escape and cap a client operation name in the error text', () => {
+    let message = '';
+    try {
+      parseRequest({
+        query: 'query GetHello { hello }',
+        operationName: `Evil\r\nINFO forged ${'x'.repeat(500)}`,
+      });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain('Evil\\r\\nINFO forged');
+    expect(message).not.toMatch(/[\r\n]/);
+    expect(message.length).toBeLessThan(400);
+  });
+
   test('should throw for document with no operations', () => {
     expect(() =>
       parseRequest({

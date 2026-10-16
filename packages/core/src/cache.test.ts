@@ -7,7 +7,13 @@
 
 import { describe, test, expect, beforeEach, spyOn } from 'bun:test';
 import { parse } from 'graphql';
-import { DocumentCache, createDocumentCache } from './cache';
+import {
+  DocumentCache,
+  createDocumentCache,
+  estimateDocumentBytes,
+  AST_BYTES_PER_QUERY_CHAR,
+  DEFAULT_CACHE_MAX_BYTES,
+} from './cache';
 
 describe('DocumentCache', () => {
   let cache: DocumentCache;
@@ -212,6 +218,141 @@ describe('DocumentCache', () => {
       disabled.set('{ a }', parse('{ a }'));
 
       expect(disabled.size).toBe(0);
+    });
+  });
+
+  describe('byte budget (maxBytes)', () => {
+    const doc = parse('{ a }');
+    /** A distinct cache key of exactly `length` characters */
+    const key = (id: number, length: number): string =>
+      `${id}:`.padEnd(length, 'x');
+    const valid = { valid: true, errors: [] };
+
+    test('should default to 32 MiB and the documented AST factor', () => {
+      expect(DEFAULT_CACHE_MAX_BYTES).toBe(32 * 1024 * 1024);
+      expect(estimateDocumentBytes('x'.repeat(10))).toBe(10 * AST_BYTES_PER_QUERY_CHAR);
+      const stats = new DocumentCache().getStats();
+      expect(stats.maxBytes).toBe(DEFAULT_CACHE_MAX_BYTES);
+      expect(stats.bytes).toBe(0);
+    });
+
+    test('should track the estimated bytes of stored entries', () => {
+      const sized = new DocumentCache();
+      sized.set(key(1, 20), doc);
+      sized.setWithValidation(key(2, 30), doc, valid);
+      expect(sized.bytes).toBe(50 * AST_BYTES_PER_QUERY_CHAR);
+      expect(sized.getStats().bytes).toBe(50 * AST_BYTES_PER_QUERY_CHAR);
+    });
+
+    test('should evict least recently used entries once maxBytes would be exceeded', () => {
+      const budget = 100 * AST_BYTES_PER_QUERY_CHAR;
+      const sized = new DocumentCache({ maxBytes: budget, maxSize: 1000 });
+
+      for (let i = 0; i < 10; i++) sized.set(key(i, 10), doc);
+      expect(sized.size).toBe(10);
+      expect(sized.bytes).toBe(budget);
+
+      // Touch the oldest so the second-oldest is the LRU victim
+      sized.get(key(0, 10));
+      sized.set(key(10, 10), doc);
+
+      expect(sized.size).toBe(10);
+      expect(sized.bytes).toBe(budget);
+      expect(sized.has(key(0, 10))).toBe(true);
+      expect(sized.has(key(1, 10))).toBe(false);
+      expect(sized.has(key(10, 10))).toBe(true);
+    });
+
+    test('should evict as many entries as a larger one needs', () => {
+      const budget = 100 * AST_BYTES_PER_QUERY_CHAR;
+      const sized = new DocumentCache({ maxBytes: budget });
+
+      for (let i = 0; i < 20; i++) sized.set(key(i, 5), doc);
+      sized.setWithValidation(key(99, 10), doc, valid);
+
+      expect(sized.bytes).toBeLessThanOrEqual(budget);
+      expect(sized.size).toBe(19);
+      expect(sized.has(key(0, 5))).toBe(false);
+      expect(sized.has(key(1, 5))).toBe(false);
+      expect(sized.has(key(2, 5))).toBe(true);
+    });
+
+    test('should not cache a single entry larger than maxBytes / 10', () => {
+      const budget = 100 * AST_BYTES_PER_QUERY_CHAR;
+      const sized = new DocumentCache({ maxBytes: budget });
+      sized.set(key(1, 10), doc);
+
+      sized.set(key(2, 11), doc);
+      sized.setWithValidation(key(3, 11), doc, valid);
+
+      expect(sized.has(key(2, 11))).toBe(false);
+      expect(sized.has(key(3, 11))).toBe(false);
+      // ...and refusing it evicts nothing
+      expect(sized.has(key(1, 10))).toBe(true);
+      expect(sized.bytes).toBe(10 * AST_BYTES_PER_QUERY_CHAR);
+    });
+
+    test('should refuse oversized entries under the default budget', () => {
+      const sized = new DocumentCache();
+      const limit = Math.floor(DEFAULT_CACHE_MAX_BYTES / 10 / AST_BYTES_PER_QUERY_CHAR);
+
+      sized.set('x'.repeat(limit), doc);
+      sized.set('y'.repeat(limit + 1), doc);
+
+      expect(sized.has('x'.repeat(limit))).toBe(true);
+      expect(sized.has('y'.repeat(limit + 1))).toBe(false);
+    });
+
+    test('should still enforce maxSize under a roomy byte budget', () => {
+      const sized = new DocumentCache({ maxSize: 3 });
+      for (let i = 0; i < 5; i++) sized.set(key(i, 10), doc);
+      expect(sized.size).toBe(3);
+      expect(sized.bytes).toBe(30 * AST_BYTES_PER_QUERY_CHAR);
+    });
+
+    test('should keep the byte count exact through overwrite, delete, clear and expiry', async () => {
+      const sized = new DocumentCache({ ttl: 30 });
+      sized.set(key(1, 10), doc);
+      sized.set(key(1, 10), doc);
+      sized.setWithValidation(key(1, 10), doc, valid);
+      expect(sized.bytes).toBe(10 * AST_BYTES_PER_QUERY_CHAR);
+
+      sized.set(key(2, 20), doc);
+      expect(sized.delete(key(2, 20))).toBe(true);
+      expect(sized.bytes).toBe(10 * AST_BYTES_PER_QUERY_CHAR);
+
+      sized.clear();
+      expect(sized.bytes).toBe(0);
+
+      sized.set(key(3, 10), doc);
+      sized.set(key(4, 10), doc);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(sized.get(key(3, 10))).toBeNull();
+      expect(sized.bytes).toBe(10 * AST_BYTES_PER_QUERY_CHAR);
+      expect(sized.prune()).toBe(1);
+      expect(sized.bytes).toBe(0);
+    });
+
+    test('should keep a rewritten slot in FIFO position and the count exact', () => {
+      const fifo = new DocumentCache({ maxSize: 2, lru: false });
+      fifo.set(key(1, 10), doc);
+      fifo.set(key(2, 10), doc);
+      fifo.setWithValidation(key(1, 10), doc, valid);
+      expect(fifo.bytes).toBe(20 * AST_BYTES_PER_QUERY_CHAR);
+
+      // Slot 1 is still the oldest insertion, so it is the one evicted
+      fifo.set(key(3, 10), doc);
+      expect(fifo.has(key(1, 10))).toBe(false);
+      expect(fifo.has(key(2, 10))).toBe(true);
+      expect(fifo.bytes).toBe(20 * AST_BYTES_PER_QUERY_CHAR);
+    });
+
+    test('should store nothing when maxBytes is 0', () => {
+      const disabled = new DocumentCache({ maxBytes: 0 });
+      disabled.set('{ a }', doc);
+      disabled.setWithValidation('{ b }', doc, valid);
+      expect(disabled.size).toBe(0);
+      expect(disabled.bytes).toBe(0);
     });
   });
 

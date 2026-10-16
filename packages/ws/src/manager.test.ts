@@ -311,6 +311,18 @@ describe('SubscriptionManager', () => {
         )
       ).rejects.toThrow(/already exists/);
 
+      await expect(
+        manager.subscribe(
+          'conn-1',
+          'sub-1',
+          { query: 'subscription { forever }' },
+          undefined,
+          () => {},
+          () => {},
+          () => {}
+        )
+      ).rejects.toThrow('Subscription sub-1 already exists');
+
       // The original is untouched and still owns the id
       expect(manager.getSubscription('conn-1', 'sub-1')).toBe(original);
       expect(probes.length).toBe(1);
@@ -495,6 +507,42 @@ describe('SubscriptionManager', () => {
         expect(consoleSpy).not.toHaveBeenCalled();
       } finally {
         consoleSpy.mockRestore();
+        manager.clear();
+      }
+    });
+
+    test('should escape a client subscription id in timeout logs', async () => {
+      const warns: unknown[][] = [];
+      const errors: unknown[][] = [];
+      const manager = new SubscriptionManager({
+        schema: createTestSchema(),
+        subscriptionTimeout: 10,
+        logger: {
+          error: (...args: unknown[]) => errors.push(args),
+          warn: (...args: unknown[]) => warns.push(args),
+        },
+      });
+
+      try {
+        await manager.subscribe(
+          'conn-1',
+          'evil\nWARN forged',
+          { query: 'subscription { forever }' },
+          undefined,
+          () => {},
+          () => {
+            throw new Error('complete failed');
+          },
+          () => {}
+        );
+        await waitFor(() => warns.length > 0 && errors.length > 0);
+        const warning = String(warns[0]![0]);
+        expect(warning).toContain('evil\\nWARN forged');
+        expect(warning).not.toContain('\n');
+        const failure = String(errors[0]![0]);
+        expect(failure).toContain('evil\\nWARN forged');
+        expect(failure).not.toContain('\n');
+      } finally {
         manager.clear();
       }
     });

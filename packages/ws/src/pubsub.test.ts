@@ -76,6 +76,17 @@ describe('PubSub', () => {
         /Maximum subscribers reached/
       );
     });
+
+    test('should escape the topic in the max-subscribers error', () => {
+      const limitedPubsub = new PubSub({ maxSubscribersPerTopic: 1 });
+      const topic = 'chat\r\nERROR forged';
+
+      limitedPubsub.subscribe(topic, () => {});
+
+      expect(() => limitedPubsub.subscribe(topic, () => {})).toThrow(
+        'Maximum subscribers reached for topic: chat\\r\\nERROR forged'
+      );
+    });
   });
 
   describe('publish', () => {

@@ -394,6 +394,35 @@ describe('LeavenDriver', () => {
       expect(logged.length).toBe(0);
     });
 
+    test('should bound the memo by bytes and skip oversized documents', async () => {
+      const internals = driver as unknown as {
+        analysisCache: Map<string, unknown>;
+        analysisBytes: number;
+      };
+      const perEntryCap = LeavenDriver.MAX_ANALYSIS_BYTES / 10;
+      // A comment pads the document without adding tokens
+      const oversized = `{ hello }\n#${'x'.repeat(Math.ceil(perEntryCap / 2))}`;
+
+      await driver.execute(oversized, undefined, makeContext());
+      expect(internals.analysisCache.size).toBe(0);
+      expect(internals.analysisBytes).toBe(0);
+
+      await driver.execute('{ hello }', undefined, makeContext());
+      expect(internals.analysisCache.size).toBe(1);
+      expect(internals.analysisBytes).toBeGreaterThan(0);
+
+      // Fill well past the byte budget with documents just under the cap
+      const nearCap = Math.floor(perEntryCap / 2) - 200;
+      for (let i = 0; i < 15; i++) {
+        await driver.execute(`{ hello }\n#${i}${'y'.repeat(nearCap)}`, undefined, makeContext());
+      }
+      expect(internals.analysisBytes).toBeLessThanOrEqual(LeavenDriver.MAX_ANALYSIS_BYTES);
+      expect(internals.analysisCache.size).toBeLessThan(16);
+
+      await driver.clearCaches();
+      expect(internals.analysisBytes).toBe(0);
+    });
+
     test('should key the memo by operation name', async () => {
       const query = 'query A { hello } query B { hello echo(message: "x") }';
 
@@ -838,6 +867,26 @@ describe('LeavenDriver', () => {
       expect(caught).toBeInstanceOf(ValidationError);
       expect((caught as ValidationError).statusCode).toBe(400);
       expect((caught as ValidationError).code).toBe('VALIDATION_ERROR');
+    });
+
+    test('should escape and cap a hostile content type echoed in the error', async () => {
+      const request = new Request('http://localhost/graphql', {
+        method: 'POST',
+        headers: { 'Content-Type': `text/\u001b[2Jplain${'x'.repeat(1000)}` },
+        body: '{ hello }',
+      });
+
+      let caught: unknown;
+      try {
+        await driver.handleRequest(request, new Response());
+      } catch (error) {
+        caught = error;
+      }
+
+      const message = (caught as ValidationError).message;
+      expect(message).toContain('text/\\x1b[2Jplain');
+      expect(message).not.toMatch(/[\u0000-\u001f]/);
+      expect(message.length).toBeLessThan(400);
     });
 
     test('should reject POST requests with an unsupported content type', async () => {

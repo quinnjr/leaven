@@ -17,6 +17,7 @@ import { Kind, getOperationAST } from 'graphql';
 
 import { createVisitBudget } from './parser';
 import type { OperationType, Variables } from './types';
+import { escapeLog } from './escape-log';
 
 /**
  * Options for query compilation
@@ -70,7 +71,7 @@ export class CompiledQuery<_TData = Record<string, unknown>> {
     if (!operation) {
       throw new Error(
         operationName
-          ? `Operation "${operationName}" not found`
+          ? `Operation "${escapeLog(operationName)}" not found`
           : 'No operation found in document'
       );
     }
