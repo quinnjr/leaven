@@ -328,6 +328,13 @@ describe('LeavenGraphQLDriver (end-to-end over HTTP)', () => {
     expect(result.body.errors?.[0]?.extensions?.code).toBe('INTERNAL_ERROR');
   });
 
+  it('rejects a document over the default 10000-token parse budget', async () => {
+    const result = await post(`{ ${'allowed '.repeat(10_001)} }`);
+
+    expect(result.body.data ?? null).toBeNull();
+    expect(result.body.errors?.[0]?.message).toMatch(/tokens/i);
+  });
+
   it('serves GraphiQL over GET when playground is enabled', async () => {
     const response = await fetch(url, { method: 'GET' });
     const html = await response.text();

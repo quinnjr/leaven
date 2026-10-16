@@ -42,12 +42,15 @@ await executor.execute({ query: '{ users { id name } }' });
 await executor.execute({ query: '{ users { id name } }' });
 ```
 
-### 2. Fast Hashing
+### 2. Collision-Safe Hashing
 
-Cache keys use Bun's native `Bun.hash()` instead of MD5:
-
-- **MD5**: ~0.014ms per hash
-- **Bun.hash**: ~0.001ms per hash (14x faster)
+Long queries are keyed by SHA-256 (`Bun.CryptoHasher`). A cache hit skips
+parsing and validation, so a key collision would let one query run under
+another query's verdict; a 64-bit non-cryptographic hash is not safe for that.
+Each entry also stores its full query and a lookup only hits on an exact
+match, so a collision (or a custom `hashKey`) can only cause a miss. The
+compiled-query cache, which holds complexity verdicts, is keyed by the full
+query string and is never hashed.
 
 ### 3. Direct Key Optimization
 
@@ -55,10 +58,10 @@ For small queries (≤256 characters), the query string is used directly as the 
 
 ```typescript
 // Small query: uses query string directly as key
-'{ hello }' → key: '{ hello }'
+'{ hello }' → key: 'd:{ hello }'
 
-// Large query: uses Bun.hash
-'{ users { id name email ... } }' → key: 'h:abc123xyz'
+// Large query: uses SHA-256
+'{ users { id name email ... } }' → key: 'h:3f2a…'
 ```
 
 ### 4. Lazy Timing

@@ -1,6 +1,6 @@
 {
   "name": "@leaven-graphql/nestjs",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "NestJS integration for Leaven GraphQL",
   "type": "module",
   "main": "./src/index.ts",

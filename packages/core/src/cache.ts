@@ -32,12 +32,30 @@ export interface DocumentCacheConfig {
   lru?: boolean;
   /** Maximum query length to use as direct key (avoids hashing, default: 256) */
   directKeyMaxLength?: number;
+  /**
+   * Hash used to key queries longer than `directKeyMaxLength`
+   * (default: SHA-256, hex).
+   *
+   * Entries keep their full query string and a lookup only hits when it
+   * matches, so even a colliding hash can never serve one query's document or
+   * validation verdict for another; a collision is just a miss.
+   */
+  hashKey?: (query: string) => string;
+}
+
+/**
+ * Default key hash for long queries: SHA-256, hex encoded.
+ */
+export function sha256Hex(input: string): string {
+  return new Bun.CryptoHasher('sha256').update(input).digest('hex');
 }
 
 /**
  * A cached document entry
  */
 export interface CacheEntry {
+  /** The full query string this entry was stored for */
+  query: string;
   /** The parsed document */
   document: DocumentNode;
   /** Cached validation result (if validated) */
@@ -63,6 +81,7 @@ export class DocumentCache implements IDocumentCache {
   private readonly ttl: number;
   private readonly lru: boolean;
   private readonly directKeyMaxLength: number;
+  private readonly hashKey: (query: string) => string;
 
   constructor(config: DocumentCacheConfig = {}) {
     this.cache = new Map();
@@ -70,19 +89,41 @@ export class DocumentCache implements IDocumentCache {
     this.ttl = config.ttl ?? 0;
     this.lru = config.lru ?? true;
     this.directKeyMaxLength = config.directKeyMaxLength ?? 256;
+    this.hashKey = config.hashKey ?? sha256Hex;
   }
 
   /**
-   * Generate a cache key for a query string
-   * Uses direct string for small queries, fast Bun.hash for larger ones
+   * Generate a cache key for a query string.
+   * Uses the string directly for small queries and `hashKey` (SHA-256 by
+   * default) for larger ones. Direct keys are prefixed `d:` so they can never
+   * clash with a hashed `h:` key.
    */
   private generateKey(query: string): string {
     // For small queries, use the query string directly (avoids hashing overhead)
     if (query.length <= this.directKeyMaxLength) {
-      return query;
+      return `d:${query}`;
     }
-    // Use Bun's fast hash function for larger queries
-    return `h:${Bun.hash(query).toString(36)}`;
+    return `h:${this.hashKey(query)}`;
+  }
+
+  /**
+   * Look up the live entry stored for exactly this query.
+   *
+   * Returns undefined on a miss, on an expired entry (which is removed) and
+   * on a key collision, where the slot holds a different query.
+   */
+  private lookup(key: string, query: string): CacheEntry | undefined {
+    const entry = this.cache.get(key);
+    if (!entry || entry.query !== query) {
+      return undefined;
+    }
+
+    if (this.isExpired(entry)) {
+      this.cache.delete(key);
+      return undefined;
+    }
+
+    return entry;
   }
 
   /**
@@ -125,14 +166,9 @@ export class DocumentCache implements IDocumentCache {
    */
   public get(query: string): DocumentNode | null {
     const key = this.generateKey(query);
-    const entry = this.cache.get(key);
+    const entry = this.lookup(key, query);
 
     if (!entry) {
-      return null;
-    }
-
-    if (this.isExpired(entry)) {
-      this.cache.delete(key);
       return null;
     }
 
@@ -167,6 +203,7 @@ export class DocumentCache implements IDocumentCache {
 
     const now = Date.now();
     this.cache.set(key, {
+      query,
       document,
       createdAt: now,
       lastAccess: now,
@@ -179,14 +216,9 @@ export class DocumentCache implements IDocumentCache {
    */
   public getWithValidation(query: string): { document: DocumentNode; validation?: CachedValidation } | null {
     const key = this.generateKey(query);
-    const entry = this.cache.get(key);
+    const entry = this.lookup(key, query);
 
     if (!entry) {
-      return null;
-    }
-
-    if (this.isExpired(entry)) {
-      this.cache.delete(key);
       return null;
     }
 
@@ -205,7 +237,7 @@ export class DocumentCache implements IDocumentCache {
    */
   public setValidation(query: string, validation: CachedValidation): void {
     const key = this.generateKey(query);
-    const entry = this.cache.get(key);
+    const entry = this.lookup(key, query);
 
     if (entry) {
       entry.validation = validation;
@@ -233,6 +265,7 @@ export class DocumentCache implements IDocumentCache {
 
     const now = Date.now();
     this.cache.set(key, {
+      query,
       document,
       validation,
       createdAt: now,
@@ -245,16 +278,7 @@ export class DocumentCache implements IDocumentCache {
    * Check if a query is in the cache
    */
   public has(query: string): boolean {
-    const key = this.generateKey(query);
-    const entry = this.cache.get(key);
-
-    if (!entry) return false;
-    if (this.isExpired(entry)) {
-      this.cache.delete(key);
-      return false;
-    }
-
-    return true;
+    return this.lookup(this.generateKey(query), query) !== undefined;
   }
 
   /**
@@ -262,6 +286,10 @@ export class DocumentCache implements IDocumentCache {
    */
   public delete(query: string): boolean {
     const key = this.generateKey(query);
+    // Only delete the slot when it really holds this query
+    if (this.cache.get(key)?.query !== query) {
+      return false;
+    }
     return this.cache.delete(key);
   }
 

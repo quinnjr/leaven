@@ -22,6 +22,14 @@ function extractInlineScript(html: string): string {
 }
 
 describe('renderGraphiQL', () => {
+  test('should pin exact React versions instead of a floating major', () => {
+    const html = renderGraphiQL({ endpoint: '/graphql' });
+
+    expect(html).toContain('https://unpkg.com/react@18.3.1/umd/react.production.min.js');
+    expect(html).toContain('https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js');
+    expect(html).not.toMatch(/react(-dom)?@18\//);
+  });
+
   test('should render HTML with endpoint', () => {
     const html = renderGraphiQL({ endpoint: '/graphql' });
 

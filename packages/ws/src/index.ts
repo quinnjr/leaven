@@ -12,6 +12,7 @@ export { SubscriptionManager, createSubscriptionManager } from './manager';
 export type { SubscriptionManagerConfig, Subscription, SubscriptionStatus } from './manager';
 
 export { PubSub, createPubSub } from './pubsub';
+export type { WebSocketLogger } from './logger';
 export type { PubSubConfig, PubSubEngine, SubscribeFn, PublishFn } from './pubsub';
 
 export {

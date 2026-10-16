@@ -5,11 +5,12 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import { OperationTypeNode, getOperationAST, parse, type GraphQLSchema } from 'graphql';
+import { OperationTypeNode, getOperationAST, type DocumentNode, type GraphQLSchema } from 'graphql';
 import type { ServerWebSocket } from 'bun';
 import type { GraphQLRequest } from '@leaven-graphql/core';
 
 import { SubscriptionManager, type SubscriptionManagerConfig } from './manager';
+import type { WebSocketLogger } from './logger';
 import {
   MessageType,
   parseMessage,
@@ -59,6 +60,12 @@ export interface WebSocketHandlerConfig<TContext = unknown> {
   keepAliveInterval?: number;
   /** Subscription manager config */
   subscriptionManager?: Omit<SubscriptionManagerConfig, 'schema'>;
+  /**
+   * Where diagnostics (failing hooks and callbacks) are logged. Defaults to
+   * `console`. Also passed to the subscription manager unless
+   * `subscriptionManager.logger` is set.
+   */
+  logger?: WebSocketLogger;
   /** Called when a connection is initialized */
   onConnect?: (
     socket: ServerWebSocket<WebSocketContext>,
@@ -80,6 +87,34 @@ export interface WebSocketHandlerConfig<TContext = unknown> {
 }
 
 /**
+ * Handler-private lifecycle state for one socket.
+ *
+ * Kept off `socket.data` (which is the application's) and keyed by the socket
+ * object, so it outlives `handleClose`: an operation that resumes after the
+ * socket closed still finds `closed: true` rather than a fresh state.
+ */
+interface ConnectionState {
+  /** Set synchronously when connection_init processing starts */
+  initializing: boolean;
+  /** Set synchronously at the start of `handleClose` */
+  closed: boolean;
+  /**
+   * Operations accepted but not yet registered with the subscription
+   * manager, by id. A client `complete` for one of these cancels it, so when
+   * its setup resumes it registers nothing (and any iterator it obtained is
+   * returned) even if the id has since been reused.
+   */
+  pending: Map<string, PendingOperation>;
+}
+
+/**
+ * Cancellation token for one in-flight operation.
+ */
+interface PendingOperation {
+  cancelled: boolean;
+}
+
+/**
  * WebSocket handler for Bun
  */
 export class WebSocketHandler<TContext = unknown> {
@@ -92,17 +127,21 @@ export class WebSocketHandler<TContext = unknown> {
   private readonly onDisconnect?: WebSocketHandlerConfig<TContext>['onDisconnect'];
   private readonly onSubscribe?: WebSocketHandlerConfig<TContext>['onSubscribe'];
   private readonly onComplete?: WebSocketHandlerConfig<TContext>['onComplete'];
+  private readonly logger: WebSocketLogger;
 
   private readonly initTimeouts: Map<string, ReturnType<typeof setTimeout>>;
   private readonly keepAliveTimers: Map<string, ReturnType<typeof setInterval>>;
+  private readonly states: WeakMap<ServerWebSocket<WebSocketContext>, ConnectionState>;
 
   constructor(config: WebSocketHandlerConfig<TContext>) {
     this.schema = config.schema;
     this.contextFactory = config.context;
     this.connectionInitTimeout = config.connectionInitTimeout ?? 3000;
     this.keepAliveInterval = config.keepAliveInterval ?? 12000;
+    this.logger = config.logger ?? console;
     this.subscriptionManager = new SubscriptionManager({
       schema: config.schema,
+      logger: this.logger,
       ...config.subscriptionManager,
     });
     this.onConnect = config.onConnect;
@@ -112,6 +151,30 @@ export class WebSocketHandler<TContext = unknown> {
 
     this.initTimeouts = new Map();
     this.keepAliveTimers = new Map();
+    this.states = new WeakMap();
+  }
+
+  /**
+   * Lifecycle state for a socket, created on first use.
+   */
+  private stateOf(socket: ServerWebSocket<WebSocketContext>): ConnectionState {
+    let state = this.states.get(socket);
+    if (!state) {
+      state = { initializing: false, closed: false, pending: new Map() };
+      this.states.set(socket, state);
+    }
+    return state;
+  }
+
+  /**
+   * Stop and forget a connection's keep-alive timer, if it has one.
+   */
+  private clearKeepAlive(connectionId: string): void {
+    const timer = this.keepAliveTimers.get(connectionId);
+    if (timer) {
+      clearInterval(timer);
+      this.keepAliveTimers.delete(connectionId);
+    }
   }
 
   /**
@@ -135,11 +198,11 @@ export class WebSocketHandler<TContext = unknown> {
       const result = invoke();
       if (result instanceof Promise) {
         result.catch((error) => {
-          console.error(`${name} failed:`, error);
+          this.logger.error(`${name} failed:`, error);
         });
       }
     } catch (error) {
-      console.error(`${name} failed:`, error);
+      this.logger.error(`${name} failed:`, error);
     }
   }
 
@@ -154,6 +217,7 @@ export class WebSocketHandler<TContext = unknown> {
       initialized: false,
       subscriptions: new Set(),
     };
+    this.states.set(socket, { initializing: false, closed: false, pending: new Map() });
 
     // Set connection init timeout
     const timeout = setTimeout(() => {
@@ -230,11 +294,18 @@ export class WebSocketHandler<TContext = unknown> {
     socket: ServerWebSocket<WebSocketContext>,
     params?: Record<string, unknown>
   ): Promise<void> {
-    // Reject repeated connection_init (graphql-ws close code 4429)
-    if (socket.data.initialized) {
+    const state = this.stateOf(socket);
+
+    // Reject repeated connection_init (graphql-ws close code 4429). The
+    // `initializing` flag is set synchronously, BEFORE the onConnect await:
+    // checking `initialized` alone lets a second init that arrives while the
+    // first is still in onConnect pass, run onConnect again and start a
+    // second keep-alive timer.
+    if (state.initializing || socket.data.initialized) {
       socket.close(4429, 'Too many initialisation requests');
       return;
     }
+    state.initializing = true;
 
     // Clear init timeout
     const timeout = this.initTimeouts.get(socket.data.connectionId);
@@ -246,6 +317,11 @@ export class WebSocketHandler<TContext = unknown> {
     // Check onConnect hook
     if (this.onConnect) {
       const allowed = await this.onConnect(socket, params);
+      // The socket may have closed while onConnect ran. Acknowledging it now
+      // would start a keep-alive timer that nothing ever clears.
+      if (state.closed) {
+        return;
+      }
       if (!allowed) {
         socket.close(4403, 'Forbidden');
         return;
@@ -258,8 +334,10 @@ export class WebSocketHandler<TContext = unknown> {
     // Send ack
     socket.send(formatMessage(createConnectionAck()));
 
-    // Start keep-alive
+    // Start keep-alive. Only one timer may ever exist per connection, so any
+    // existing one is cleared first.
     if (this.keepAliveInterval > 0) {
+      this.clearKeepAlive(socket.data.connectionId);
       const timer = setInterval(() => {
         socket.send(formatMessage({ type: MessageType.Ping }));
       }, this.keepAliveInterval);
@@ -276,6 +354,7 @@ export class WebSocketHandler<TContext = unknown> {
     message: SubscribeMessage
   ): Promise<void> {
     const { id, payload } = message;
+    const state = this.stateOf(socket);
 
     // Check if subscription ID already exists
     if (socket.data.subscriptions.has(id)) {
@@ -283,10 +362,30 @@ export class WebSocketHandler<TContext = unknown> {
       return;
     }
 
+    // Enforce the per-connection limit here too, counting operations still
+    // being set up: the manager only sees an operation once its hooks and
+    // context factory have run, so without this a burst of frames would run
+    // all of that work before any of them hit the manager's limit.
+    if (socket.data.subscriptions.size >= this.subscriptionManager.subscriptionLimit) {
+      socket.send(
+        formatMessage(
+          createErrorMessage(id, [{ message: 'Maximum subscriptions per connection reached' }])
+        )
+      );
+      return;
+    }
+
     // Register the ID synchronously, BEFORE any await, so a concurrent
     // Subscribe frame with the same ID is caught by the duplicate check
     // above while this one is still setting up
     socket.data.subscriptions.add(id);
+    const token: PendingOperation = { cancelled: false };
+    state.pending.set(id, token);
+    const settle = (): void => {
+      if (state.pending.get(id) === token) {
+        state.pending.delete(id);
+      }
+    };
 
     const request: GraphQLRequest = {
       query: payload.query,
@@ -295,14 +394,22 @@ export class WebSocketHandler<TContext = unknown> {
       extensions: payload.extensions,
     };
 
+    // Whether this operation was abandoned while it awaited: the socket
+    // closed, or the client completed the id (which may since have been
+    // reused by a newer operation). Nothing may be sent, registered or
+    // cleaned up for it after that: the id is no longer this operation's.
+    const abandoned = (): boolean => state.closed || token.cancelled;
+
     try {
       // Call onSubscribe hook
       await this.onSubscribe?.(socket, id, request);
+      if (abandoned()) return;
 
       // Build context
       let context: TContext | undefined;
       if (this.contextFactory) {
         context = await this.contextFactory(socket, request);
+        if (abandoned()) return;
       }
 
       // A Subscribe frame is the graphql-ws transport for EVERY operation,
@@ -310,8 +417,11 @@ export class WebSocketHandler<TContext = unknown> {
       // followed by Complete; routing it into graphql-js `subscribe()` would
       // fail with "Schema is not configured to execute subscription
       // operation."
-      if (!this.isSubscriptionOperation(request)) {
+      const isSubscription = await this.isSubscriptionOperation(request);
+      if (abandoned()) return;
+      if (!isSubscription) {
         const response = await this.subscriptionManager.execute(request, context);
+        if (abandoned()) return;
 
         // Errors raised BEFORE execution (validation, variable coercion) are
         // an Error message; errors raised DURING execution ride inside the
@@ -324,6 +434,7 @@ export class WebSocketHandler<TContext = unknown> {
           socket.send(formatMessage(createCompleteMessage(id)));
         }
 
+        settle();
         socket.data.subscriptions.delete(id);
         this.invokeHook('onComplete hook', () => this.onComplete?.(socket, id));
         return;
@@ -349,7 +460,12 @@ export class WebSocketHandler<TContext = unknown> {
           this.invokeHook('onComplete hook', () => this.onComplete?.(socket, id));
         }
       );
+      // Registered (or already finished): a client complete is now handled
+      // by the manager's unsubscribe, which returns the iterator
+      settle();
     } catch (error) {
+      if (abandoned()) return;
+      settle();
       // Per graphql-ws, operation setup failures are reported as an Error
       // message on the offending ID — the connection (and its other
       // subscriptions) must stay open
@@ -369,10 +485,19 @@ export class WebSocketHandler<TContext = unknown> {
    * A document graphql-js cannot resolve to a single operation (no operations
    * at all, or several with no `operationName`) is reported as a subscription
    * so the executor produces the precise error rather than this method
-   * guessing at one.
+   * guessing at one. The same goes for a document that fails to parse.
+   *
+   * Parsing goes through the executor, so the configured `maxTokens` and
+   * depth limits apply here too; a plain `parse()` would lex an arbitrarily
+   * large document before the executor's limits ever ran.
    */
-  private isSubscriptionOperation(request: GraphQLRequest): boolean {
-    const document = parse(request.query);
+  private async isSubscriptionOperation(request: GraphQLRequest): Promise<boolean> {
+    let document: DocumentNode;
+    try {
+      document = await this.subscriptionManager.parse(request.query);
+    } catch {
+      return true;
+    }
     const operation = getOperationAST(document, request.operationName ?? null);
     return !operation || operation.operation === OperationTypeNode.SUBSCRIPTION;
   }
@@ -384,6 +509,15 @@ export class WebSocketHandler<TContext = unknown> {
     socket: ServerWebSocket<WebSocketContext>,
     subscriptionId: string
   ): void {
+    // Cancel an operation that is still being set up, so it registers
+    // nothing when it resumes
+    const state = this.stateOf(socket);
+    const pending = state.pending.get(subscriptionId);
+    if (pending) {
+      pending.cancelled = true;
+      state.pending.delete(subscriptionId);
+    }
+
     socket.data.subscriptions.delete(subscriptionId);
     // Scoped to THIS connection: operation ids are unique per connection, so
     // an unscoped teardown would drop another client's subscription
@@ -397,6 +531,16 @@ export class WebSocketHandler<TContext = unknown> {
   public async handleClose(socket: ServerWebSocket<WebSocketContext>): Promise<void> {
     const { connectionId } = socket.data;
 
+    // Flag the close synchronously, before anything else: operations still
+    // awaiting onConnect, a context factory or the executor check it when
+    // they resume and must not register anything on a dead socket.
+    const state = this.stateOf(socket);
+    state.closed = true;
+    for (const pending of state.pending.values()) {
+      pending.cancelled = true;
+    }
+    state.pending.clear();
+
     // Clear timeouts/timers
     const initTimeout = this.initTimeouts.get(connectionId);
     if (initTimeout) {
@@ -404,11 +548,7 @@ export class WebSocketHandler<TContext = unknown> {
       this.initTimeouts.delete(connectionId);
     }
 
-    const keepAliveTimer = this.keepAliveTimers.get(connectionId);
-    if (keepAliveTimer) {
-      clearInterval(keepAliveTimer);
-      this.keepAliveTimers.delete(connectionId);
-    }
+    this.clearKeepAlive(connectionId);
 
     // Unsubscribe all subscriptions
     this.subscriptionManager.unsubscribeConnection(connectionId);
@@ -433,12 +573,12 @@ export class WebSocketHandler<TContext = unknown> {
       open: (socket: ServerWebSocket<WebSocketContext>) => this.handleOpen(socket),
       message: (socket: ServerWebSocket<WebSocketContext>, message: string | Buffer) => {
         void this.handleMessage(socket, message).catch((error) => {
-          console.error('WebSocket message handling failed:', error);
+          this.logger.error('WebSocket message handling failed:', error);
         });
       },
       close: (socket: ServerWebSocket<WebSocketContext>) => {
         void this.handleClose(socket).catch((error) => {
-          console.error('onDisconnect failed:', error);
+          this.logger.error('onDisconnect failed:', error);
         });
       },
     };

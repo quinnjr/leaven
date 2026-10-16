@@ -460,6 +460,7 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
       request: request,
       subscriptions: new Map(),
       initialized: false,
+      initializing: false,
       connectionParams: undefined,
       context: undefined,
       keepAliveInterval: undefined,
@@ -580,10 +581,15 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
     state: ConnectionState,
     message: { type: 'connection_init'; payload?: Record<string, unknown> }
   ): Promise<void> {
-    if (state.initialized) {
+    // `initializing` is set synchronously, before the onConnect await:
+    // checking `initialized` alone lets a second init that arrives while the
+    // first is still in onConnect through, running onConnect again and
+    // starting a second keep-alive timer.
+    if (state.initialized || state.initializing) {
       socket.close(4429, 'Too many initialization requests');
       return;
     }
+    state.initializing = true;
 
     state.connectionParams = message.payload ?? {};
 
@@ -596,6 +602,11 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
     // Call onConnect callback if provided
     if (this.config.onConnect) {
       const allowed = await this.config.onConnect(ctx);
+      // The socket may have closed (and been torn down) while onConnect ran;
+      // acknowledging it now would start a keep-alive timer nothing clears.
+      if (this.connections.get(socket) !== state) {
+        return;
+      }
       if (!allowed) {
         socket.close(4401, 'Unauthorized');
         return;
@@ -614,8 +625,11 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
 
     this.send(socket, { type: 'connection_ack' });
 
-    // Start keep-alive
+    // Start keep-alive. Only one timer may ever exist per connection.
     if (this.config.keepAlive) {
+      if (state.keepAliveInterval) {
+        clearInterval(state.keepAliveInterval);
+      }
       state.keepAliveInterval = setInterval(() => {
         this.send(socket, { type: 'ping' });
       }, this.config.keepAlive);
@@ -909,11 +923,15 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
    * Determine whether a query string is a streaming `subscription` operation.
    *
    * Parse failures return `false` so that syntax errors surface through the
-   * normal execution/error path instead of being masked here.
+   * normal execution/error path instead of being masked here. That includes
+   * an exceeded `parseOptions.maxTokens`: the parse here applies the same
+   * token budget as the executor (default 10000), so an oversized document is
+   * never lexed in full, and the executor then reports the limit.
    */
   private isSubscriptionOperation(query: string, operationName?: string): boolean {
     try {
-      const document = parse(query);
+      const { graphqlOptions, maxTokens } = this.driver.getParseOptions();
+      const document = parse(query, { ...graphqlOptions, maxTokens });
       return getOperationAST(document, operationName)?.operation === 'subscription';
     } catch {
       return false;
@@ -1135,6 +1153,8 @@ interface ConnectionState {
   request: Request | undefined;
   subscriptions: Map<string, SubscriptionState>;
   initialized: boolean;
+  /** Set synchronously when connection_init processing starts */
+  initializing: boolean;
   connectionParams: Record<string, unknown> | undefined;
   context: SubscriptionContext | undefined;
   keepAliveInterval: ReturnType<typeof setInterval> | undefined;

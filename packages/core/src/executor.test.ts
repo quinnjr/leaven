@@ -5,9 +5,10 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach, spyOn } from 'bun:test';
 import {
   buildSchema,
+  parse,
   GraphQLError,
   type GraphQLFormattedError,
 } from 'graphql';
@@ -306,6 +307,53 @@ describe('LeavenExecutor', () => {
     });
   });
 
+  describe('compiled query cache identity', () => {
+    test('should not reuse the complexity of a cheap query for another on hash collision', async () => {
+      const limited = new LeavenExecutor({
+        schema,
+        rootValue,
+        cache: false,
+        maxComplexity: 2,
+      });
+
+      // Force any 64-bit Bun.hash-derived key to collide
+      const spy = spyOn(Bun, 'hash').mockImplementation(() => 1n);
+      try {
+        const cheap = await limited.execute({ query: '{ hello }' });
+        expect(cheap.response.errors).toBeUndefined();
+
+        const expensive = await limited.execute({
+          query: '{ a: hello b: hello c: hello d: hello e: hello }',
+        });
+        expect(expensive.response.data).toBeUndefined();
+        expect(expensive.response.errors?.[0]?.extensions?.code).toBe(
+          ErrorCode.COMPLEXITY_LIMIT
+        );
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    test('should not confuse query/operationName pairs that concatenate identically', async () => {
+      const limited = new LeavenExecutor({
+        schema,
+        rootValue,
+        cache: false,
+        maxComplexity: 2,
+      });
+
+      // `${query}:${operationName}` used to make these two requests share a key
+      const first = await limited.execute({ query: 'query A { hello }', operationName: 'A' });
+      expect(first.response.errors).toBeUndefined();
+
+      const second = await limited.execute({
+        query: 'query A { hello }:A',
+      });
+      // A syntax error, not a cached compiled plan
+      expect(second.response.errors?.[0]?.message).toMatch(/Syntax Error/);
+    });
+  });
+
   describe('execute with depth limits', () => {
     test('should treat maxDepth: 0 as a limit that rejects everything', async () => {
       const zeroExecutor = new LeavenExecutor({ schema, rootValue, maxDepth: 0 });
@@ -532,6 +580,60 @@ describe('LeavenExecutor', () => {
       expect(warm.metrics?.documentCached).toBe(true);
       expect(warm.metrics?.validationCached).toBe(true);
       expect(calls).toEqual(['setWithValidation']);
+    });
+  });
+
+  describe('invalid document caching', () => {
+    test('should not cache a document that fails validation', async () => {
+      const cache = new DocumentCache();
+      const strict = new LeavenExecutor({ schema, rootValue, cache });
+
+      const result = await strict.execute({ query: '{ doesNotExist }' });
+      expect(result.response.errors).toBeDefined();
+
+      // Junk queries must not be able to fill (and evict real entries from)
+      // the document cache.
+      expect(cache.size).toBe(0);
+    });
+
+    test('should still cache a document that passes validation', async () => {
+      const cache = new DocumentCache();
+      const strict = new LeavenExecutor({ schema, rootValue, cache });
+
+      await strict.execute({ query: '{ hello }' });
+      expect(cache.size).toBe(1);
+    });
+
+    test('should not attach an invalid verdict to an already cached document', async () => {
+      const writes: string[] = [];
+      // A backend holding the document but no verdict, as `set()` leaves it
+      const documentOnly: IDocumentCache = {
+        get: () => null,
+        set: () => undefined,
+        getWithValidation: (key) => ({
+          document: parse(key.slice(key.indexOf('\x00') + 1)),
+        }),
+        setValidation: () => {
+          writes.push('setValidation');
+        },
+        setWithValidation: () => {
+          writes.push('setWithValidation');
+        },
+        has: () => false,
+        delete: () => false,
+        clear: () => undefined,
+        size: 0,
+        getStats: () => ({ size: 0, maxSize: 0, hitRate: 0, totalHits: 0, entries: 0 }),
+      };
+
+      const recorder = new LeavenExecutor({ schema, rootValue, cache: documentOnly });
+      const result = await recorder.execute({ query: '{ doesNotExist }' });
+      expect(result.response.errors).toBeDefined();
+      expect(writes).toEqual([]);
+
+      // A valid document still gets its verdict recorded
+      await recorder.execute({ query: '{ hello }' });
+      expect(writes).toEqual(['setValidation']);
     });
   });
 
@@ -896,6 +998,37 @@ describe('LeavenExecutor', () => {
   describe('getSchema', () => {
     test('should return the schema', () => {
       expect(executor.getSchema()).toBe(schema);
+    });
+  });
+
+  describe('parse', () => {
+    test('should parse a query', async () => {
+      const document = await executor.parse('{ hello }');
+      expect(document.kind).toBe('Document');
+    });
+
+    test('should apply the configured parse limits', async () => {
+      const limited = new LeavenExecutor({ schema, rootValue, parseOptions: { maxTokens: 3 } });
+      await expect(limited.parse('{ hello hello hello }')).rejects.toThrow(/tokens/i);
+    });
+
+    test('should apply maxDepth', async () => {
+      const limited = new LeavenExecutor({ schema, rootValue, maxDepth: 1 });
+      await expect(limited.parse('{ user(id: "1") { id } }')).rejects.toThrow(/depth/i);
+    });
+
+    test('should reuse a cached document without writing to the cache', async () => {
+      const cache = new DocumentCache();
+      const cached = new LeavenExecutor({ schema, rootValue, cache });
+
+      await cached.parse('{ hello }');
+      expect(cache.size).toBe(0);
+
+      await cached.execute({ query: '{ hello }' });
+      const getSpy = spyOn(cache, 'get');
+      await cached.parse('{ hello }');
+      expect(getSpy.mock.results[0]?.value).not.toBeNull();
+      getSpy.mockRestore();
     });
   });
 

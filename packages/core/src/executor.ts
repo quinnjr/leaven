@@ -266,13 +266,15 @@ export class LeavenExecutor {
     // Computed once: a cache entry is only reusable by an executor with the
     // same schema, the same validation rules AND the same parser options.
     // `printSchema` is memoised per schema instance because it dominates this.
-    this.validationFingerprint = Bun.hash(
-      [
-        printSchemaOnce(config.schema),
-        this.validationRules ? 'no-introspection' : 'default',
-        stableStringify(this.parseOptions),
-      ].join('|')
-    ).toString(36);
+    this.validationFingerprint = new Bun.CryptoHasher('sha256')
+      .update(
+        [
+          printSchemaOnce(config.schema),
+          this.validationRules ? 'no-introspection' : 'default',
+          stableStringify(this.parseOptions),
+        ].join('|')
+      )
+      .digest('hex');
     this.maxComplexity = config.maxComplexity;
     this.hooks = config.hooks;
     this.metricsEnabled = config.metrics ?? false;
@@ -308,12 +310,16 @@ export class LeavenExecutor {
   }
 
   /**
-   * Generate a cache key for a query
-   * Uses fast Bun.hash instead of MD5
+   * Generate the compiled-query cache key for a query and operation name.
+   *
+   * Keyed by the full strings, never by a hash: a 64-bit hash collision would
+   * let an expensive query reuse a cheap query's compiled plan and complexity
+   * verdict, bypassing `maxComplexity`. The operation name is length-prefixed
+   * so that no two (query, operationName) pairs can produce the same key.
    */
   private getCacheKey(query: string, operationName?: string): string {
-    const input = operationName ? `${query}:${operationName}` : query;
-    return Bun.hash(input).toString(36);
+    const name = operationName ?? '';
+    return `${operationName === undefined ? '-' : name.length}:${name}\x00${query}`;
   }
 
   /**
@@ -530,7 +536,12 @@ export class LeavenExecutor {
         this.validationRules ? { rules: this.validationRules } : undefined
       );
 
-      this.cacheDocument(cacheKey, document, validation, parsed.cached);
+      // Only valid documents are cached. Caching rejects would let a client
+      // fill the cache with junk queries (evicting real entries, or growing a
+      // shared Redis without bound) at no cost beyond a failed request.
+      if (validation.valid) {
+        this.cacheDocument(cacheKey, document, validation, parsed.cached);
+      }
     }
 
     if (this.metricsEnabled) {
@@ -836,6 +847,28 @@ export class LeavenExecutor {
    */
   public getSchema(): GraphQLSchema {
     return this.schema;
+  }
+
+  /**
+   * Parse a query under this executor's parser limits (`maxTokens`,
+   * `maxDepth`, `graphqlOptions`), reusing a cached document when one exists.
+   *
+   * For transports that must inspect a document before handing the request
+   * to {@link LeavenExecutor.execute} or {@link LeavenExecutor.subscribe}
+   * (for example to pick between them). A plain graphql-js `parse()` there
+   * would run without the limits and undo the parser's DoS protection.
+   * Nothing is written to the cache: only validated documents are cached.
+   *
+   * Throws on a syntax error or an exceeded limit.
+   */
+  public async parse(query: string): Promise<DocumentNode> {
+    if (this.cache) {
+      const cached = await resolveValue(this.cache.get(this.cacheKeyFor(query)));
+      if (cached) {
+        return cached;
+      }
+    }
+    return parseDocument(query, this.parseOptions);
   }
 }
 

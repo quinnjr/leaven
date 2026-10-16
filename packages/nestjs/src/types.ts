@@ -8,7 +8,7 @@
 import type { Type } from '@nestjs/common';
 import type { ModuleMetadata } from '@nestjs/common/interfaces';
 import type { GraphQLSchema, DocumentNode } from 'graphql';
-import type { DocumentCacheConfig } from '@leaven-graphql/core';
+import type { DocumentCacheConfig, ParseOptions } from '@leaven-graphql/core';
 import type { PubSub } from '@leaven-graphql/ws';
 import type { SubscriptionConfig } from './subscriptions';
 
@@ -128,6 +128,20 @@ export interface LeavenModuleOptions {
    * Maximum query depth allowed
    */
   maxDepth?: number;
+
+  /**
+   * Parser limits, in the same shape as the core executor's `parseOptions`.
+   *
+   * Applied everywhere the module parses a document: the executor (HTTP and
+   * subscription transports alike), query analysis for the complexity/depth
+   * guards, and the subscription transport's synchronous operation-type
+   * detection. A document over a limit is rejected through the executor's
+   * normal error response.
+   *
+   * `maxTokens` defaults to 10000; set it to `Infinity` to opt out.
+   * `maxDepth` here is overridden by the top-level `maxDepth` when both are set.
+   */
+  parseOptions?: ParseOptions;
 
   /**
    * Enable execution metrics

@@ -342,7 +342,7 @@ async function runBenchmarks() {
   console.log('📊 PERFORMANCE IMPROVEMENTS:');
   console.log('-'.repeat(40));
   console.log('✓ Validation caching: Skip GraphQL validation for cached documents');
-  console.log('✓ Fast hashing: Bun.hash instead of MD5 for cache keys');
+  console.log('✓ Collision-safe keys: SHA-256 for long queries, verified on lookup');
   console.log('✓ Direct keys: Small queries use string directly (no hashing)');
   console.log('✓ Lazy timing: Only measure performance when metrics enabled');
   console.log('✓ Optimized hooks: Check existence before async calls');

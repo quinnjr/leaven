@@ -19,6 +19,8 @@ import {
 } from '@leaven-graphql/errors';
 import { renderGraphiQL } from '@leaven-graphql/playground';
 
+import { DEFAULT_MAX_TOKENS } from './driver';
+
 /**
  * Minimal Express-shaped request, as produced by the NestJS HTTP adapter.
  *
@@ -75,6 +77,12 @@ export interface LeavenDriverConfig extends GqlModuleOptions {
   maxComplexity?: number;
   /** Maximum allowed query depth. Enforced by the executor at parse time. */
   maxDepth?: number;
+  /**
+   * Parser limits passed to the executor, in the core executor's
+   * `parseOptions` shape. `maxTokens` defaults to 10000; set it to
+   * `Infinity` to opt out.
+   */
+  parseOptions?: ExecutorConfig['parseOptions'];
   /** Serve GraphiQL on `GET <path>`. Defaults to `false`. */
   playground?: boolean;
   /** WebSocket endpoint advertised to GraphiQL, when subscriptions are served. */
@@ -164,6 +172,10 @@ export class LeavenGraphQLDriver extends AbstractGraphQLDriver<LeavenDriverConfi
       metrics: options.metrics,
       maxComplexity: options.maxComplexity,
       maxDepth: options.maxDepth,
+      parseOptions: {
+        ...options.parseOptions,
+        maxTokens: options.parseOptions?.maxTokens ?? DEFAULT_MAX_TOKENS,
+      },
       introspection: options.introspection ?? process.env.NODE_ENV !== 'production',
       formatExecutionError: LeavenGraphQLDriver.formatExecutionError,
     });

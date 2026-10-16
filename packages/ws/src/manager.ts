@@ -5,13 +5,15 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import type { GraphQLSchema } from 'graphql';
+import type { DocumentNode, GraphQLSchema } from 'graphql';
 import {
   LeavenExecutor,
   type ExecutorConfig,
   type GraphQLRequest,
   type GraphQLResponse,
 } from '@leaven-graphql/core';
+
+import { logWarning, type WebSocketLogger } from './logger';
 
 /**
  * Subscription status
@@ -63,6 +65,11 @@ export interface SubscriptionManagerConfig {
    * Defaults to a new executor configured with `schema` alone.
    */
   executor?: LeavenExecutor | Omit<ExecutorConfig, 'schema'>;
+  /**
+   * Where diagnostics (subscription timeouts, failing completion callbacks)
+   * are logged. Defaults to `console`.
+   */
+  logger?: WebSocketLogger;
 }
 
 /**
@@ -83,6 +90,7 @@ export class SubscriptionManager {
   private readonly connections: Map<string, Map<string, Subscription>>;
   private readonly maxSubscriptionsPerConnection: number;
   private readonly subscriptionTimeout: number;
+  private readonly logger: WebSocketLogger;
 
   constructor(config: SubscriptionManagerConfig) {
     this.executor =
@@ -92,6 +100,23 @@ export class SubscriptionManager {
     this.connections = new Map();
     this.maxSubscriptionsPerConnection = config.maxSubscriptionsPerConnection ?? 100;
     this.subscriptionTimeout = config.subscriptionTimeout ?? 0;
+    this.logger = config.logger ?? console;
+  }
+
+  /**
+   * Maximum number of subscriptions (pending or active) one connection may
+   * hold.
+   */
+  public get subscriptionLimit(): number {
+    return this.maxSubscriptionsPerConnection;
+  }
+
+  /**
+   * Parse a query under the managed executor's parser limits.
+   * See {@link LeavenExecutor.parse}.
+   */
+  public parse(query: string): Promise<DocumentNode> {
+    return this.executor.parse(query);
   }
 
   /**
@@ -119,10 +144,17 @@ export class SubscriptionManager {
     onComplete: () => void,
     onError: (errors: readonly { message: string }[]) => void
   ): Promise<Subscription> {
-    // Check subscription limit
+    // Check subscription limit. Entries are registered synchronously below,
+    // before the executor is awaited, so pending subscriptions count too.
     const existing = this.connections.get(connectionId);
     if (existing && existing.size >= this.maxSubscriptionsPerConnection) {
       throw new Error('Maximum subscriptions per connection reached');
+    }
+
+    // Never overwrite a registered id: the displaced subscription's iterator
+    // would be orphaned, still running with nothing left to return() it
+    if (existing?.has(subscriptionId)) {
+      throw new Error(`Subscription ${subscriptionId} already exists`);
     }
 
     // Create subscription entry
@@ -146,6 +178,20 @@ export class SubscriptionManager {
     try {
       // Execute the subscription
       const result = await this.executor.subscribe(request, context);
+
+      // The subscription may have been torn down while the executor ran: the
+      // client completed the id, or the connection closed. Its entry is then
+      // gone (or, after an id reuse, belongs to a newer subscription), so
+      // release the source stream and register nothing.
+      if (!this.isCurrent(subscription)) {
+        subscription.status = 'completed';
+        if (Symbol.asyncIterator in Object(result)) {
+          void (result as AsyncIterableIterator<GraphQLResponse>)
+            .return?.()
+            ?.catch(() => {});
+        }
+        return subscription;
+      }
 
       // Check if it's an error result (a plain response object, not an async iterable)
       if (!(Symbol.asyncIterator in Object(result))) {
@@ -174,22 +220,25 @@ export class SubscriptionManager {
             // Notify the client before tearing down so the subscription does
             // not vanish silently: mark it completed and emit a Complete frame.
             const timedOut = this.getSubscription(connectionId, subscriptionId);
-            if (timedOut && timedOut.status === 'active') {
+            if (timedOut === subscription && timedOut.status === 'active') {
               timedOut.status = 'completed';
               // The client sees a plain `complete` either way, so log here to
               // keep a timeout distinguishable from a natural completion.
-              console.warn(
+              logWarning(
+                this.logger,
                 `Subscription ${subscriptionId} timed out after ${this.subscriptionTimeout}ms`
               );
               onComplete();
             }
           } catch (error) {
-            console.error(
+            this.logger.error(
               `Error completing timed-out subscription ${subscriptionId}:`,
               error
             );
           } finally {
-            this.unsubscribe(connectionId, subscriptionId);
+            if (this.isCurrent(subscription)) {
+              this.unsubscribe(connectionId, subscriptionId);
+            }
           }
         }, this.subscriptionTimeout);
       }
@@ -202,8 +251,7 @@ export class SubscriptionManager {
 
       // Start consuming the iterator
       this.consumeIterator(
-        connectionId,
-        subscriptionId,
+        subscription,
         iterator,
         onNext,
         onComplete,
@@ -212,6 +260,11 @@ export class SubscriptionManager {
 
       return subscription;
     } catch (error) {
+      // A subscription torn down mid-setup has nobody left to report to
+      if (!this.isCurrent(subscription)) {
+        subscription.status = 'completed';
+        return subscription;
+      }
       subscription.status = 'error';
       const message = error instanceof Error ? error.message : 'Subscription failed';
       onError([{ message }]);
@@ -221,35 +274,43 @@ export class SubscriptionManager {
   }
 
   /**
+   * Whether this exact subscription object is still the one registered under
+   * its connection and id. An id lookup alone is not enough: after a
+   * teardown the id can be registered again by a NEWER subscription.
+   */
+  private isCurrent(subscription: Subscription): boolean {
+    return this.getSubscription(subscription.connectionId, subscription.id) === subscription;
+  }
+
+  /**
    * Consume an async iterator and call callbacks
    */
   private async consumeIterator(
-    connectionId: string,
-    subscriptionId: string,
+    subscription: Subscription,
     iterator: AsyncIterableIterator<GraphQLResponse>,
     onNext: (result: GraphQLResponse) => void,
     onComplete: () => void,
     onError: (errors: readonly { message: string }[]) => void
   ): Promise<void> {
+    const { connectionId, id: subscriptionId } = subscription;
     try {
       for await (const result of iterator) {
-        const subscription = this.getSubscription(connectionId, subscriptionId);
-        if (!subscription || subscription.status !== 'active') {
+        // Identity, not just the id: a reused id belongs to a newer
+        // subscription whose client must never see this stream's events
+        if (!this.isCurrent(subscription) || subscription.status !== 'active') {
           break;
         }
 
         onNext(result);
       }
 
-      const subscription = this.getSubscription(connectionId, subscriptionId);
-      if (subscription) {
+      if (this.isCurrent(subscription)) {
         subscription.status = 'completed';
         onComplete();
         this.unsubscribe(connectionId, subscriptionId);
       }
     } catch (error) {
-      const subscription = this.getSubscription(connectionId, subscriptionId);
-      if (subscription) {
+      if (this.isCurrent(subscription)) {
         subscription.status = 'error';
         const message = error instanceof Error ? error.message : 'Subscription error';
         onError([{ message }]);

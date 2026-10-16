@@ -19,6 +19,7 @@ import {
   type WebSocketContext,
   type WebSocketHandlerConfig,
 } from './handler';
+import type { SubscriptionManager } from './manager';
 
 /** Records whether an iterator was released via return() */
 interface IteratorProbe {
@@ -157,9 +158,26 @@ function createTestSchema(
             return feed.iterator;
           },
         },
+        // Like `forever`, but the source stream takes 20ms to set up, which
+        // leaves a window for the socket to close or the id to be completed
+        slow: {
+          type: GraphQLInt,
+          subscribe: async () => {
+            const probe: IteratorProbe = { returned: false };
+            probes.push(probe);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            return neverEndingIterator(probe);
+          },
+        },
       },
     }),
   });
+}
+
+/** Reach the handler's subscription manager for bookkeeping assertions */
+function managerOf(handler: WebSocketHandler): SubscriptionManager {
+  return (handler as unknown as { subscriptionManager: SubscriptionManager })
+    .subscriptionManager;
 }
 
 interface Frame {
@@ -238,6 +256,8 @@ const SUBSCRIBE_COUNT =
   '{"id":"sub-1","type":"subscribe","payload":{"query":"subscription { count }"}}';
 const SUBSCRIBE_FOREVER =
   '{"id":"sub-1","type":"subscribe","payload":{"query":"subscription { forever }"}}';
+const SUBSCRIBE_SLOW =
+  '{"id":"sub-1","type":"subscribe","payload":{"query":"subscription { slow }"}}';
 
 describe('WebSocketHandler', () => {
   describe('handleOpen', () => {
@@ -331,6 +351,82 @@ describe('WebSocketHandler', () => {
       expect(frames(socket).filter((f) => f.type === 'connection_ack').length).toBe(1);
 
       await handler.handleClose(socket);
+    });
+  });
+
+  describe('connection_init races', () => {
+    test('should close with 4429 on a second connection_init while onConnect is pending', async () => {
+      let connects = 0;
+      const handler = createHandler({
+        onConnect: async () => {
+          connects++;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          return true;
+        },
+      });
+      const socket = createFakeSocket();
+      handler.handleOpen(socket);
+
+      // Bun dispatches back-to-back frames without awaiting the first
+      const first = handler.handleMessage(socket, '{"type":"connection_init"}');
+      const second = handler.handleMessage(socket, '{"type":"connection_init"}');
+
+      expect(socket.closed?.code).toBe(4429);
+      await Promise.all([first, second]);
+
+      // onConnect ran once; the second init never reached it
+      expect(connects).toBe(1);
+
+      await handler.handleClose(socket);
+    });
+
+    test('should never start more than one keep-alive timer per connection', async () => {
+      const intervalSpy = spyOn(globalThis, 'setInterval');
+      try {
+        const handler = createHandler({
+          keepAliveInterval: 1000,
+          onConnect: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            return true;
+          },
+        });
+        const socket = createFakeSocket();
+        handler.handleOpen(socket);
+
+        await Promise.all([
+          handler.handleMessage(socket, '{"type":"connection_init"}'),
+          handler.handleMessage(socket, '{"type":"connection_init"}'),
+        ]);
+
+        expect(intervalSpy.mock.calls.length).toBeLessThanOrEqual(1);
+
+        await handler.handleClose(socket);
+      } finally {
+        intervalSpy.mockRestore();
+      }
+    });
+
+    test('should neither ack nor start keep-alive when the socket closed during onConnect', async () => {
+      const handler = createHandler({
+        keepAliveInterval: 5,
+        onConnect: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          return true;
+        },
+      });
+      const socket = createFakeSocket();
+      handler.handleOpen(socket);
+
+      const init = handler.handleMessage(socket, '{"type":"connection_init"}');
+      await handler.handleClose(socket);
+      await init;
+
+      // Give a leaked keep-alive interval the chance to fire
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      expect(frames(socket).some((f) => f.type === 'connection_ack')).toBe(false);
+      expect(frames(socket).some((f) => f.type === 'ping')).toBe(false);
+      expect(socket.data.initialized).toBe(false);
     });
   });
 
@@ -482,6 +578,148 @@ describe('WebSocketHandler', () => {
     });
   });
 
+  describe('subscribe after close', () => {
+    test('should register nothing when the socket closed while the context was built', async () => {
+      const probes: IteratorProbe[] = [];
+      const handler = createHandler(
+        {
+          context: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            return {};
+          },
+        },
+        probes
+      );
+      const socket = createFakeSocket();
+      await openAndInit(handler, socket);
+
+      const subscribing = handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+      await handler.handleClose(socket);
+      const sentAtClose = socket.sent.length;
+      await subscribing;
+
+      // Either the source stream was never created or it was released
+      expect(probes.every((probe) => probe.returned)).toBe(true);
+      expect(managerOf(handler).subscriptionCount).toBe(0);
+      expect(managerOf(handler).connectionCount).toBe(0);
+      expect(socket.sent.length).toBe(sentAtClose);
+    });
+
+    test('should return the iterator when the socket closed during executor.subscribe', async () => {
+      const probes: IteratorProbe[] = [];
+      const handler = createHandler({}, probes);
+      const socket = createFakeSocket();
+      await openAndInit(handler, socket);
+
+      const subscribing = handler.handleMessage(socket, SUBSCRIBE_SLOW);
+      // Let the subscribe reach the (slow) source stream setup
+      await waitFor(() => probes.length === 1);
+      await handler.handleClose(socket);
+      await subscribing;
+
+      await waitFor(() => probes[0]!.returned);
+      expect(probes[0]!.returned).toBe(true);
+      expect(managerOf(handler).subscriptionCount).toBe(0);
+      expect(managerOf(handler).connectionCount).toBe(0);
+    });
+  });
+
+  describe('subscription id reuse', () => {
+    test('should cancel a pending subscribe completed by the client before reusing its id', async () => {
+      const probes: IteratorProbe[] = [];
+      let contexts = 0;
+      const handler = createHandler(
+        {
+          // Only the first operation is slow to build its context
+          context: async () => {
+            if (contexts++ === 0) {
+              await new Promise((resolve) => setTimeout(resolve, 30));
+            }
+            return {};
+          },
+        },
+        probes
+      );
+      const socket = createFakeSocket();
+      await openAndInit(handler, socket);
+
+      const first = handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+      await handler.handleMessage(socket, '{"id":"sub-1","type":"complete"}');
+      await handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+      await first;
+
+      // The cancelled first operation never created a source stream, and did
+      // not overwrite the second one's registration
+      expect(probes.length).toBe(1);
+      expect(probes[0]!.returned).toBe(false);
+      expect(managerOf(handler).subscriptionCount).toBe(1);
+      expect(socket.data.subscriptions.has('sub-1')).toBe(true);
+      expect(socket.closed).toBeNull();
+      expect(frames(socket).some((f) => f.type === 'error')).toBe(false);
+
+      // Nothing was orphaned: closing releases the one live stream
+      await handler.handleClose(socket);
+      await waitFor(() => probes[0]!.returned);
+    });
+
+    test('should return the iterator of a pending subscribe completed during executor.subscribe', async () => {
+      const probes: IteratorProbe[] = [];
+      const handler = createHandler({}, probes);
+      const socket = createFakeSocket();
+      await openAndInit(handler, socket);
+
+      const first = handler.handleMessage(socket, SUBSCRIBE_SLOW);
+      await waitFor(() => probes.length === 1);
+      await handler.handleMessage(socket, '{"id":"sub-1","type":"complete"}');
+      await handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+      await first;
+
+      await waitFor(() => probes[0]!.returned);
+      expect(probes.length).toBe(2);
+      expect(probes[1]!.returned).toBe(false);
+      expect(managerOf(handler).subscriptionCount).toBe(1);
+      expect(managerOf(handler).getSubscription(socket.data.connectionId, 'sub-1')?.request.query).toBe(
+        'subscription { forever }'
+      );
+
+      await handler.handleClose(socket);
+    });
+
+    test('should count pending subscriptions against maxSubscriptionsPerConnection', async () => {
+      let contexts = 0;
+      const handler = createHandler({
+        subscriptionManager: { maxSubscriptionsPerConnection: 1 },
+        context: async () => {
+          contexts++;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          return {};
+        },
+      });
+      const socket = createFakeSocket();
+      await openAndInit(handler, socket);
+
+      await Promise.all([
+        handler.handleMessage(socket, SUBSCRIBE_FOREVER),
+        handler.handleMessage(
+          socket,
+          '{"id":"sub-2","type":"subscribe","payload":{"query":"subscription { forever }"}}'
+        ),
+      ]);
+
+      // The second was refused before any work was done for it
+      expect(contexts).toBe(1);
+      const errorFrames = frames(socket).filter((f) => f.type === 'error');
+      expect(errorFrames.map((f) => f.id)).toEqual(['sub-2']);
+      expect(errorFrames[0]?.payload?.[0]?.message).toMatch(
+        /Maximum subscriptions per connection reached/
+      );
+      expect(socket.data.subscriptions.has('sub-1')).toBe(true);
+      expect(socket.data.subscriptions.has('sub-2')).toBe(false);
+
+      await handler.handleClose(socket);
+    });
+  });
+
   describe('query and mutation operations', () => {
     // graphql-ws carries EVERY operation on a Subscribe frame; a query or
     // mutation gets a single Next followed by Complete
@@ -595,6 +833,53 @@ describe('WebSocketHandler', () => {
       );
 
       expect(completedIds).toEqual(['q1']);
+
+      await handler.handleClose(socket);
+    });
+  });
+
+  describe('operation type detection', () => {
+    test('should parse with the executor limits, not an unbounded parse', async () => {
+      const handler = createHandler({
+        subscriptionManager: { executor: { parseOptions: { maxTokens: 5 } } },
+      });
+      const socket = createFakeSocket();
+      await openAndInit(handler, socket);
+
+      // Over the token budget long before the syntax error at the end: an
+      // unbounded parse lexes the whole document and reports the syntax error
+      await handler.handleMessage(
+        socket,
+        JSON.stringify({
+          id: 'op-1',
+          type: 'subscribe',
+          payload: { query: `{ ${'hello '.repeat(50)} ) }` },
+        })
+      );
+
+      const errorFrame = frames(socket).find((f) => f.type === 'error');
+      expect(errorFrame?.id).toBe('op-1');
+      expect(errorFrame?.payload?.[0]?.message).toMatch(/tokens/i);
+      expect(socket.closed).toBeNull();
+
+      await handler.handleClose(socket);
+    });
+
+    test('should still route queries through execute', async () => {
+      const handler = createHandler({
+        subscriptionManager: { executor: { parseOptions: { maxTokens: 50 } } },
+      });
+      const socket = createFakeSocket();
+      await openAndInit(handler, socket);
+
+      await handler.handleMessage(
+        socket,
+        '{"id":"op-1","type":"subscribe","payload":{"query":"{ hello }"}}'
+      );
+
+      const next = frames(socket).find((f) => f.type === 'next');
+      expect(next?.payload?.data?.hello).toBe('world');
+      expect(frames(socket).some((f) => f.type === 'complete')).toBe(true);
 
       await handler.handleClose(socket);
     });
@@ -737,6 +1022,93 @@ describe('WebSocketHandler', () => {
       // The setup-failure path is terminal for the id, like the other three
       expect(frames(socket).some((f) => f.type === 'error')).toBe(true);
       expect(completedIds).toEqual(['sub-1']);
+
+      await handler.handleClose(socket);
+    });
+  });
+
+  describe('logger', () => {
+    function recordingLogger(): {
+      errors: unknown[][];
+      warns: unknown[][];
+      logger: { error(...args: unknown[]): void; warn(...args: unknown[]): void };
+    } {
+      const errors: unknown[][] = [];
+      const warns: unknown[][] = [];
+      return {
+        errors,
+        warns,
+        logger: {
+          error: (...args: unknown[]) => errors.push(args),
+          warn: (...args: unknown[]) => warns.push(args),
+        },
+      };
+    }
+
+    test('should report hook failures through the injected logger, not console', async () => {
+      const { errors, logger } = recordingLogger();
+      const handler = createHandler({
+        logger,
+        onComplete: async () => {
+          throw new Error('onComplete boom');
+        },
+      });
+      const socket = createFakeSocket();
+      const consoleSpy = spyOn(console, 'error').mockImplementation(() => {});
+
+      try {
+        await openAndInit(handler, socket);
+        await handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+        await handler.handleMessage(socket, '{"id":"sub-1","type":"complete"}');
+
+        await waitFor(() => errors.some((call) => String(call[0]).includes('onComplete')));
+        expect(consoleSpy).not.toHaveBeenCalled();
+      } finally {
+        consoleSpy.mockRestore();
+      }
+
+      await handler.handleClose(socket);
+    });
+
+    test('should report Bun callback failures through the injected logger', async () => {
+      const { errors, logger } = recordingLogger();
+      const handler = createHandler({
+        logger,
+        onDisconnect: async () => {
+          throw new Error('onDisconnect boom');
+        },
+      });
+      const socket = createFakeSocket();
+      const config = handler.getWebSocketConfig();
+      const consoleSpy = spyOn(console, 'error').mockImplementation(() => {});
+
+      try {
+        config.open(socket);
+        config.close(socket);
+        await waitFor(() => errors.some((call) => String(call[0]).includes('onDisconnect')));
+        expect(consoleSpy).not.toHaveBeenCalled();
+      } finally {
+        consoleSpy.mockRestore();
+      }
+    });
+
+    test('should pass its logger to the subscription manager', async () => {
+      const { warns, logger } = recordingLogger();
+      const handler = createHandler({
+        logger,
+        subscriptionManager: { subscriptionTimeout: 10 },
+      });
+      const socket = createFakeSocket();
+      const consoleSpy = spyOn(console, 'warn').mockImplementation(() => {});
+
+      try {
+        await openAndInit(handler, socket);
+        await handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+        await waitFor(() => warns.some((call) => String(call[0]).includes('timed out')));
+        expect(consoleSpy).not.toHaveBeenCalled();
+      } finally {
+        consoleSpy.mockRestore();
+      }
 
       await handler.handleClose(socket);
     });
