@@ -1,6 +1,6 @@
 {
   "name": "@leaven-graphql/nestjs",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "NestJS integration for Leaven GraphQL",
   "type": "module",
   "main": "./src/index.ts",
@@ -27,13 +27,13 @@
     "README.md"
   ],
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir ./dist --target bun --external @nestjs/* --external reflect-metadata --external rxjs --external graphql --external @graphql-tools/* --external class-transformer --external class-validator --external @leaven-graphql/* && tsc -p tsconfig.build.json",
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun --packages external && tsc -p tsconfig.build.json",
     "clean": "rm -rf dist",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@graphql-tools/schema": "^10.0.0",
+    "@graphql-tools/schema": "^10.1.0",
     "@leaven-graphql/context": "workspace:*",
     "@leaven-graphql/core": "workspace:*",
     "@leaven-graphql/errors": "workspace:*",
@@ -48,14 +48,14 @@
   },
   "devDependencies": {
     "@lexmata/nestjs-platform-bun": "^0.4.0",
-    "@nestjs/common": "^11.1.19",
-    "@nestjs/core": "^11.1.19",
-    "@nestjs/graphql": "^13.2.5",
-    "@nestjs/testing": "^11.1.19",
+    "@nestjs/common": "^11.2.0",
+    "@nestjs/core": "^11.2.0",
+    "@nestjs/graphql": "^13.4.4",
+    "@nestjs/testing": "^11.2.0",
     "graphql": "^16.12.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",
-    "typescript": "^5.9.3"
+    "typescript": "^6.0.0"
   },
   "keywords": [
     "nestjs",

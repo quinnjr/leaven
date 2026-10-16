@@ -53,7 +53,7 @@
  */
 
 import { mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync } from 'node:fs';
-import { dirname, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { Glob } from 'bun';
 
 const REPO_ROOT = resolve(import.meta.dir, '..');
@@ -799,8 +799,16 @@ const tsconfig = {
     noImplicitAny: false,
     noUnusedLocals: false,
     noUnusedParameters: false,
-    baseUrl: REPO_ROOT,
-    paths: { ...WORKSPACE_PATHS, ...nestedPackagePaths },
+    // No `baseUrl`: TypeScript 6 deprecates it and 7 drops it. The targets are
+    // made absolute instead, which is what `baseUrl` was resolving them
+    // against anyway — `paths` here would otherwise resolve relative to this
+    // generated tsconfig, which lives under `node_modules`.
+    paths: Object.fromEntries(
+      Object.entries({ ...WORKSPACE_PATHS, ...nestedPackagePaths }).map(([specifier, targets]) => [
+        specifier,
+        targets.map((target) => (isAbsolute(target) ? target : join(REPO_ROOT, target))),
+      ])
+    ),
   },
   include: ['preamble.d.ts', 'stubs.d.ts', 'samples/**/*.ts', 'samples/**/*.d.ts'],
 };
