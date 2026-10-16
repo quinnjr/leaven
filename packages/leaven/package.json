@@ -43,6 +43,11 @@
   ],
   "author": "Joseph Quinn",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/quinnjr/leaven.git",
+    "directory": "packages/leaven"
+  },
   "dependencies": {
     "@leaven-graphql/context": "workspace:*",
     "@leaven-graphql/core": "workspace:*",
