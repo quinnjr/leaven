@@ -8,7 +8,13 @@
 export { LeavenExecutor, createExecutor } from './executor';
 export type { ExecutorConfig, ExecutionResult, ExecutionContext } from './executor';
 
-export { DocumentCache, createDocumentCache } from './cache';
+export {
+  DocumentCache,
+  createDocumentCache,
+  estimateDocumentBytes,
+  AST_BYTES_PER_QUERY_CHAR,
+  DEFAULT_CACHE_MAX_BYTES,
+} from './cache';
 export type { DocumentCacheConfig, CacheEntry, CachedValidation, IDocumentCache, CacheStats } from './cache';
 export { isPromise, resolveValue } from './cache';
 

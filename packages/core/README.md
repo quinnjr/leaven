@@ -53,6 +53,7 @@ const executor = new LeavenExecutor({
   schema,
   cache: {
     maxSize: 1000,      // Maximum cached documents
+    maxBytes: 32 << 20, // Estimated memory budget (default: 32 MiB)
     ttl: 3600000,       // TTL in milliseconds (1 hour)
   },
 });
@@ -66,13 +67,25 @@ console.log(stats);
 //     maxSize: 1000,
 //     hitRate: 3.71,   // AVERAGE HITS PER ENTRY, not a hit/miss ratio
 //     totalHits: 156,
-//     entries: 42      // alias for `size`
+//     entries: 42,     // alias for `size`
+//     bytes: 2_016_000, // estimated retained bytes
+//     maxBytes: 33_554_432
 //   },
 //   compiled: { size: 38, maxSize: 1000 }
 // }
 ```
 
 `stats.document` is `null` when the executor was created with `cache: false`.
+
+**Memory is bounded, not just entry count.** Each entry is estimated at
+`query.length * AST_BYTES_PER_QUERY_CHAR` (300) bytes: a parsed document with
+graphql-js location info retains roughly 50-140 bytes per character of
+pretty-printed query text and up to ~280 for minified text, so 300 errs high.
+Least recently used entries are evicted whenever `maxSize` or `maxBytes` would
+be exceeded, and a single entry estimated above `maxBytes / 10` (about 11,000
+characters at the 32 MiB default) is never cached, so one oversized query
+cannot flush the cache. Raise `maxBytes` if you rely on caching larger
+documents.
 
 **`hitRate` is not a percentage.** It is `totalHits / size` — the average number
 of times each cached entry has been reused. Misses are not tracked at all, so
@@ -363,6 +376,10 @@ interface CacheStats {
   totalHits: number;
   // Alias for `size`
   entries: number;
+  // Estimated retained bytes and the configured budget; reported by the
+  // in-memory DocumentCache, omitted by backends that cannot estimate them
+  bytes?: number;
+  maxBytes?: number;
 }
 ```
 

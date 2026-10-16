@@ -179,6 +179,7 @@ console.log(result.response.data);
   schema,
   cache: {
     maxSize: 1000,      // Max cached documents
+    maxBytes: 32 << 20, // Estimated memory budget (default: 32 MiB)
     ttl: 3600000,       // 1 hour TTL
   },
 });
