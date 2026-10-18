@@ -930,16 +930,50 @@ describe('SSE', () => {
     expect(text.endsWith(COMPLETE)).toBe(true);
   });
 
+  test('should stream a mutation whose onExecuted hook throws after it ran', async () => {
+    let runs = 0;
+    const handler = createHandler({
+      schema: new GraphQLSchema({
+        query: new GraphQLObjectType({
+          name: 'Query',
+          fields: { hello: { type: GraphQLString, resolve: () => 'world' } },
+        }),
+        mutation: new GraphQLObjectType({
+          name: 'Mutation',
+          fields: { record: { type: GraphQLString, resolve: () => `run ${++runs}` } },
+        }),
+      }),
+      sse: true,
+      executor: {
+        hooks: {
+          onExecuted: () => {
+            throw new Error('audit log down');
+          },
+        },
+      },
+    });
+    const res = await handler(post({ query: 'mutation { record }' }, { accept: 'text/event-stream' }));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
+    const text = await res.text();
+    expect(text).toContain('event: next');
+    expect(text.endsWith(COMPLETE)).toBe(true);
+    expect(runs).toBe(1);
+  });
+
+  // graphql-js rejects a variable that fails to coerce before any resolver
+  // runs, and the executor codes it BAD_REQUEST: a request error, so JSON.
   test('should answer a variable coercion error as JSON 400', async () => {
     const handler = createHandler({ schema: sseSchema, sse: true });
     const res = await handler(
       post(
-        { query: 'query ($n: Int!) { hello }', variables: { n: 'x' } },
+        { query: 'query ($n: Boolean!) { hello @include(if: $n) }', variables: { n: 'x' } },
         { accept: 'text/event-stream' }
       )
     );
     expect(res.status).toBe(400);
     expect(res.headers.get('content-type')).toContain('application/json');
+    expect((await res.json()).errors[0].extensions.code).toBe('BAD_REQUEST');
   });
 
   test('should mask a thrown subscription error by default without errorFormatting', async () => {

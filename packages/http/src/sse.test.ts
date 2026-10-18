@@ -15,11 +15,12 @@ import {
 } from 'graphql';
 import { createClient, NetworkError, type Client, type ClientOptions } from 'graphql-sse';
 import { AuthenticationError } from '@leaven-graphql/errors';
-import { createServer, type LeavenServer } from './server';
+import { createServer, type LeavenServer, type ServerConfig } from './server';
 
 let finished = false;
 let chargeCalls = 0;
 let guardedCalls = 0;
+let recordCalls = 0;
 
 const schema = new GraphQLSchema({
   query: new GraphQLObjectType({
@@ -29,6 +30,13 @@ const schema = new GraphQLSchema({
   mutation: new GraphQLObjectType({
     name: 'Mutation',
     fields: {
+      record: {
+        type: GraphQLString,
+        resolve: () => {
+          recordCalls++;
+          return 'recorded';
+        },
+      },
       charge: {
         type: new GraphQLNonNull(GraphQLString),
         resolve: () => {
@@ -78,9 +86,10 @@ const schema = new GraphQLSchema({
  */
 async function withClient(
   fn: (client: Client, server: LeavenServer, port: number) => Promise<void>,
-  options: Partial<ClientOptions> = { retryAttempts: 0 }
+  options: Partial<ClientOptions> = { retryAttempts: 0 },
+  serverConfig: Partial<ServerConfig> = {}
 ): Promise<void> {
-  const server = createServer({ schema, sse: true, port: 0 });
+  const server = createServer({ schema, sse: true, port: 0, ...serverConfig });
   const { port } = server.start();
   const client = createClient({
     url: `http://localhost:${port}/graphql`,
@@ -147,6 +156,31 @@ describe('GraphQL over SSE', () => {
       expect(results[0]!.data).toBeNull();
       expect(results[0]!.errors?.[0]?.message).toBe('card declined');
     }, retrying);
+  });
+
+  test('should run a mutation once when an onExecuted hook throws after it ran', async () => {
+    recordCalls = 0;
+    await withClient(
+      async (client) => {
+        const results: Array<{ errors?: ReadonlyArray<{ message: string }> }> = [];
+        for await (const result of client.iterate({ query: 'mutation { record }' })) {
+          results.push(result);
+        }
+        expect(recordCalls).toBe(1);
+        expect(results).toHaveLength(1);
+        expect(results[0]!.errors?.length).toBe(1);
+      },
+      retrying,
+      {
+        executor: {
+          hooks: {
+            onExecuted: () => {
+              throw new Error('audit log down');
+            },
+          },
+        },
+      }
+    );
   });
 
   test('should deliver a subscribe-time AuthenticationError as an event, not a NetworkError', async () => {

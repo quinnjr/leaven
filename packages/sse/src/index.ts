@@ -24,3 +24,5 @@ export type {
 export { isSubscriptionIterator, createEventStream, createEventStreamResponse } from './stream';
 
 export { formatResultErrors } from './format';
+
+export { REQUEST_ERROR_CODES, isRequestError } from './request-error';

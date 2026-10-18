@@ -19,6 +19,7 @@ import {
   acceptsEventStream,
   createEventStreamResponse,
   formatResultErrors,
+  isRequestError,
   isSubscriptionIterator,
   type EventStreamSource,
 } from '@leaven-graphql/sse';
@@ -212,35 +213,12 @@ function formatResponseErrors<TData>(
 }
 
 /**
- * True when a response is a *request error*: the operation was rejected
- * before anything ran, so it is answered as a non-200 JSON response rather
- * than as an event stream.
- *
- * A request error has no `data` (an `undefined` value counts as absent; it is
- * dropped on serialisation) and none of its errors carries a `path`. That
- * covers parse, validation, complexity, depth and operation-selection
- * rejections. Everything else — `data: null`, or any error with a `path`,
- * whether from a resolver or from a subscribe resolver that threw at
- * subscription start — happened during execution and must be streamed: the
- * graphql-sse client retries every non-OK response, which would run a
- * failing mutation's resolver again on each retry.
- *
- * @param response - A single executor response
- * @returns True when the response must be answered as JSON
- */
-function isRequestError(response: GraphQLResponse<unknown>): boolean {
-  return (
-    response.data === undefined &&
-    !(response.errors ?? []).some((error) => error.path !== undefined)
-  );
-}
-
-/**
  * Execute a request for the SSE transport and pick the source to stream.
  *
  * Subscriptions go through `subscribe`, everything else through `execute`.
  * Returns the source to stream, or the single response to answer as JSON
- * when it is a request error (see {@link isRequestError}). The rule applies
+ * when it is a request error (`isRequestError` from `@leaven-graphql/sse`:
+ * no data, and every error coded as a pre-execution rejection). The rule applies
  * to an `execute()` response and to a `subscribe()` result that is not an
  * iterator alike.
  */

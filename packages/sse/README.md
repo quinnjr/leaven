@@ -38,12 +38,15 @@ single `next` event followed by `complete`. Mutations are only accepted over
 
 Only a *request error* is answered as a plain JSON response with the usual
 status code rather than as a stream: one rejected before anything ran, with no
-`data` and no error `path` (a syntax, validation, complexity, depth or
-operation-selection error). Everything else is streamed as `200` `next` +
-`complete`, including a result with `data: null` and an error raised by a
-resolver, or by a subscribe resolver at subscription start (an
-`AuthenticationError`, for example). The client receives those as a result
-carrying `errors`.
+`data` and every error coded as a pre-execution rejection (`REQUEST_ERROR_CODES`:
+`PARSE_ERROR`, `VALIDATION_ERROR`, `COMPLEXITY_LIMIT`, `DEPTH_LIMIT`,
+`BAD_REQUEST`, `PERSISTED_QUERY_NOT_FOUND`, `PERSISTED_QUERY_INVALID`).
+Everything else is streamed as `200` `next` + `complete`, including a result
+with `data: null`, an error raised by a resolver or by a subscribe resolver at
+subscription start (an `AuthenticationError`, for example), and an uncoded
+failure such as a throwing `onExecuted` hook. The client receives those as a
+result carrying `errors`. The list is an allowlist on purpose: streaming is the
+safe default, because a stream is never retried.
 
 ### Retries
 
@@ -108,7 +111,7 @@ For a custom transport (a different framework, or your own router), build the
 GraphQL context yourself and route the operation by type: a subscription goes
 through `executor.subscribe` (an iterator, or a single response when it failed
 to start), a query or mutation through `executor.execute`. Answer a request
-error as JSON, and hand everything else to `createEventStreamResponse`, which
+error (`isRequestError`) as JSON, and hand everything else to `createEventStreamResponse`, which
 accepts either a subscription iterator or a single response. Mask errors with
 `formatResultErrors`: the executor's errors are already formatted, and passing
 them to `formatErrors` would mask intentional errors such as `UNAUTHENTICATED`
@@ -122,6 +125,7 @@ import {
   acceptsEventStream,
   createEventStreamResponse,
   formatResultErrors,
+  isRequestError,
   isSubscriptionIterator,
 } from '@leaven-graphql/sse';
 
@@ -133,12 +137,6 @@ const masking = { maskErrors: true };
 // Request errors all answer 400 here for brevity; @leaven-graphql/http derives
 // the status from each error's code instead
 const json = (body: GraphQLResponse, status = 400): Response => Response.json(body, { status });
-
-// Rejected before anything ran: no data and no error path. Everything else,
-// data: null included, ran resolvers and must be streamed, or the client's
-// retries would run them again.
-const isRequestError = (response: GraphQLResponse): boolean =>
-  response.data === undefined && !response.errors?.some((error) => error.path);
 
 export async function handleGraphQL(request: Request): Promise<Response> {
   if (!acceptsEventStream(request)) {
@@ -168,6 +166,9 @@ export async function handleGraphQL(request: Request): Promise<Response> {
       ? await executor.subscribe(graphqlRequest, context)
       : (await executor.execute(graphqlRequest, context)).response;
 
+  // Only a rejection before anything ran (no data, every error coded as a
+  // pre-execution rejection) is answered as JSON. Everything else is streamed,
+  // or the client's retries would run its resolvers again.
   if (!isSubscriptionIterator(source) && isRequestError(source)) {
     return json(formatResultErrors(source, masking));
   }
@@ -199,6 +200,7 @@ to `formatResult`.
 | `acceptsEventStream(request)` | Whether the request `Accept`s `text/event-stream` |
 | `isSubscriptionIterator(value)` | Distinguish an iterator from a single response |
 | `formatResultErrors(result, options?)` | Format (mask) the already-formatted errors of an executor result |
+| `isRequestError(result)`, `REQUEST_ERROR_CODES` | Whether a single result was rejected before execution, and the codes that count |
 | `formatSSEEvent`, `formatNextEvent`, `formatCompleteEvent` | Event encoders |
 | `SSE_CONTENT_TYPE`, `SSE_HEADERS`, `SSE_KEEP_ALIVE` | Protocol constants |
 | `DEFAULT_KEEP_ALIVE_INTERVAL` | `8000` ms |
