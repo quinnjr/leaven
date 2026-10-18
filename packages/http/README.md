@@ -101,11 +101,20 @@ const server = createServer({
 
 Set `sse` to serve GraphQL over SSE (graphql-sse, distinct connections mode) to
 requests that `Accept` `text/event-stream`. It is off by default; with `sse`
-unset behaviour is unchanged. Subscriptions stream results, queries and
-mutations answer with one `next` event then `complete`, and operations that fail
-before producing data get a plain JSON response. `LeavenServer` disables Bun's
-idle timeout for SSE requests. See [`@leaven-graphql/sse`](../sse) for the
-client and the low-level API.
+unset behaviour is unchanged. Subscriptions stream results, and queries and
+mutations answer with one `next` event then `complete`. Only request errors
+(no `data` and no error `path`: a syntax, validation, complexity, depth or
+operation-selection error) get a plain JSON response; execution errors,
+`data: null` included, are streamed, because the `graphql-sse` client retries
+non-`200` responses. `LeavenServer` disables Bun's idle timeout while an event
+stream is open and restores it when the stream closes. See
+[`@leaven-graphql/sse`](../sse) for the client and the low-level API.
+
+Errors in a streamed result (from resolvers) follow `errorFormatting`, exactly
+as on the JSON path: without it nothing is masked. An error thrown by the
+subscription iterator itself mid-stream is masked by default, and follows
+`errorFormatting` when it is set. The SSE `Content-Type` and `Cache-Control`
+always win over `response.headers`; other headers, CORS included, are kept.
 
 A mutation sent with `GET` is rejected with `405` and `Allow: POST` on every
 path, whether or not `sse` is enabled.

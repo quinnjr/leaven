@@ -139,14 +139,21 @@ import { SeoService } from '../services/seo.service';
           Mutations sent with <code class="text-green-400">GET</code> are rejected with
           <code class="text-green-400">405</code> and <code class="text-green-400">Allow: POST</code>.
           A keep-alive comment is sent every 8000 ms by default (<code class="text-green-400">0</code>
-          disables it) to stay under Bun's 10 second idle timeout; the server turns that timeout off for
-          SSE requests. Over HTTP/1.1 browsers allow only about 6 connections per origin, so many live
+          disables it) to stay under Bun's 10 second idle timeout; the server turns that timeout off while
+          a stream is open and restores it afterwards. Over HTTP/1.1 browsers allow only about 6 connections per origin, so many live
           subscriptions on one page call for HTTP/2.
+        </p>
+        <p class="text-zinc-400 mb-4">
+          Only request errors (no <code class="text-green-400">data</code> and no error
+          <code class="text-green-400">path</code>, such as a validation error) are answered as non-200 JSON.
+          Execution errors are streamed, because the graphql-sse client retries every non-200 response
+          (<code class="text-green-400">retryAttempts</code>, default 5), and a retried mutation would run again.
         </p>
         <p class="text-zinc-400 mb-4">
           Frameworks that own routing, such as Knead, can use the low-level API: build the context, run the operation with
           <code class="text-green-400">executor.subscribe</code> or <code class="text-green-400">executor.execute</code>,
-          answer failures that happen before any data as plain JSON, and stream the rest:
+          answer request errors as plain JSON, stream the rest, and mask errors with
+          <code class="text-green-400">formatResultErrors</code>:
         </p>
         <app-code-block [code]="sseLowLevelCode" title="custom-transport.ts" />
       </section>
@@ -568,13 +575,25 @@ import { formatErrors } from '@leaven-graphql/errors';
 import {
   acceptsEventStream,
   createEventStreamResponse,
+  formatResultErrors,
   isSubscriptionIterator,
 } from '@leaven-graphql/sse';
 import { schema } from './schema';
 
 const executor = new LeavenExecutor({ schema });
 
-const json = (body: GraphQLResponse, status: number): Response => Response.json(body, { status });
+// Mask unexpected errors; intentional Leaven errors keep their code and path
+const masking = { maskErrors: true };
+
+// Request errors all answer 400 here for brevity; @leaven-graphql/http derives
+// the status from each error's code instead
+const json = (body: GraphQLResponse, status = 400): Response => Response.json(body, { status });
+
+// Rejected before anything ran: no data and no error path. Everything else,
+// data: null included, ran resolvers and must be streamed, or the client's
+// retries would run them again.
+const isRequestError = (response: GraphQLResponse): boolean =>
+  response.data === undefined && !response.errors?.some((error) => error.path);
 
 export async function handleGraphQL(request: Request): Promise<Response> {
   if (!acceptsEventStream(request)) {
@@ -592,31 +611,27 @@ export async function handleGraphQL(request: Request): Promise<Response> {
       graphqlRequest.operationName
     );
   } catch (error) {
-    return json({ errors: formatErrors([error]) }, 400);
+    return json({ errors: formatErrors([error], masking) });
   }
   if (!operation) {
-    return json({ errors: [{ message: 'Unknown operation' }] }, 400);
+    return json({ errors: [{ message: 'Unknown operation' }] });
   }
 
-  let source;
-  if (operation.operation === 'subscription') {
-    source = await executor.subscribe(graphqlRequest, context);
-    // Not an iterator: the subscription failed before it started
-    if (!isSubscriptionIterator(source)) return json(source, 400);
-  } else {
-    source = (await executor.execute(graphqlRequest, context)).response;
-    // Errors and no data: a total failure, not a stream
-    if (source.errors?.length && source.data == null) return json(source, 400);
+  // Subscriptions go through subscribe, queries and mutations through execute
+  const source =
+    operation.operation === 'subscription'
+      ? await executor.subscribe(graphqlRequest, context)
+      : (await executor.execute(graphqlRequest, context)).response;
+
+  if (!isSubscriptionIterator(source) && isRequestError(source)) {
+    return json(formatResultErrors(source, masking));
   }
 
   return createEventStreamResponse(source, {
     // Closing the connection ends the stream and returns the iterator
     signal: request.signal,
-    // Mask unexpected errors in every result before it is serialised
-    formatResult: (response) => ({
-      ...response,
-      errors: response.errors && formatErrors(response.errors, { maskErrors: true }),
-    }),
+    // Mask every result's errors before it is serialised
+    formatResult: (response) => formatResultErrors(response, masking),
   });
 }`;
 }

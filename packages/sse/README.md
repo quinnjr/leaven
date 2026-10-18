@@ -34,10 +34,26 @@ createServer({
 A request is answered over SSE when it `Accept`s `text/event-stream`.
 Subscriptions stream every result; queries and mutations are answered with a
 single `next` event followed by `complete`. Mutations are only accepted over
-`POST`: a `GET` mutation is rejected with `405` and `Allow: POST`. Anything that
-fails before producing data (a syntax or validation error, for example) is
-answered as a plain JSON response with the usual status code rather than as a
-stream.
+`POST`: a `GET` mutation is rejected with `405` and `Allow: POST`.
+
+Only a *request error* is answered as a plain JSON response with the usual
+status code rather than as a stream: one rejected before anything ran, with no
+`data` and no error `path` (a syntax, validation, complexity, depth or
+operation-selection error). Everything else is streamed as `200` `next` +
+`complete`, including a result with `data: null` and an error raised by a
+resolver, or by a subscribe resolver at subscription start (an
+`AuthenticationError`, for example). The client receives those as a result
+carrying `errors`.
+
+### Retries
+
+The `graphql-sse` client treats every non-`200` response as a network error and
+retries it, up to `retryAttempts` times (default `5`) with randomised
+exponential backoff, before rejecting with a `NetworkError` whose `response`
+holds the JSON error. This is why only request errors get a non-`200` answer:
+retrying them is harmless because nothing ran, while an execution error answered
+that way would run a mutation's resolver again on every retry. Set
+`retryAttempts: 0` on the client to surface request errors immediately.
 
 ### Browser client
 
@@ -63,10 +79,14 @@ Success responses carry these headers:
 
 ```
 Content-Type: text/event-stream; charset=utf-8
-Cache-Control: no-cache
+Cache-Control: no-cache, no-transform
 Connection: keep-alive
 X-Accel-Buffering: no
+Content-Encoding: none
 ```
+
+Extra `headers` passed to `createEventStreamResponse` (CORS headers, for
+example) are added to these, but cannot replace them.
 
 Events are exactly:
 
@@ -85,9 +105,14 @@ keep-alive.
 ## Low-level API
 
 For a custom transport (a different framework, or your own router), build the
-GraphQL context yourself, call `executor.subscribe`, and hand the result to
-`createEventStreamResponse`. It accepts either a subscription iterator or a
-single response:
+GraphQL context yourself and route the operation by type: a subscription goes
+through `executor.subscribe` (an iterator, or a single response when it failed
+to start), a query or mutation through `executor.execute`. Answer a request
+error as JSON, and hand everything else to `createEventStreamResponse`, which
+accepts either a subscription iterator or a single response. Mask errors with
+`formatResultErrors`: the executor's errors are already formatted, and passing
+them to `formatErrors` would mask intentional errors such as `UNAUTHENTICATED`
+and drop their `path`.
 
 ```typescript
 import { getOperationAST } from 'graphql';
@@ -96,12 +121,24 @@ import { formatErrors } from '@leaven-graphql/errors';
 import {
   acceptsEventStream,
   createEventStreamResponse,
+  formatResultErrors,
   isSubscriptionIterator,
 } from '@leaven-graphql/sse';
 
 const executor = new LeavenExecutor({ schema });
 
-const json = (body: GraphQLResponse, status: number): Response => Response.json(body, { status });
+// Mask unexpected errors; intentional Leaven errors keep their code and path
+const masking = { maskErrors: true };
+
+// Request errors all answer 400 here for brevity; @leaven-graphql/http derives
+// the status from each error's code instead
+const json = (body: GraphQLResponse, status = 400): Response => Response.json(body, { status });
+
+// Rejected before anything ran: no data and no error path. Everything else,
+// data: null included, ran resolvers and must be streamed, or the client's
+// retries would run them again.
+const isRequestError = (response: GraphQLResponse): boolean =>
+  response.data === undefined && !response.errors?.some((error) => error.path);
 
 export async function handleGraphQL(request: Request): Promise<Response> {
   if (!acceptsEventStream(request)) {
@@ -119,31 +156,27 @@ export async function handleGraphQL(request: Request): Promise<Response> {
       graphqlRequest.operationName
     );
   } catch (error) {
-    return json({ errors: formatErrors([error]) }, 400);
+    return json({ errors: formatErrors([error], masking) });
   }
   if (!operation) {
-    return json({ errors: [{ message: 'Unknown operation' }] }, 400);
+    return json({ errors: [{ message: 'Unknown operation' }] });
   }
 
-  let source;
-  if (operation.operation === 'subscription') {
-    source = await executor.subscribe(graphqlRequest, context);
-    // Not an iterator: the subscription failed before it started
-    if (!isSubscriptionIterator(source)) return json(source, 400);
-  } else {
-    source = (await executor.execute(graphqlRequest, context)).response;
-    // Errors and no data: a total failure, not a stream
-    if (source.errors?.length && source.data == null) return json(source, 400);
+  // Subscriptions go through subscribe, queries and mutations through execute
+  const source =
+    operation.operation === 'subscription'
+      ? await executor.subscribe(graphqlRequest, context)
+      : (await executor.execute(graphqlRequest, context)).response;
+
+  if (!isSubscriptionIterator(source) && isRequestError(source)) {
+    return json(formatResultErrors(source, masking));
   }
 
   return createEventStreamResponse(source, {
     // Closing the connection ends the stream and returns the iterator
     signal: request.signal,
-    // Mask unexpected errors in every result before it is serialised
-    formatResult: (response) => ({
-      ...response,
-      errors: response.errors && formatErrors(response.errors, { maskErrors: true }),
-    }),
+    // Mask every result's errors before it is serialised
+    formatResult: (response) => formatResultErrors(response, masking),
   });
 }
 ```
@@ -153,8 +186,9 @@ creation and only need the stream.
 
 The stream applies backpressure (the iterator is only advanced as fast as the
 client reads), calls `iterator.return()` exactly once when the client
-disconnects or `signal` aborts, and masks unexpected errors by default; supply
-`formatError` to change that.
+disconnects or `signal` aborts, and masks errors thrown by the iterator by
+default; supply `formatError` to change that. Errors inside a result are left
+to `formatResult`.
 
 ### Exports
 
@@ -164,6 +198,7 @@ disconnects or `signal` aborts, and masks unexpected errors by default; supply
 | `createEventStream(source, options?)` | The underlying `ReadableStream` |
 | `acceptsEventStream(request)` | Whether the request `Accept`s `text/event-stream` |
 | `isSubscriptionIterator(value)` | Distinguish an iterator from a single response |
+| `formatResultErrors(result, options?)` | Format (mask) the already-formatted errors of an executor result |
 | `formatSSEEvent`, `formatNextEvent`, `formatCompleteEvent` | Event encoders |
 | `SSE_CONTENT_TYPE`, `SSE_HEADERS`, `SSE_KEEP_ALIVE` | Protocol constants |
 | `DEFAULT_KEEP_ALIVE_INTERVAL` | `8000` ms |
@@ -173,8 +208,9 @@ disconnects or `signal` aborts, and masks unexpected errors by default; supply
 Proxies and Bun itself close connections that stay silent. The keep-alive
 comment defaults to every `8000` ms (`DEFAULT_KEEP_ALIVE_INTERVAL`); set
 `keepAliveInterval: 0` to disable it. Keep the interval below Bun's 10 second
-`idleTimeout`. `LeavenServer` disables Bun's idle timeout for SSE requests, so
-this matters mainly when you serve the stream with your own `Bun.serve`.
+`idleTimeout`. `LeavenServer` disables Bun's idle timeout while an event stream
+is open and restores it when the stream closes, so this matters mainly when you
+serve the stream with your own `Bun.serve`.
 
 ## HTTP/1.1 connection limit
 
