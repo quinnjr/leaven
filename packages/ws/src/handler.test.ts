@@ -1623,6 +1623,24 @@ describe('error formatting', () => {
     });
   }
 
+  test('should keep a validation error visible under masking', async () => {
+    const handler = createHandler({ errorFormatting: { maskErrors: true } });
+    const socket = createFakeSocket();
+
+    await openAndInit(handler, socket);
+    await handler.handleMessage(socket, subscribeFrame('s1', 'subscription { nonexistent }'));
+    await handler.handleMessage(socket, subscribeFrame('q1', '{ nonexistent }'));
+
+    const errorFrames = frames(socket).filter((f) => f.type === 'error');
+    expect(errorFrames.map((f) => f.id)).toEqual(['s1', 'q1']);
+    for (const frame of errorFrames) {
+      expect(frame.payload?.[0]?.message).toMatch(/Cannot query field "nonexistent"/);
+      expect(frame.payload?.[0]?.extensions?.code).toBe(ErrorCode.VALIDATION_ERROR);
+    }
+
+    await handler.handleClose(socket);
+  });
+
   test('should pass errorFormatting to the subscription manager', async () => {
     const handler = createHandler({ errorFormatting: { maskErrors: true } });
     const manager = managerOf(handler) as unknown as {

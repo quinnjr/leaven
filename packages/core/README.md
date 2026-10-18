@@ -102,6 +102,15 @@ contains multiple operations.` (`parseRequest` and `CompiledQuery` throw the sam
 `LeavenError`, and also `Must provide an operation.` for a document with none).
 Because the code is a known client code, masking transports never hide it.
 
+**Every request error carries a client code.** graphql-js reports syntax,
+validation and variable-coercion failures with no `extensions.code`, which a
+masking transport would treat as an unexpected error (and HTTP as a 500). The
+executor codes them instead, keeping their `locations`: syntax errors
+(including an exceeded `maxTokens`) are `PARSE_ERROR`, validation errors
+(including disabled introspection) are `VALIDATION_ERROR`, and a variable that
+fails to coerce is `BAD_REQUEST`, all 400. An error that already has a code
+keeps it, and resolver errors are left as they are.
+
 **`hitRate` is not a percentage.** It is `totalHits / size` — the average number
 of times each cached entry has been reused. Misses are not tracked at all, so
 the value is unbounded and routinely exceeds `1` on a warm cache.

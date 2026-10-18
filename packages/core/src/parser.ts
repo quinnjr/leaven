@@ -54,6 +54,29 @@ export function createVisitBudget(): () => void {
 }
 
 /**
+ * Give a graphql-js error an `ErrorCode` unless it already has one.
+ *
+ * graphql-js reports syntax, validation and variable-coercion failures with
+ * no `extensions` at all. Every error leaving Leaven must carry a code, and
+ * these are client mistakes: left uncoded, `errorToGraphQL` files them under
+ * INTERNAL_ERROR, so a masking transport hides them and HTTP answers 500.
+ * `nodes`, `source` and `positions` are carried over so `locations` survive.
+ */
+export function withErrorCode(error: GraphQLError, code: ErrorCode): GraphQLError {
+  if (error.extensions?.code !== undefined) {
+    return error;
+  }
+  return new GraphQLError(error.message, {
+    nodes: error.nodes,
+    source: error.source,
+    positions: error.positions,
+    path: error.path,
+    originalError: error.originalError,
+    extensions: { ...error.extensions, code },
+  });
+}
+
+/**
  * Options for parsing GraphQL documents
  */
 export interface ParseOptions {
@@ -112,7 +135,13 @@ export function parseDocument(query: string, options?: ParseOptions): DocumentNo
   }
 
   try {
-    const document = parse(query, parseOptions);
+    let document: DocumentNode;
+    try {
+      document = parse(query, parseOptions);
+    } catch (error) {
+      // A syntax error, including an exceeded maxTokens, is the client's
+      throw error instanceof GraphQLError ? withErrorCode(error, ErrorCode.PARSE_ERROR) : error;
+    }
 
     // Validate query depth if specified. DepthLimitError owns the message,
     // the ErrorCode and the `depth`/`maxDepth` extensions, and carries a 400

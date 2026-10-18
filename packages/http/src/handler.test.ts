@@ -413,6 +413,53 @@ describe('createHandler', () => {
     });
   });
 
+  describe('request errors', () => {
+    for (const errorFormatting of [undefined, { maskErrors: true }]) {
+      const label = errorFormatting ? 'with masking' : 'without masking';
+
+      test(`should answer a validation error with 400 VALIDATION_ERROR ${label}`, async () => {
+        const handler = createHandler({ schema, errorFormatting });
+
+        const response = await handler(postRequest(JSON.stringify({ query: '{ nope }' })));
+
+        expect(response.status).toBe(400);
+        const body = await response.json();
+        expect(body.errors[0].message).toBe('Cannot query field "nope" on type "Query".');
+        expect(body.errors[0].extensions.code).toBe('VALIDATION_ERROR');
+        expect(body.errors[0].locations).toEqual([{ line: 1, column: 3 }]);
+      });
+
+      test(`should answer a syntax error with 400 PARSE_ERROR ${label}`, async () => {
+        const handler = createHandler({ schema, errorFormatting });
+
+        const response = await handler(postRequest(JSON.stringify({ query: '{ hello' })));
+
+        expect(response.status).toBe(400);
+        const body = await response.json();
+        expect(body.errors[0].message).toMatch(/^Syntax Error/);
+        expect(body.errors[0].extensions.code).toBe('PARSE_ERROR');
+      });
+
+      test(`should answer a variable coercion error with 400 BAD_REQUEST ${label}`, async () => {
+        const handler = createHandler({ schema, errorFormatting });
+
+        const response = await handler(
+          postRequest(
+            JSON.stringify({
+              query: 'query ($n: Boolean!) { hello @include(if: $n) }',
+              variables: { n: 'not a boolean' },
+            })
+          )
+        );
+
+        expect(response.status).toBe(400);
+        const body = await response.json();
+        expect(body.errors[0].message).toMatch(/Variable "\$n"/);
+        expect(body.errors[0].extensions.code).toBe('BAD_REQUEST');
+      });
+    }
+  });
+
   describe('operation selection errors', () => {
     for (const errorFormatting of [undefined, { maskErrors: true }]) {
       const label = errorFormatting ? 'with masking' : 'without masking';

@@ -355,6 +355,89 @@ describe('LeavenExecutor', () => {
     });
   });
 
+  describe('request error codes', () => {
+    const executor = new LeavenExecutor({ schema, rootValue });
+
+    test('should give a syntax error PARSE_ERROR and keep its location', async () => {
+      const result = await executor.execute({ query: '{ hello' });
+
+      expect(result.response.errors?.[0]?.message).toMatch(/^Syntax Error/);
+      expect(result.response.errors?.[0]?.extensions?.code).toBe(ErrorCode.PARSE_ERROR);
+      expect(result.response.errors?.[0]?.locations).toEqual([{ line: 1, column: 8 }]);
+    });
+
+    test('should give an exceeded maxTokens PARSE_ERROR', async () => {
+      const limited = new LeavenExecutor({ schema, rootValue, parseOptions: { maxTokens: 2 } });
+
+      const result = await limited.execute({ query: '{ hello }' });
+
+      expect(result.response.errors?.[0]?.message).toMatch(/tokens/);
+      expect(result.response.errors?.[0]?.extensions?.code).toBe(ErrorCode.PARSE_ERROR);
+    });
+
+    test('should give a validation error VALIDATION_ERROR and keep its location', async () => {
+      const result = await executor.execute({ query: '{ nope }' });
+
+      expect(result.response.errors?.[0]?.message).toBe('Cannot query field "nope" on type "Query".');
+      expect(result.response.errors?.[0]?.extensions?.code).toBe(ErrorCode.VALIDATION_ERROR);
+      expect(result.response.errors?.[0]?.locations).toEqual([{ line: 1, column: 3 }]);
+    });
+
+    test('should give disabled introspection VALIDATION_ERROR', async () => {
+      const closed = new LeavenExecutor({ schema, rootValue, introspection: false });
+
+      const result = await closed.execute({ query: '{ __schema { queryType { name } } }' });
+
+      expect(result.response.errors?.[0]?.extensions?.code).toBe(ErrorCode.VALIDATION_ERROR);
+    });
+
+    test('should give a variable coercion error BAD_REQUEST before formatExecutionError runs', async () => {
+      const seen: unknown[] = [];
+      const hooked = new LeavenExecutor({
+        schema,
+        rootValue,
+        formatExecutionError: (error) => {
+          seen.push(error.extensions.code);
+          return error.toJSON();
+        },
+      });
+
+      const result = await hooked.execute({ query: 'query ($id: ID!) { user(id: $id) { id } }' });
+
+      expect(result.response.data).toBeUndefined();
+      expect(result.response.errors?.[0]?.message).toMatch(/Variable "\$id"/);
+      expect(result.response.errors?.[0]?.extensions?.code).toBe(ErrorCode.BAD_REQUEST);
+      expect(seen).toEqual([ErrorCode.BAD_REQUEST]);
+    });
+
+    test('should leave resolver errors uncoded', async () => {
+      const result = await executor.execute({ query: '{ error }' });
+
+      expect(result.response.data).toEqual({ error: null });
+      expect(result.response.errors?.[0]?.extensions).toBeUndefined();
+    });
+
+    test('should give subscribe syntax, validation and variable errors client codes', async () => {
+      const syntax = (await executor.subscribe({ query: 'subscription {' })) as GraphQLResponse;
+      const invalid = (await executor.subscribe({ query: 'subscription { nope }' })) as GraphQLResponse;
+      const variables = (await executor.subscribe({
+        query: 'subscription ($from: Int!) { countdown(from: $from) }',
+      })) as GraphQLResponse;
+
+      expect(syntax.errors?.[0]?.extensions?.code).toBe(ErrorCode.PARSE_ERROR);
+      expect(invalid.errors?.[0]?.extensions?.code).toBe(ErrorCode.VALIDATION_ERROR);
+      expect(variables.errors?.[0]?.extensions?.code).toBe(ErrorCode.BAD_REQUEST);
+    });
+
+    test('should leave a failing subscribe resolver uncoded', async () => {
+      const result = (await executor.subscribe({ query: 'subscription { failing }' })) as GraphQLResponse;
+
+      expect(result.errors?.[0]?.message).toBe('Subscribe failed');
+      expect(result.errors?.[0]?.path).toEqual(['failing']);
+      expect(result.errors?.[0]?.extensions?.code).toBeUndefined();
+    });
+  });
+
   describe('operation selection errors', () => {
     const compiled = new LeavenExecutor({ schema, rootValue, compilerOptions: {} });
     const plain = new LeavenExecutor({ schema, rootValue });

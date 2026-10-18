@@ -24,6 +24,7 @@ import { DocumentCache, type DocumentCacheConfig, type CachedValidation, type ID
 import {
   operationSelectionError,
   parseDocument,
+  withErrorCode,
   validateDocument,
   type ParseOptions,
   type ValidationResult,
@@ -586,7 +587,11 @@ export class LeavenExecutor {
     }
 
     if (!validation.valid) {
-      return { errors: validation.errors.map((e) => e.toJSON()) };
+      return {
+        errors: validation.errors.map((e) =>
+          withErrorCode(e, ErrorCode.VALIDATION_ERROR).toJSON()
+        ),
+      };
     }
 
     // Validation does not look at `operationName`, so an unknown name, or a
@@ -721,7 +726,9 @@ export class LeavenExecutor {
 
       const response: GraphQLResponse<TData> = {
         data: result.data as TData | undefined,
-        errors: result.errors?.map((e) => this.serializeExecutionError(e)),
+        errors: result.errors?.map((e) =>
+          this.serializeExecutionError(LeavenExecutor.codeRequestError(e, result.data))
+        ),
       };
 
       if (this.hooks?.onExecuted) {
@@ -744,6 +751,22 @@ export class LeavenExecutor {
         metrics: this.metricsEnabled ? buildMetrics() : undefined,
       };
     }
+  }
+
+  /**
+   * Give a graphql-js *request* error the client code `BAD_REQUEST`.
+   *
+   * graphql-js reports a request it cannot start (in practice a variable that
+   * fails to coerce, since operation selection is checked earlier) as errors
+   * with no `data` and no `path`, and with no code. Those are client mistakes;
+   * an error with a `path` (a subscribe resolver that threw) is not, and is
+   * left as it is. Applied before `formatExecutionError`, which still gets the
+   * last word.
+   */
+  private static codeRequestError(error: GraphQLError, data: unknown): GraphQLError {
+    return data === undefined && error.path === undefined
+      ? withErrorCode(error, ErrorCode.BAD_REQUEST)
+      : error;
   }
 
   /**
@@ -826,7 +849,9 @@ export class LeavenExecutor {
       // If it's an error result (not an async iterable), return it as a response
       if (!(Symbol.asyncIterator in result)) {
         return {
-          errors: (result as GraphQLExecutionResult).errors?.map((e) => serializeError(e)),
+          errors: (result as GraphQLExecutionResult).errors?.map((e) =>
+            serializeError(LeavenExecutor.codeRequestError(e, undefined))
+          ),
         };
       }
 
