@@ -1,6 +1,6 @@
 {
   "name": "@leaven-graphql/sse",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "Server-Sent Events (graphql-sse) transport for Leaven GraphQL",
   "type": "module",
   "main": "./src/index.ts",
