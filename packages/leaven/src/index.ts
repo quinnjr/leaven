@@ -2,7 +2,7 @@
  * Leaven - A high-performance GraphQL library for the Bun runtime
  *
  * Meta-package that re-exports the Leaven runtime modules — core, http, ws,
- * context, errors, plugins, and playground — plus selected schema-building
+ * sse, context, errors, plugins, and playground — plus selected schema-building
  * helpers from `@leaven-graphql/schema`. The NestJS integration is not
  * included here; it ships separately as `@leaven-graphql/nestjs`.
  *
@@ -28,6 +28,7 @@ export {
 } from '@leaven-graphql/schema';
 export * from '@leaven-graphql/http';
 export * from '@leaven-graphql/ws';
+export * from '@leaven-graphql/sse';
 export * from '@leaven-graphql/context';
 export * from '@leaven-graphql/errors';
 export * from '@leaven-graphql/plugins';
@@ -75,6 +76,15 @@ export {
   PubSub,
   createPubSub,
 } from '@leaven-graphql/ws';
+
+export {
+  // SSE
+  createEventStream,
+  createEventStreamResponse,
+  acceptsEventStream,
+  formatResultErrors,
+  isRequestError,
+} from '@leaven-graphql/sse';
 
 export {
   // Context

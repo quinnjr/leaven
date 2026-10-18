@@ -2,12 +2,17 @@
 # Registers this repo's release workflow as the npm trusted publisher (OIDC)
 # for every public workspace package, so CI can publish without an NPM_TOKEN.
 #
-# Run by a maintainer with npm 2FA (it logs in first if needed):
+# Run by a maintainer with npm 2FA who is already logged in to npm (the script
+# never logs in itself):
 #   pnpm trust:npm --dry-run   # preview
 #   pnpm trust:npm
 #
+# Packages that already trust this repo's release workflow are skipped, so the
+# script is safe to re-run after adding a package.
+#
 # A package must already exist on the registry before a trusted publisher can
-# be attached to it, so a brand-new package needs one manual first publish.
+# be attached to it, so a brand-new package needs one manual first publish;
+# packages not on the registry yet are skipped with a notice.
 set -euo pipefail
 
 REPO="quinnjr/leaven"
@@ -30,15 +35,73 @@ packages=$(cd "$root" && node -e '
 while IFS= read -r var; do unset "$var"; done < <(env | grep -io '^npm_config_[^=]*' || true)
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
-npm11() { (cd "$workdir" && pnpm dlx npm@11 "$@"); }
+npm11() { (cd "$workdir" && pnpm --silent dlx npm@11 "$@"); }
 
 if ! npm11 whoami >/dev/null 2>&1; then
-  npm11 login
+  echo "Not logged in to npm. Log in first (npm login), then re-run." >&2
+  exit 1
 fi
+
+# Exit 0 when the package already trusts $REPO's $WORKFLOW, 1 when it does not,
+# 2 when the check itself failed (npm sometimes demands a one-time password
+# just to list). `npm trust list --json` prints one object for a single
+# relationship, an array for several, and `{ "error": ... }` on failure.
+trust_status() {
+  npm11 trust list "$1" --json 2>/dev/null | REPO="$REPO" WORKFLOW="$WORKFLOW" node -e '
+    let input = "";
+    process.stdin.on("data", (chunk) => (input += chunk));
+    process.stdin.on("end", () => {
+      let parsed;
+      try { parsed = JSON.parse(input || "[]"); } catch { process.exit(2); }
+      if (parsed && !Array.isArray(parsed) && parsed.error) process.exit(2);
+      const entries = Array.isArray(parsed) ? parsed : [parsed];
+      const match = entries.some((entry) =>
+        entry && entry.type === "github" &&
+        entry.repository === process.env.REPO &&
+        entry.file === process.env.WORKFLOW);
+      process.exit(match ? 0 : 1);
+    });'
+}
+
+errlog="$workdir/trust-error.log"
+failed=()
 
 for pkg in $packages; do
   echo "==> $pkg"
-  npm11 trust github "$pkg" --file "$WORKFLOW" --repo "$REPO" --allow-publish --yes "$@"
+  if ! npm11 view "$pkg" name >/dev/null 2>&1; then
+    echo "    skipped: not on the registry yet (publish it manually once first)"
+    continue
+  fi
+  status=0
+  trust_status "$pkg" || status=$?
+  if [ "$status" -eq 0 ]; then
+    echo "    skipped: already trusts $REPO ($WORKFLOW)"
+    continue
+  fi
+  if [ "$status" -eq 2 ]; then
+    echo "    could not check existing trust (npm wanted a one-time password); trying anyway"
+  fi
+  # stderr is copied to a log (and still shown) so a 409 can be recognised; the
+  # browser-auth prompt needs the terminal, so stdout and stdin stay attached.
+  : >"$errlog"
+  rc=0
+  npm11 trust github "$pkg" --file "$WORKFLOW" --repo "$REPO" --allow-publish --yes "$@" \
+    2> >(tee "$errlog" >&2) || rc=$?
+  wait $! 2>/dev/null || true # let tee finish writing the log
+  if [ "$rc" -eq 0 ]; then
+    :
+  elif grep -q 'E409' "$errlog"; then
+    # The registry answers 409 when a matching trusted publisher already exists.
+    echo "    skipped: a trusted publisher already exists (npm 409)"
+  else
+    echo "    FAILED: see the npm error above" >&2
+    failed+=("$pkg")
+  fi
   # The registry rate-limits trust changes; npm recommends spacing calls.
   sleep 2
 done
+
+if [ "${#failed[@]}" -gt 0 ]; then
+  echo "Failed: ${failed[*]}" >&2
+  exit 1
+fi

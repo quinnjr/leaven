@@ -11,6 +11,10 @@
   - changed-files:
       - any-glob-to-any-file: packages/ws/**
 
+'pkg: sse':
+  - changed-files:
+      - any-glob-to-any-file: packages/sse/**
+
 'pkg: context':
   - changed-files:
       - any-glob-to-any-file: packages/context/**

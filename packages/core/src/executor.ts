@@ -142,6 +142,65 @@ interface PipelineTelemetry {
 }
 
 /**
+ * Responses the executor produced for a request it rejected before running
+ * any resolver. See {@link isRequestRejection}.
+ */
+const requestRejections = new WeakSet<object>();
+
+/**
+ * Errors thrown by the executor's own analysis (parsing with its limits, and
+ * query compilation with its visit budget). The analysis can run user code,
+ * namely `compilerOptions.complexityCalculator`, but never a resolver, so a
+ * throw from the calculator is still a pre-execution rejection. A response
+ * built from one of these errors in a catch block is a rejection.
+ */
+const rejectionThrows = new WeakSet<object>();
+
+function isObject(value: unknown): value is object {
+  return (typeof value === 'object' && value !== null) || typeof value === 'function';
+}
+
+function markRejection<T extends object>(response: T): T {
+  requestRejections.add(response);
+  return response;
+}
+
+/** Tag an error thrown by the executor's own analysis, then rethrow it */
+function rejectionThrow(error: unknown): never {
+  if (isObject(error)) {
+    rejectionThrows.add(error);
+  }
+  throw error;
+}
+
+/**
+ * Whether a response is one the executor produced because it rejected the
+ * request before running any resolver.
+ *
+ * That covers a syntax error, the parser limits (`maxTokens`, `maxDepth`,
+ * the analysis budget), a validation failure, the complexity budget, an
+ * unknown or missing operation name, and a variable that fails to coerce.
+ * Nothing ran, so the request can safely be answered with a non-200 status
+ * and retried. Errors from `onExecute`, `onExecuted`, resolvers, subscribe
+ * resolvers and any other unexpected throw are never marked, whatever code
+ * they carry.
+ *
+ * The check is identity-based: pass the very `response` object that
+ * `execute()` (inside its `ExecutionResult`) or `subscribe()` returned, not a
+ * copy or a formatted clone. The mark is also module-scoped, so the caller
+ * must use the same installed copy of `@leaven-graphql/core` as the executor
+ * that produced the response. With duplicate copies this returns false, which
+ * is safe: the response streams instead of being answered non-200. The mark changes nothing on the wire: the
+ * response serialises exactly as before.
+ *
+ * @param response - A response returned by the executor
+ * @returns True when the executor rejected the request before execution
+ */
+export function isRequestRejection(response: unknown): boolean {
+  return isObject(response) && requestRejections.has(response);
+}
+
+/**
  * Result of the shared pipeline: either a document cleared to run, or the
  * formatted errors that reject the request.
  */
@@ -436,7 +495,11 @@ export class LeavenExecutor {
     // `this.parseOptions` already has any configured `maxDepth` folded in, and
     // is part of the cache-key fingerprint, so a cached document can never
     // have been parsed under different limits than the ones in force here.
-    return { document: parseDocument(query, this.parseOptions), cached: false };
+    try {
+      return { document: parseDocument(query, this.parseOptions), cached: false };
+    } catch (error) {
+      return rejectionThrow(error);
+    }
   }
 
   /**
@@ -611,11 +674,13 @@ export class LeavenExecutor {
     // stored once it is known to be within budget (see below).
     let admitCompiled: (() => void) | undefined;
     if (this.compilerOptions) {
-      const { compiled, cached, admit } = this.getCompiledQuery(
-        request.query,
-        document,
-        request.operationName
-      );
+      let compilation: ReturnType<LeavenExecutor['getCompiledQuery']>;
+      try {
+        compilation = this.getCompiledQuery(request.query, document, request.operationName);
+      } catch (error) {
+        return rejectionThrow(error);
+      }
+      const { compiled, cached, admit } = compilation;
       admitCompiled = admit;
       telemetry.queryCached = cached;
       if (this.compilerOptions.calculateComplexity) {
@@ -699,7 +764,7 @@ export class LeavenExecutor {
 
       if (prepared.errors) {
         return {
-          response: { errors: prepared.errors },
+          response: markRejection({ errors: prepared.errors }),
           metrics: this.metricsEnabled ? buildMetrics() : undefined,
         };
       }
@@ -731,6 +796,12 @@ export class LeavenExecutor {
         ),
       };
 
+      // graphql-js leaves `data` out only when it could not start execution
+      // (a variable that fails to coerce): no resolver ran.
+      if (result.data === undefined) {
+        markRejection(response);
+      }
+
       if (this.hooks?.onExecuted) {
         await this.hooks.onExecuted(response as GraphQLResponse);
       }
@@ -740,16 +811,36 @@ export class LeavenExecutor {
         metrics: this.metricsEnabled ? buildMetrics(executionTime) : undefined,
       };
     } catch (error) {
-      if (this.hooks?.onError) {
-        await this.hooks.onError(error as Error);
-      }
+      await this.reportError(error);
 
+      const response: GraphQLResponse<TData> = {
+        errors: [this.formatCaughtError(error)],
+      };
+      if (isObject(error) && rejectionThrows.has(error)) {
+        markRejection(response);
+      }
       return {
-        response: {
-          errors: [this.formatCaughtError(error)],
-        },
+        response,
         metrics: this.metricsEnabled ? buildMetrics() : undefined,
       };
+    }
+  }
+
+  /**
+   * Run the onError hook without letting it fail the request.
+   *
+   * It is called from the executor's catch blocks, which must still return
+   * the original error as a response: a throwing or rejecting hook is
+   * ignored, as a throwing onCacheError hook is.
+   */
+  private async reportError(error: unknown): Promise<void> {
+    if (!this.hooks?.onError) {
+      return;
+    }
+    try {
+      await this.hooks.onError(error as Error);
+    } catch {
+      // The error hook itself must never fail the request
     }
   }
 
@@ -826,7 +917,7 @@ export class LeavenExecutor {
       const prepared = await this.runPipeline(request, telemetry);
 
       if (prepared.errors) {
-        return { errors: prepared.errors };
+        return markRejection({ errors: prepared.errors });
       }
 
       const { document } = prepared;
@@ -848,11 +939,16 @@ export class LeavenExecutor {
 
       // If it's an error result (not an async iterable), return it as a response
       if (!(Symbol.asyncIterator in result)) {
-        return {
-          errors: (result as GraphQLExecutionResult).errors?.map((e) =>
-            serializeError(LeavenExecutor.codeRequestError(e, undefined))
-          ),
+        const errors = (result as GraphQLExecutionResult).errors ?? [];
+        const response: GraphQLResponse<TData> = {
+          errors: errors.map((e) => serializeError(LeavenExecutor.codeRequestError(e, undefined))),
         };
+        // graphql-js locates every subscribe-resolver error at the field's
+        // path; only errors raised before that resolver ran have none.
+        if (errors.every((e) => e.path === undefined)) {
+          markRejection(response);
+        }
+        return response;
       }
 
       // Transform the async iterator to match our response type
@@ -889,11 +985,13 @@ export class LeavenExecutor {
         },
       } as SubscriptionIterator<TData>;
     } catch (error) {
-      if (this.hooks?.onError) {
-        await this.hooks.onError(error as Error);
-      }
+      await this.reportError(error);
 
-      return { errors: [this.formatCaughtError(error)] };
+      const response: GraphQLResponse<TData> = { errors: [this.formatCaughtError(error)] };
+      if (isObject(error) && rejectionThrows.has(error)) {
+        markRejection(response);
+      }
+      return response;
     }
   }
 
