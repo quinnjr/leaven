@@ -15,3 +15,10 @@ export {
   formatCompleteEvent,
   acceptsEventStream,
 } from './protocol';
+
+export type {
+  EventStreamSource,
+  EventStreamOptions,
+  EventStreamResponseOptions,
+} from './stream';
+export { isSubscriptionIterator, createEventStream, createEventStreamResponse } from './stream';
