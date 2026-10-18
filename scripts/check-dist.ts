@@ -56,11 +56,12 @@ for (const name of readdirSync(packagesDir)) {
 }
 
 // 2. Smoke test: a schema built with the consumer's `graphql` must work with the built executor
-//    and the built WebSocket subscription manager.
+//    and the built WebSocket subscription manager, and the built SSE package must encode a stream.
 if (failures.length === 0) {
   const { GraphQLObjectType, GraphQLSchema, GraphQLString } = await import('graphql');
   const core = await import(join(packagesDir, 'core', 'dist', 'index.js'));
   const ws = await import(join(packagesDir, 'ws', 'dist', 'index.js'));
+  const sse = await import(join(packagesDir, 'sse', 'dist', 'index.js'));
 
   const schema = new GraphQLSchema({
     query: new GraphQLObjectType({
@@ -97,6 +98,16 @@ if (failures.length === 0) {
       failures.push(`ws: subscription returned ${JSON.stringify(received)}`);
     }
     manager.clear();
+
+    const stream: ReadableStream<Uint8Array> = sse.createEventStream(
+      { data: { ok: true } },
+      { keepAliveInterval: 0 },
+    );
+    const frames = await new Response(stream).text();
+    const expected = 'event: next\ndata: {"data":{"ok":true}}\n\nevent: complete\ndata:\n\n';
+    if (frames !== expected) {
+      failures.push(`sse: event stream yielded ${JSON.stringify(frames)}`);
+    }
   } catch (error) {
     failures.push(`smoke test threw: ${(error as Error).message.split('\n')[0]}`);
   }
