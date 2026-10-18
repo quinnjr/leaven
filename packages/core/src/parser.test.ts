@@ -18,7 +18,7 @@ import {
   MAX_ANALYSIS_VISITS,
 } from './parser';
 import { buildSchema, getIntrospectionQuery, GraphQLError } from 'graphql';
-import { DepthLimitError, ErrorCode } from '@leaven-graphql/errors';
+import { DepthLimitError, ErrorCode, LeavenError } from '@leaven-graphql/errors';
 
 describe('parseDocument', () => {
   test('should parse a valid GraphQL query', () => {
@@ -534,13 +534,32 @@ describe('parseRequest', () => {
     expect(result.operationType).toBe('query');
   });
 
-  test('should throw for missing operation', () => {
-    expect(() =>
-      parseRequest({
-        query: 'query GetHello { hello }',
-        operationName: 'NonExistent',
-      })
-    ).toThrow(/not found/);
+  test('should throw a BAD_REQUEST LeavenError for an unknown operation name', () => {
+    let thrown: unknown;
+    try {
+      parseRequest({ query: 'query GetHello { hello }', operationName: 'NonExistent' });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(LeavenError);
+    expect((thrown as LeavenError).message).toBe('Unknown operation named "NonExistent".');
+    expect((thrown as LeavenError).code).toBe(ErrorCode.BAD_REQUEST);
+    expect((thrown as LeavenError).statusCode).toBe(400);
+  });
+
+  test('should require an operation name when the document has several operations', () => {
+    expect(() => parseRequest({ query: 'query A { hello } query B { hello }' })).toThrow(
+      'Must provide operation name if query contains multiple operations.'
+    );
+  });
+
+  test('should treat a null operation name as unspecified', () => {
+    const result = parseRequest({
+      query: 'query A { hello }',
+      operationName: null as unknown as undefined,
+    });
+    expect(result.operation.name?.value).toBe('A');
   });
 
   test('should escape and cap a client operation name in the error text', () => {
@@ -559,11 +578,16 @@ describe('parseRequest', () => {
   });
 
   test('should throw for document with no operations', () => {
-    expect(() =>
-      parseRequest({
-        query: 'fragment F on User { id }',
-      })
-    ).toThrow(/No operation found/);
+    let thrown: unknown;
+    try {
+      parseRequest({ query: 'fragment F on User { id }' });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(LeavenError);
+    expect((thrown as LeavenError).message).toBe('Must provide an operation.');
+    expect((thrown as LeavenError).code).toBe(ErrorCode.BAD_REQUEST);
   });
 });
 

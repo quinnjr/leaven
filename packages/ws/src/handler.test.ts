@@ -1598,6 +1598,31 @@ describe('error formatting', () => {
     await handler.handleClose(socket);
   });
 
+  for (const [label, query] of [
+    ['query', 'query A { hello }'],
+    ['subscription', 'subscription A { count }'],
+  ] as const) {
+    test(`should send an unknown ${label} operation name as a BAD_REQUEST error frame`, async () => {
+      const handler = createHandler({ errorFormatting: { maskErrors: true } });
+      const socket = createFakeSocket();
+
+      await openAndInit(handler, socket);
+      await handler.handleMessage(
+        socket,
+        JSON.stringify({ id: 'op', type: 'subscribe', payload: { query, operationName: 'B' } })
+      );
+      await waitFor(() => frames(socket).some((f) => f.type === 'error'));
+
+      const errorFrame = frames(socket).find((f) => f.type === 'error');
+      expect(errorFrame?.id).toBe('op');
+      expect(errorFrame?.payload?.[0]?.message).toBe('Unknown operation named "B".');
+      expect(errorFrame?.payload?.[0]?.extensions?.code).toBe(ErrorCode.BAD_REQUEST);
+      expect(socket.closed).toBeNull();
+
+      await handler.handleClose(socket);
+    });
+  }
+
   test('should pass errorFormatting to the subscription manager', async () => {
     const handler = createHandler({ errorFormatting: { maskErrors: true } });
     const manager = managerOf(handler) as unknown as {

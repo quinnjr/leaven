@@ -355,6 +355,80 @@ describe('LeavenExecutor', () => {
     });
   });
 
+  describe('operation selection errors', () => {
+    const compiled = new LeavenExecutor({ schema, rootValue, compilerOptions: {} });
+    const plain = new LeavenExecutor({ schema, rootValue });
+
+    for (const [label, executor] of [
+      ['without the compiler', plain],
+      ['with the compiler', compiled],
+    ] as const) {
+      test(`should report an unknown operation name as BAD_REQUEST ${label}`, async () => {
+        const result = await executor.execute({
+          query: 'query A { hello }',
+          operationName: 'B',
+        });
+
+        expect(result.response.data).toBeUndefined();
+        expect(result.response.errors).toEqual([
+          { message: 'Unknown operation named "B".', extensions: { code: ErrorCode.BAD_REQUEST } },
+        ]);
+      });
+
+      test(`should report a missing operation name as BAD_REQUEST ${label}`, async () => {
+        const result = await executor.execute({ query: 'query A { hello } query B { hello }' });
+
+        expect(result.response.errors).toEqual([
+          {
+            message: 'Must provide operation name if query contains multiple operations.',
+            extensions: { code: ErrorCode.BAD_REQUEST },
+          },
+        ]);
+      });
+    }
+
+    test('should report an unknown operation name on subscribe as BAD_REQUEST', async () => {
+      const result = await plain.subscribe({
+        query: 'subscription A { countdown(from: 1) }',
+        operationName: 'B',
+      });
+
+      expect(Symbol.asyncIterator in result).toBe(false);
+      expect((result as GraphQLResponse).errors?.[0]?.extensions?.code).toBe(ErrorCode.BAD_REQUEST);
+      expect((result as GraphQLResponse).errors?.[0]?.message).toBe(
+        'Unknown operation named "B".'
+      );
+    });
+
+    test('should escape a client operation name in the error text', async () => {
+      const result = await plain.execute({
+        query: 'query A { hello }',
+        operationName: 'Evil\r\nINFO forged',
+      });
+
+      expect(result.response.errors?.[0]?.message).toBe(
+        'Unknown operation named "Evil\\r\\nINFO forged".'
+      );
+    });
+
+    test('should not call onError for an operation selection error', async () => {
+      let called = false;
+      const hooked = new LeavenExecutor({
+        schema,
+        rootValue,
+        hooks: {
+          onError: () => {
+            called = true;
+          },
+        },
+      });
+
+      await hooked.execute({ query: 'query A { hello }', operationName: 'B' });
+
+      expect(called).toBe(false);
+    });
+  });
+
   describe('execute with depth limits', () => {
     test('should treat maxDepth: 0 as a limit that rejects everything', async () => {
       const zeroExecutor = new LeavenExecutor({ schema, rootValue, maxDepth: 0 });

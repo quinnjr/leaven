@@ -14,9 +14,10 @@ import {
   type ParseOptions as GraphQLParseOptions,
   getOperationAST,
   Kind,
+  type OperationDefinitionNode,
 } from 'graphql';
 
-import { DepthLimitError, ErrorCode } from '@leaven-graphql/errors';
+import { DepthLimitError, ErrorCode, LeavenError } from '@leaven-graphql/errors';
 
 import type { OperationType, ParsedRequest, GraphQLRequest } from './types';
 import { escapeLog } from './escape-log';
@@ -415,22 +416,68 @@ export function getOperationType(
 }
 
 /**
+ * The client error for a document whose operation cannot be selected, worded
+ * as graphql-js words it.
+ *
+ * Choosing the operation is the client's job (the document and
+ * `operationName` are both request input), so this is a `BAD_REQUEST` (400)
+ * `LeavenError`, never an internal error that a masking transport would hide
+ * behind a 500. The client-chosen name goes through {@link escapeLog}.
+ *
+ * Only meaningful when `getOperationAST(document, operationName)` returned
+ * nothing.
+ */
+export function operationSelectionError(
+  document: DocumentNode,
+  operationName?: string | null
+): LeavenError {
+  if (operationName !== undefined && operationName !== null) {
+    return new LeavenError(
+      `Unknown operation named "${escapeLog(operationName)}".`,
+      ErrorCode.BAD_REQUEST
+    );
+  }
+  const hasOperation = document.definitions.some(
+    (definition) => definition.kind === Kind.OPERATION_DEFINITION
+  );
+  return new LeavenError(
+    hasOperation
+      ? 'Must provide operation name if query contains multiple operations.'
+      : 'Must provide an operation.',
+    ErrorCode.BAD_REQUEST
+  );
+}
+
+/**
+ * Select the operation a request runs.
+ *
+ * @throws {LeavenError} `BAD_REQUEST` when `operationName` names no operation
+ * of the document, or is missing while the document has several (or none);
+ * see {@link operationSelectionError}.
+ */
+export function selectOperation(
+  document: DocumentNode,
+  operationName?: string | null
+): OperationDefinitionNode {
+  const operation = getOperationAST(document, operationName);
+  if (!operation) {
+    throw operationSelectionError(document, operationName);
+  }
+  return operation;
+}
+
+/**
  * Parse and extract full request information
+ *
+ * @throws {LeavenError} `BAD_REQUEST` when the operation cannot be selected
+ * (see {@link selectOperation}).
  */
 export function parseRequest(
   request: GraphQLRequest,
   options?: ParseOptions
 ): ParsedRequest {
   const document = parseDocument(request.query, options);
-  const operation = getOperationAST(document, request.operationName);
-
-  if (!operation) {
-    throw new Error(
-      request.operationName
-        ? `Operation "${escapeLog(request.operationName)}" not found in document`
-        : 'No operation found in document'
-    );
-  }
+  const operation = selectOperation(document, request.operationName);
 
   return {
     ...request,

@@ -94,6 +94,14 @@ document actually selects, so an `operationName` the document does not contain
 never creates an entry. Neither cache stores a query until it has passed
 validation, the depth limit and the complexity budget.
 
+**Selecting the operation is the client's job.** An `operationName` the document
+does not contain, or a missing one for a document with several operations, is
+rejected after validation with a `BAD_REQUEST` (400) error worded as graphql-js
+words it: `Unknown operation named "x".` or `Must provide operation name if query
+contains multiple operations.` (`parseRequest` and `CompiledQuery` throw the same
+`LeavenError`, and also `Must provide an operation.` for a document with none).
+Because the code is a known client code, masking transports never hide it.
+
 **`hitRate` is not a percentage.** It is `totalHits / size` — the average number
 of times each cached entry has been reused. Misses are not tracked at all, so
 the value is unbounded and routinely exceeds `1` on a warm cache.

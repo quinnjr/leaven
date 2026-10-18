@@ -413,6 +413,55 @@ describe('createHandler', () => {
     });
   });
 
+  describe('operation selection errors', () => {
+    for (const errorFormatting of [undefined, { maskErrors: true }]) {
+      const label = errorFormatting ? 'with masking' : 'without masking';
+
+      test(`should answer an unknown operation name with 400 BAD_REQUEST ${label}`, async () => {
+        const handler = createHandler({ schema, errorFormatting });
+
+        const response = await handler(
+          postRequest(JSON.stringify({ query: 'query A { hello }', operationName: 'B' }))
+        );
+
+        expect(response.status).toBe(400);
+        const body = await response.json();
+        expect(body.errors[0].message).toBe('Unknown operation named "B".');
+        expect(body.errors[0].extensions.code).toBe('BAD_REQUEST');
+      });
+
+      test(`should answer a missing operation name with 400 BAD_REQUEST ${label}`, async () => {
+        const handler = createHandler({ schema, errorFormatting });
+
+        const response = await handler(
+          postRequest(JSON.stringify({ query: 'query A { hello } query B { hello }' }))
+        );
+
+        expect(response.status).toBe(400);
+        const body = await response.json();
+        expect(body.errors[0].message).toBe(
+          'Must provide operation name if query contains multiple operations.'
+        );
+        expect(body.errors[0].extensions.code).toBe('BAD_REQUEST');
+      });
+    }
+
+    test('should answer an unknown operation name with 400 when the compiler is on', async () => {
+      const handler = createHandler({
+        schema,
+        executor: { maxComplexity: 100 },
+        errorFormatting: { maskErrors: true },
+      });
+
+      const response = await handler(
+        postRequest(JSON.stringify({ query: 'query A { hello }', operationName: 'B' }))
+      );
+
+      expect(response.status).toBe(400);
+      expect((await response.json()).errors[0].message).toBe('Unknown operation named "B".');
+    });
+  });
+
   describe('error mapping', () => {
     test('should use LeavenError statusCode for thrown Leaven errors', async () => {
       const handler = createHandler({

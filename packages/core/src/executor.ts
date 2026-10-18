@@ -21,7 +21,13 @@ import {
 import { ComplexityError, ErrorCode, isLeavenError } from '@leaven-graphql/errors';
 
 import { DocumentCache, type DocumentCacheConfig, type CachedValidation, type IDocumentCache, resolveValue } from './cache';
-import { parseDocument, validateDocument, type ParseOptions, type ValidationResult } from './parser';
+import {
+  operationSelectionError,
+  parseDocument,
+  validateDocument,
+  type ParseOptions,
+  type ValidationResult,
+} from './parser';
 import { type CompiledQuery, compileQuery, type CompilerOptions } from './compiler';
 import { CompiledQueryCache } from './compiled-cache';
 import type {
@@ -581,6 +587,19 @@ export class LeavenExecutor {
 
     if (!validation.valid) {
       return { errors: validation.errors.map((e) => e.toJSON()) };
+    }
+
+    // Validation does not look at `operationName`, so an unknown name, or a
+    // missing one for a multi-operation document, gets this far. Both are
+    // client mistakes: reject them here as BAD_REQUEST, on every path (the
+    // compiler and graphql-js would otherwise report them as an uncoded or
+    // INTERNAL_ERROR failure, which a masking transport hides as a 500).
+    if (!getOperationAST(document, request.operationName)) {
+      return {
+        errors: [
+          operationSelectionError(document, request.operationName).toGraphQLError().toJSON(),
+        ],
+      };
     }
 
     // Check complexity if compiler is enabled. The compiled plan is only
