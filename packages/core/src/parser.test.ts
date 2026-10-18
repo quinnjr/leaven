@@ -10,13 +10,14 @@ import {
   parseDocument,
   validateDocument,
   calculateQueryDepth,
+  calculateQueryDepths,
   getOperationType,
   parseRequest,
   countFields,
   getOperationNames,
   MAX_ANALYSIS_VISITS,
 } from './parser';
-import { buildSchema, GraphQLError } from 'graphql';
+import { buildSchema, getIntrospectionQuery, GraphQLError } from 'graphql';
 import { DepthLimitError, ErrorCode } from '@leaven-graphql/errors';
 
 describe('parseDocument', () => {
@@ -273,6 +274,207 @@ describe('calculateQueryDepth', () => {
     expect(thrown).toBeInstanceOf(GraphQLError);
     expect((thrown as GraphQLError).message).toMatch(/exceeded the maximum/);
     expect((thrown as GraphQLError).extensions.code).toBe(ErrorCode.COMPLEXITY_LIMIT);
+  });
+});
+
+/** Parse and return the thrown error, or undefined when parsing succeeded */
+function parseError(query: string, options: Parameters<typeof parseDocument>[1]): GraphQLError | undefined {
+  try {
+    parseDocument(query, options);
+    return undefined;
+  } catch (error) {
+    return error as GraphQLError;
+  }
+}
+
+describe('calculateQueryDepths', () => {
+  test('should split introspection depth from the rest of the document', () => {
+    const document = parseDocument(`{
+      a { b { c } }
+      __schema { types { fields { name } } }
+    }`);
+
+    expect(calculateQueryDepths(document)).toEqual({ depth: 3, introspectionDepth: 4 });
+  });
+
+  test('should report 0 introspection depth for a document without introspection', () => {
+    expect(calculateQueryDepths(parseDocument('{ a { b } }'))).toEqual({
+      depth: 2,
+      introspectionDepth: 0,
+    });
+  });
+
+  test('should keep calculateQueryDepth as the deepest of the two', () => {
+    const document = parseDocument(getIntrospectionQuery());
+
+    expect(calculateQueryDepth(document)).toBe(15);
+    expect(calculateQueryDepths(document)).toEqual({ depth: 0, introspectionDepth: 15 });
+  });
+
+  test('should count __typename as an ordinary field', () => {
+    expect(calculateQueryDepths(parseDocument('{ a { __typename } __typename }'))).toEqual({
+      depth: 2,
+      introspectionDepth: 0,
+    });
+  });
+
+  test('should treat __schema and __type only at the operation root as introspection', () => {
+    // graphql-js only defines the meta-fields on the query root; a nested
+    // `__type` is rejected by validation, so it must not escape maxDepth here
+    const document = parseDocument('{ a { __type(name: "X") { ofType { ofType { name } } } } }');
+
+    expect(calculateQueryDepths(document)).toEqual({ depth: 5, introspectionDepth: 0 });
+  });
+
+  test('should treat meta-fields reached through root inline fragments and spreads as introspection', () => {
+    const document = parseDocument(`
+      { ... on Query { __type(name: "X") { name } } ...Root }
+      fragment Root on Query { __schema { types { name } } }
+    `);
+
+    expect(calculateQueryDepths(document)).toEqual({ depth: 0, introspectionDepth: 3 });
+  });
+
+  test('should count a fragment shared inside and outside introspection under both limits', () => {
+    const shared = 'fragment F on T { ofType { ofType { name } } }';
+    const introspectionFirst = parseDocument(
+      `{ __type(name: "X") { ...F } a { b { ...F } } } ${shared}`
+    );
+    const regularFirst = parseDocument(
+      `{ a { b { ...F } } __type(name: "X") { ...F } } ${shared}`
+    );
+
+    // __type = 1, F adds 3 below it; a.b = 2, F adds 3 below that
+    expect(calculateQueryDepths(introspectionFirst)).toEqual({ depth: 5, introspectionDepth: 4 });
+    expect(calculateQueryDepths(regularFirst)).toEqual({ depth: 5, introspectionDepth: 4 });
+  });
+
+  test('should memoise a fragment with root meta-fields separately per spread site', () => {
+    const intro = 'fragment Intro on Query { __schema { types { fields { name } } } }';
+    const rootFirst = parseDocument(`{ ...Intro a { ...Intro } } ${intro}`);
+    const nestedFirst = parseDocument(`{ a { ...Intro } ...Intro } ${intro}`);
+
+    // At the root the fragment is introspection (depth 4); under `a` its
+    // `__schema` is an ordinary field, so the path counts as regular depth 5
+    expect(calculateQueryDepths(rootFirst)).toEqual({ depth: 5, introspectionDepth: 4 });
+    expect(calculateQueryDepths(nestedFirst)).toEqual({ depth: 5, introspectionDepth: 4 });
+  });
+
+  test('should stay linear for doubly-spread fragment chains used in both modes', () => {
+    const chain = 20;
+    const definitions: string[] = [];
+    for (let i = 0; i < chain; i++) {
+      definitions.push(`fragment F${i} on T { ...F${i + 1} ...F${i + 1} }`);
+    }
+    definitions.push(`fragment F${chain} on T { leaf { ofType { name } } }`);
+    definitions.push('fragment Root on Query { __type(name: "X") { ...F0 } a { ...F0 } }');
+
+    const document = parseDocument(
+      `{ ...Root __schema { types { ...F0 } } b { ...Root } }\n${definitions.join('\n')}`
+    );
+
+    const start = performance.now();
+    const depths = calculateQueryDepths(document);
+    const elapsed = performance.now() - start;
+
+    // b.__type.leaf.ofType.name and b.a.leaf.ofType.name are regular (5);
+    // __schema.types.leaf.ofType.name is introspection (5)
+    expect(depths).toEqual({ depth: 5, introspectionDepth: 5 });
+    expect(elapsed).toBeLessThan(250);
+  });
+});
+
+describe('parseDocument maxIntrospectionDepth', () => {
+  const introspection = getIntrospectionQuery();
+
+  test('should reject getIntrospectionQuery() under maxDepth alone, as before', () => {
+    const error = parseError(introspection, { maxDepth: 10 });
+
+    expect(error?.extensions.code).toBe(ErrorCode.DEPTH_LIMIT);
+    expect(error?.extensions.depth).toBe(15);
+    expect(error?.extensions.limit).toBeUndefined();
+  });
+
+  test('should accept getIntrospectionQuery() with a separate maxIntrospectionDepth', () => {
+    expect(parseError(introspection, { maxDepth: 10, maxIntrospectionDepth: 20 })).toBeUndefined();
+  });
+
+  test('should still bound introspection with maxIntrospectionDepth', () => {
+    const error = parseError(introspection, { maxDepth: 10, maxIntrospectionDepth: 5 });
+
+    expect(error).toBeInstanceOf(GraphQLError);
+    expect(error?.originalError).toBeInstanceOf(DepthLimitError);
+    expect(error?.extensions.code).toBe(ErrorCode.DEPTH_LIMIT);
+    expect(error?.extensions.depth).toBe(15);
+    expect(error?.extensions.maxDepth).toBe(5);
+    expect(error?.extensions.limit).toBe('maxIntrospectionDepth');
+  });
+
+  test('should still reject a non-introspection query deeper than maxDepth', () => {
+    const deep = '{ a { b { c { d { e { f { g { h { i { j { k } } } } } } } } } } }';
+    const error = parseError(deep, { maxDepth: 10, maxIntrospectionDepth: 20 });
+
+    expect(error?.extensions.code).toBe(ErrorCode.DEPTH_LIMIT);
+    expect(error?.extensions.depth).toBe(11);
+    expect(error?.extensions.maxDepth).toBe(10);
+    expect(error?.extensions.limit).toBe('maxDepth');
+  });
+
+  test('should reject a nested __type chain against maxDepth', () => {
+    const nested = '{ a { __type(name: "X") { ofType { ofType { ofType { name } } } } } }';
+
+    expect(parseError(nested, { maxDepth: 4, maxIntrospectionDepth: 20 })?.extensions.limit).toBe(
+      'maxDepth'
+    );
+  });
+
+  test('should apply both limits to a fragment shared inside and outside introspection', () => {
+    const query = `
+      { __type(name: "X") { ...F } a { b { ...F } } }
+      fragment F on T { ofType { ofType { name } } }
+    `;
+
+    expect(parseError(query, { maxDepth: 5, maxIntrospectionDepth: 4 })).toBeUndefined();
+    expect(parseError(query, { maxDepth: 4, maxIntrospectionDepth: 20 })?.extensions.limit).toBe(
+      'maxDepth'
+    );
+    expect(parseError(query, { maxDepth: 20, maxIntrospectionDepth: 3 })?.extensions.limit).toBe(
+      'maxIntrospectionDepth'
+    );
+  });
+
+  test('should bound introspection when only maxIntrospectionDepth is set', () => {
+    expect(parseError(introspection, { maxIntrospectionDepth: 5 })?.extensions.limit).toBe(
+      'maxIntrospectionDepth'
+    );
+    expect(parseError('{ a { b { c { d { e { f } } } } } }', { maxIntrospectionDepth: 5 })).toBeUndefined();
+  });
+
+  test('should reject a pathologically deep ofType chain quickly', () => {
+    const levels = 2000;
+    const query = `{ __type(name: "X") { ${'ofType { '.repeat(levels)}name${' }'.repeat(levels)} } }`;
+
+    const start = performance.now();
+    const error = parseError(query, { maxDepth: 10, maxIntrospectionDepth: 20 });
+    const elapsed = performance.now() - start;
+
+    expect(error?.extensions.limit).toBe('maxIntrospectionDepth');
+    expect(elapsed).toBeLessThan(250);
+  });
+
+  test('should reject a pathologically wide introspection document through the visit budget', () => {
+    const aliases = Array.from(
+      { length: MAX_ANALYSIS_VISITS + 1 },
+      (_, i) => `t${i}: __type(name: "X") { name }`
+    ).join(' ');
+    const query = `{ ${aliases} }`;
+
+    const start = performance.now();
+    const error = parseError(query, { maxDepth: 10, maxIntrospectionDepth: 20 });
+    const elapsed = performance.now() - start;
+
+    expect(error?.extensions.code).toBe(ErrorCode.COMPLEXITY_LIMIT);
+    expect(elapsed).toBeLessThan(2000);
   });
 });
 

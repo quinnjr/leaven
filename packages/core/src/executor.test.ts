@@ -8,6 +8,7 @@
 import { describe, test, expect, beforeEach, spyOn } from 'bun:test';
 import {
   buildSchema,
+  getIntrospectionQuery,
   parse,
   GraphQLError,
   type GraphQLFormattedError,
@@ -365,6 +366,82 @@ describe('LeavenExecutor', () => {
         /exceeds maximum allowed depth/
       );
       expect(result.response.errors![0]?.extensions?.code).toBe('DEPTH_LIMIT');
+    });
+
+    test('should accept getIntrospectionQuery() under maxDepth 10 with maxIntrospectionDepth 20', async () => {
+      const executor = new LeavenExecutor({
+        schema,
+        rootValue,
+        maxDepth: 10,
+        maxIntrospectionDepth: 20,
+      });
+
+      const result = await executor.execute({ query: getIntrospectionQuery() });
+
+      expect(result.response.errors).toBeUndefined();
+      expect(result.response.data).toHaveProperty('__schema');
+    });
+
+    test('should reject getIntrospectionQuery() under maxIntrospectionDepth 5', async () => {
+      const executor = new LeavenExecutor({
+        schema,
+        rootValue,
+        maxDepth: 10,
+        maxIntrospectionDepth: 5,
+      });
+
+      const result = await executor.execute({ query: getIntrospectionQuery() });
+
+      expect(result.response.data).toBeUndefined();
+      expect(result.response.errors![0]?.extensions?.code).toBe(ErrorCode.DEPTH_LIMIT);
+      expect(result.response.errors![0]?.extensions?.limit).toBe('maxIntrospectionDepth');
+    });
+
+    test('should keep counting introspection against maxDepth when maxIntrospectionDepth is unset', async () => {
+      const executor = new LeavenExecutor({ schema, rootValue, maxDepth: 10 });
+
+      const result = await executor.execute({ query: getIntrospectionQuery() });
+
+      expect(result.response.errors![0]?.extensions?.code).toBe(ErrorCode.DEPTH_LIMIT);
+    });
+
+    test('should let maxIntrospectionDepth override parseOptions.maxIntrospectionDepth', async () => {
+      const executor = new LeavenExecutor({
+        schema,
+        rootValue,
+        maxDepth: 10,
+        maxIntrospectionDepth: 20,
+        parseOptions: { maxIntrospectionDepth: 1 },
+      });
+
+      const result = await executor.execute({ query: getIntrospectionQuery() });
+
+      expect(result.response.errors).toBeUndefined();
+    });
+
+    test('should not serve a document cached under a looser maxIntrospectionDepth', async () => {
+      const sharedCache = new DocumentCache();
+      const query = getIntrospectionQuery();
+      const permissive = new LeavenExecutor({
+        schema,
+        rootValue,
+        cache: sharedCache,
+        maxDepth: 10,
+        maxIntrospectionDepth: 20,
+      });
+      const strict = new LeavenExecutor({
+        schema,
+        rootValue,
+        cache: sharedCache,
+        maxDepth: 10,
+        maxIntrospectionDepth: 5,
+      });
+
+      expect((await permissive.execute({ query })).response.errors).toBeUndefined();
+
+      const denied = await strict.execute({ query });
+      expect(denied.response.data).toBeUndefined();
+      expect(denied.response.errors![0]?.extensions?.limit).toBe('maxIntrospectionDepth');
     });
 
     test('should honour parseOptions.maxDepth when no executor maxDepth is set', async () => {

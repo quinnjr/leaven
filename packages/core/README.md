@@ -234,9 +234,10 @@ const result = await executor.execute<QueryData>(
 | `schema` | `GraphQLSchema` | Required | Your GraphQL schema |
 | `rootValue` | `unknown` | `undefined` | Root resolver value |
 | `cache` | `DocumentCacheConfig \| boolean \| IDocumentCache` | `true` | Document cache configuration or custom cache |
-| `parseOptions` | `ParseOptions` | `{}` | Parser options: `maxDepth`, `maxTokens`, and raw `graphqlOptions` |
+| `parseOptions` | `ParseOptions` | `{}` | Parser options: `maxDepth`, `maxIntrospectionDepth`, `maxTokens`, and raw `graphqlOptions` |
 | `compilerOptions` | `CompilerOptions` | `undefined` | Query compiler options |
 | `maxDepth` | `number` | `undefined` | Maximum query depth (overrides `parseOptions.maxDepth`) |
+| `maxIntrospectionDepth` | `number` | `undefined` | Separate depth limit for introspection paths (overrides `parseOptions.maxIntrospectionDepth`); see below |
 | `maxComplexity` | `number` | `undefined` | Maximum query complexity (implies `compilerOptions.calculateComplexity`) |
 | `hooks` | `ExecutionHooks` | `undefined` | Lifecycle hooks |
 | `metrics` | `boolean` | `false` | Enable execution metrics (reported by `execute` only) |
@@ -246,6 +247,36 @@ const result = await executor.execute<QueryData>(
 `maxDepth`, `maxComplexity` and `hooks` apply to subscriptions as well as
 queries and mutations — `execute` and `subscribe` share one
 parse/validate/compile pipeline.
+
+### `maxIntrospectionDepth`
+
+graphql-js's `getIntrospectionQuery()`, which GraphiQL and codegen tools send,
+is 15 levels deep, so a typical `maxDepth: 10` rejects it. Set
+`maxIntrospectionDepth` to bound introspection separately:
+
+```typescript
+import { getIntrospectionQuery } from 'graphql';
+import { LeavenExecutor } from '@leaven-graphql/core';
+
+const executor = new LeavenExecutor({ schema, maxDepth: 10, maxIntrospectionDepth: 20 });
+
+await executor.execute({ query: getIntrospectionQuery() }); // accepted
+await executor.execute({ query: '{ a { b { c { d { e { f { g { h { i { j { k } } } } } } } } } } }' });
+// rejected: depth 11 exceeds maxDepth 10
+```
+
+A path that enters `__schema` or `__type` at an operation's root (directly or
+through root-level inline fragments and spreads) counts against
+`maxIntrospectionDepth`; everything else counts against `maxDepth`.
+`__typename`, and a meta-field below the root, are ordinary fields.
+Introspection stays bounded, since deep `__type { ofType { ofType ... } }`
+nesting is a known DoS vector. Both limits raise a `DepthLimitError`
+(`DEPTH_LIMIT`, 400) whose `extensions.limit` is `'maxDepth'` or
+`'maxIntrospectionDepth'`. When `maxIntrospectionDepth` is unset, introspection
+counts against `maxDepth` as before, and the error has no `limit` extension.
+`calculateQueryDepths(document)` returns both depths
+(`{ depth, introspectionDepth }`); `calculateQueryDepth` still returns the
+deepest of the two.
 
 ### `formatExecutionError`
 
