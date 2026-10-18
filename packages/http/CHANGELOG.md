@@ -1,5 +1,20 @@
 # @leaven-graphql/http
 
+## 0.3.0
+
+### Minor Changes
+
+- 998bbaf: Reject mutations sent with GET. The handler now answers a GET request whose selected operation is a mutation with `405 Method Not Allowed` and an `Allow: POST` header, before the context factory runs, whether or not `sse` is enabled. Send mutations with POST.
+- 998bbaf: Add GraphQL over Server-Sent Events (graphql-sse distinct connections mode): the new `@leaven-graphql/sse` package and an opt-in `sse` option on the HTTP handler and server.
+
+### Patch Changes
+
+- Updated dependencies [998bbaf]
+- Updated dependencies [998bbaf]
+  - @leaven-graphql/core@0.4.0
+  - @leaven-graphql/sse@0.4.0
+  - @leaven-graphql/ws@0.3.1
+
 ## 0.2.4
 
 ### Patch Changes
