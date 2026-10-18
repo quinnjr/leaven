@@ -6,7 +6,7 @@
  */
 
 export { createHandler, createBunHandler } from './handler';
-export type { HandlerConfig, GraphQLHandler, ContextFactory } from './handler';
+export type { HandlerConfig, GraphQLHandler, ContextFactory, SSEOptions } from './handler';
 
 export { LeavenServer, createServer } from './server';
 export type { ServerConfig, ServerInfo } from './server';

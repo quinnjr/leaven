@@ -185,6 +185,9 @@ importers:
       '@leaven-graphql/playground':
         specifier: workspace:*
         version: link:../playground
+      '@leaven-graphql/sse':
+        specifier: workspace:*
+        version: link:../sse
       '@leaven-graphql/ws':
         specifier: workspace:*
         version: link:../ws
@@ -195,6 +198,9 @@ importers:
       graphql:
         specifier: ^16.8.0
         version: 16.12.0
+      graphql-sse:
+        specifier: 2.6.3
+        version: 2.6.3(graphql@16.12.0)
       typescript:
         specifier: ^6.0.0
         version: 6.0.3
@@ -2792,6 +2798,7 @@ packages:
   eslint@9.39.2:
     resolution: {integrity: sha512-LEyamqS7W5HB3ujJyvi0HQK/dtVINZvd5mAAp9eT5S/ujByGjiZLCzPcHVzuXbpJDJF/cxwHlfceVUDZ2lnSTw==}
     engines: {node: ^18.18.0 || ^20.9.0 || >=21.1.0}
+    deprecated: This version is no longer supported. Please see https://eslint.org/version-support for other options.
     hasBin: true
     peerDependencies:
       jiti: '*'
@@ -2990,6 +2997,12 @@ packages:
 
   graceful-fs@4.2.11:
     resolution: {integrity: sha512-RbJ5/jmFcNNCcDV5o9eTnBLJ/HszWV0P73bc+Ff4nS/rJj+YaS6IGyiOL0VoBYX+l1Wrl3k63h/KrH+nhJ0XvQ==}
+
+  graphql-sse@2.6.3:
+    resolution: {integrity: sha512-UCSx3a+IklDOqJt8gpxGwDhnmWiZLJ5wNPMJ7TLGOQ68PhiKIDxLJBB2i+nKEGyWYLtiSLpTJ5fFEG5kkAxppA==}
+    engines: {node: '>=12'}
+    peerDependencies:
+      graphql: '>=0.11 <=17'
 
   graphql-tag@2.12.6:
     resolution: {integrity: sha512-FdSNcu2QQcWnM2VNvSCCDCVS5PpPqpzgFT8+GXzqJuoDd0CBncxCY278u4mhRO7tMgo2JjgJA5aZ+nWSQ/Z+xg==}
@@ -7012,6 +7025,10 @@ snapshots:
     optional: true
 
   graceful-fs@4.2.11: {}
+
+  graphql-sse@2.6.3(graphql@16.12.0):
+    dependencies:
+      graphql: 16.12.0
 
   graphql-tag@2.12.6(graphql@16.12.0):
     dependencies:

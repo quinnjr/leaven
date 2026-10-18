@@ -7,6 +7,7 @@
 
 import type { Server } from 'bun';
 import type { WebSocketHandler, WebSocketContext } from '@leaven-graphql/ws';
+import { acceptsEventStream } from '@leaven-graphql/sse';
 import { createHandler, type HandlerConfig, type GraphQLHandler } from './handler';
 
 /**
@@ -26,7 +27,10 @@ export interface ServerConfig<TContext = unknown> extends HandlerConfig<TContext
   /**
    * WebSocket handler for GraphQL subscriptions. When set, requests to the
    * GraphQL path carrying an `Upgrade: websocket` header are upgraded and
-   * handled via the graphql-transport-ws protocol.
+   * handled via the graphql-transport-ws protocol. For subscriptions over
+   * plain HTTP, set `sse` instead (or as well): requests that Accept
+   * `text/event-stream` are streamed as server-sent events, with Bun's idle
+   * timeout disabled for that request.
    */
   websocket?: WebSocketHandler;
   /** Called when server starts */
@@ -103,6 +107,12 @@ export class LeavenServer {
             return undefined;
           }
           return new Response('WebSocket upgrade failed', { status: 400 });
+        }
+
+        // An event stream may stay quiet longer than Bun's idle timeout
+        // between events; keep-alives cover proxies, this covers Bun itself.
+        if (this.config.sse && this.server && acceptsEventStream(request)) {
+          this.server.timeout(request, 0);
         }
 
         return await this.handler(request);
