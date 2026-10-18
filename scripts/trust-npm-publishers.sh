@@ -63,6 +63,9 @@ trust_status() {
     });'
 }
 
+errlog="$workdir/trust-error.log"
+failed=()
+
 for pkg in $packages; do
   echo "==> $pkg"
   if ! npm11 view "$pkg" name >/dev/null 2>&1; then
@@ -78,7 +81,27 @@ for pkg in $packages; do
   if [ "$status" -eq 2 ]; then
     echo "    could not check existing trust (npm wanted a one-time password); trying anyway"
   fi
-  npm11 trust github "$pkg" --file "$WORKFLOW" --repo "$REPO" --allow-publish --yes "$@"
+  # stderr is copied to a log (and still shown) so a 409 can be recognised; the
+  # browser-auth prompt needs the terminal, so stdout and stdin stay attached.
+  : >"$errlog"
+  rc=0
+  npm11 trust github "$pkg" --file "$WORKFLOW" --repo "$REPO" --allow-publish --yes "$@" \
+    2> >(tee "$errlog" >&2) || rc=$?
+  wait $! 2>/dev/null || true # let tee finish writing the log
+  if [ "$rc" -eq 0 ]; then
+    :
+  elif grep -q 'E409' "$errlog"; then
+    # The registry answers 409 when a matching trusted publisher already exists.
+    echo "    skipped: a trusted publisher already exists (npm 409)"
+  else
+    echo "    FAILED: see the npm error above" >&2
+    failed+=("$pkg")
+  fi
   # The registry rate-limits trust changes; npm recommends spacing calls.
   sleep 2
 done
+
+if [ "${#failed[@]}" -gt 0 ]; then
+  echo "Failed: ${failed[*]}" >&2
+  exit 1
+fi
