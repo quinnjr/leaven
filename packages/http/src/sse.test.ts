@@ -6,16 +6,37 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { GraphQLInt, GraphQLObjectType, GraphQLSchema, GraphQLString } from 'graphql';
-import { createClient, type Client } from 'graphql-sse';
+import {
+  GraphQLInt,
+  GraphQLNonNull,
+  GraphQLObjectType,
+  GraphQLSchema,
+  GraphQLString,
+} from 'graphql';
+import { createClient, NetworkError, type Client, type ClientOptions } from 'graphql-sse';
+import { AuthenticationError } from '@leaven-graphql/errors';
 import { createServer, type LeavenServer } from './server';
 
 let finished = false;
+let chargeCalls = 0;
+let guardedCalls = 0;
 
 const schema = new GraphQLSchema({
   query: new GraphQLObjectType({
     name: 'Query',
     fields: { hello: { type: GraphQLString, resolve: () => 'world' } },
+  }),
+  mutation: new GraphQLObjectType({
+    name: 'Mutation',
+    fields: {
+      charge: {
+        type: new GraphQLNonNull(GraphQLString),
+        resolve: () => {
+          chargeCalls++;
+          throw new Error('card declined');
+        },
+      },
+    },
   }),
   subscription: new GraphQLObjectType({
     name: 'Subscription',
@@ -41,6 +62,13 @@ const schema = new GraphQLSchema({
           }
         },
       },
+      guarded: {
+        type: GraphQLInt,
+        subscribe: () => {
+          guardedCalls++;
+          throw new AuthenticationError('Sign in to subscribe');
+        },
+      },
     },
   }),
 });
@@ -49,14 +77,15 @@ const schema = new GraphQLSchema({
  * Start an SSE-enabled server on an ephemeral port and run a test with a client
  */
 async function withClient(
-  fn: (client: Client, server: LeavenServer, port: number) => Promise<void>
+  fn: (client: Client, server: LeavenServer, port: number) => Promise<void>,
+  options: Partial<ClientOptions> = { retryAttempts: 0 }
 ): Promise<void> {
   const server = createServer({ schema, sse: true, port: 0 });
   const { port } = server.start();
   const client = createClient({
     url: `http://localhost:${port}/graphql`,
     singleConnection: false,
-    retryAttempts: 0,
+    ...options,
   });
 
   try {
@@ -88,15 +117,52 @@ describe('GraphQL over SSE', () => {
     });
   });
 
-  test('should surface a validation error to the client as a rejection', async () => {
+  test('should surface a validation error to the client as a 400 rejection', async () => {
     await withClient(async (client) => {
-      const run = async (): Promise<void> => {
+      let caught: unknown;
+      try {
         for await (const _result of client.iterate({ query: '{ nope }' })) {
           // unreachable
         }
-      };
-      await expect(run()).rejects.toBeDefined();
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(NetworkError);
+      expect((caught as NetworkError<Response>).response?.status).toBe(400);
     });
+  });
+
+  /** Default retryAttempts (5), with the backoff delay removed */
+  const retrying: Partial<ClientOptions> = { retry: async () => {} };
+
+  test('should run a failing mutation exactly once and deliver its error', async () => {
+    chargeCalls = 0;
+    await withClient(async (client) => {
+      const results: Array<{ data?: unknown; errors?: ReadonlyArray<{ message: string }> }> = [];
+      for await (const result of client.iterate({ query: 'mutation { charge }' })) {
+        results.push(result);
+      }
+      expect(chargeCalls).toBe(1);
+      expect(results).toHaveLength(1);
+      expect(results[0]!.data).toBeNull();
+      expect(results[0]!.errors?.[0]?.message).toBe('card declined');
+    }, retrying);
+  });
+
+  test('should deliver a subscribe-time AuthenticationError as an event, not a NetworkError', async () => {
+    guardedCalls = 0;
+    await withClient(async (client) => {
+      const results: Array<{
+        errors?: ReadonlyArray<{ message: string; extensions?: Record<string, unknown> }>;
+      }> = [];
+      for await (const result of client.iterate({ query: 'subscription { guarded }' })) {
+        results.push(result);
+      }
+      expect(guardedCalls).toBe(1);
+      expect(results).toHaveLength(1);
+      expect(results[0]!.errors?.[0]?.message).toBe('Sign in to subscribe');
+      expect(results[0]!.errors?.[0]?.extensions?.code).toBe('UNAUTHENTICATED');
+    }, retrying);
   });
 
   test('should end the server iterator when the client disposes', async () => {

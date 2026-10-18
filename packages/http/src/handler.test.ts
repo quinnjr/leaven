@@ -6,7 +6,13 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { GraphQLInt, GraphQLObjectType, GraphQLSchema, GraphQLString } from 'graphql';
+import {
+  GraphQLInt,
+  GraphQLNonNull,
+  GraphQLObjectType,
+  GraphQLSchema,
+  GraphQLString,
+} from 'graphql';
 import { AuthenticationError, NotFoundError } from '@leaven-graphql/errors';
 import { createHandler, createBunHandler } from './handler';
 
@@ -779,7 +785,15 @@ describe('SSE', () => {
     }),
     mutation: new GraphQLObjectType({
       name: 'Mutation',
-      fields: { noop: { type: GraphQLString, resolve: () => 'done' } },
+      fields: {
+        noop: { type: GraphQLString, resolve: () => 'done' },
+        fail: {
+          type: new GraphQLNonNull(GraphQLString),
+          resolve: () => {
+            throw new Error('declined');
+          },
+        },
+      },
     }),
     subscription: new GraphQLObjectType({
       name: 'Subscription',
@@ -801,6 +815,12 @@ describe('SSE', () => {
         pending: {
           type: GraphQLInt,
           subscribe: () => pendingIterator(),
+        },
+        guarded: {
+          type: GraphQLInt,
+          subscribe: () => {
+            throw new AuthenticationError('Sign in first');
+          },
         },
       },
     }),
@@ -885,6 +905,41 @@ describe('SSE', () => {
     expect(text).toContain('event: next');
     expect(text).not.toContain('secret');
     expect(text.endsWith(COMPLETE)).toBe(true);
+  });
+
+  test('should stream an execution failure with data null as 200 next then complete', async () => {
+    const handler = createHandler({ schema: sseSchema, sse: true });
+    const res = await handler(post({ query: 'mutation { fail }' }, { accept: 'text/event-stream' }));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
+    const text = await res.text();
+    expect(text).toContain('"data":null');
+    expect(text).toContain('declined');
+    expect(text.endsWith(COMPLETE)).toBe(true);
+  });
+
+  test('should stream a subscribe-time error that carries a path', async () => {
+    const handler = createHandler({ schema: sseSchema, sse: true });
+    const res = await handler(
+      post({ query: 'subscription { guarded }' }, { accept: 'text/event-stream' })
+    );
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('"path":["guarded"]');
+    expect(text).toContain('UNAUTHENTICATED');
+    expect(text.endsWith(COMPLETE)).toBe(true);
+  });
+
+  test('should answer a variable coercion error as JSON 400', async () => {
+    const handler = createHandler({ schema: sseSchema, sse: true });
+    const res = await handler(
+      post(
+        { query: 'query ($n: Int!) { hello }', variables: { n: 'x' } },
+        { accept: 'text/event-stream' }
+      )
+    );
+    expect(res.status).toBe(400);
+    expect(res.headers.get('content-type')).toContain('application/json');
   });
 
   test('should return a JSON error response for a validation failure', async () => {

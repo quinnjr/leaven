@@ -222,13 +222,26 @@ function formatResponseErrors<TData>(
 }
 
 /**
- * True when a single response failed outright (errors and no data), which is
- * answered as a JSON error response rather than as an event stream.
+ * True when a response is a *request error*: the operation was rejected
+ * before anything ran, so it is answered as a non-200 JSON response rather
+ * than as an event stream.
+ *
+ * A request error has no `data` (an `undefined` value counts as absent; it is
+ * dropped on serialisation) and none of its errors carries a `path`. That
+ * covers parse, validation, complexity, depth and operation-selection
+ * rejections. Everything else — `data: null`, or any error with a `path`,
+ * whether from a resolver or from a subscribe resolver that threw at
+ * subscription start — happened during execution and must be streamed: the
+ * graphql-sse client retries every non-OK response, which would run a
+ * failing mutation's resolver again on each retry.
+ *
+ * @param response - A single executor response
+ * @returns True when the response must be answered as JSON
  */
-function isTotalFailure(response: GraphQLResponse<unknown>): boolean {
+function isRequestError(response: GraphQLResponse<unknown>): boolean {
   return (
-    (response.errors?.length ?? 0) > 0 &&
-    (response.data === undefined || response.data === null)
+    response.data === undefined &&
+    !(response.errors ?? []).some((error) => error.path !== undefined)
   );
 }
 
@@ -237,19 +250,23 @@ function isTotalFailure(response: GraphQLResponse<unknown>): boolean {
  *
  * Subscriptions go through `subscribe`, everything else through `execute`.
  * Returns the source to stream, or the single response to answer as JSON
- * when the operation failed before producing any data.
+ * when it is a request error (see {@link isRequestError}). The rule applies
+ * to an `execute()` response and to a `subscribe()` result that is not an
+ * iterator alike.
  */
 async function executeForStream<TContext>(
   executor: LeavenExecutor,
   request: GraphQLRequest,
   context: TContext
 ): Promise<{ stream: EventStreamSource } | { json: GraphQLResponse }> {
-  if ((await operationTypeOf(executor, request)) === OperationTypeNode.SUBSCRIPTION) {
-    const result = await executor.subscribe(request, context);
-    return isSubscriptionIterator(result) ? { stream: result } : { json: result };
+  const result =
+    (await operationTypeOf(executor, request)) === OperationTypeNode.SUBSCRIPTION
+      ? await executor.subscribe(request, context)
+      : (await executor.execute(request, context)).response;
+  if (isSubscriptionIterator(result) || !isRequestError(result)) {
+    return { stream: result };
   }
-  const { response } = await executor.execute(request, context);
-  return isTotalFailure(response) ? { json: response } : { stream: response };
+  return { json: result };
 }
 
 /**
@@ -437,7 +454,7 @@ export function createHandler<TContext = unknown>(
         // which the rebuilt body request's signal never does.
         return createEventStreamResponse(outcome.stream, {
           signal: request.signal,
-          keepAliveInterval: sseOptions?.keepAliveInterval,
+          keepAliveInterval: sseOptions.keepAliveInterval,
           formatResult: (r) => formatResponseErrors(r, config.errorFormatting),
           formatError: (e) => formatError(e, config.errorFormatting ?? { maskErrors: true }),
           headers: responseOptions.headers,
