@@ -1,7 +1,7 @@
 {
   "name": "@leaven-graphql/leaven",
   "version": "0.2.4",
-  "description": "Meta-package for Leaven, a high-performance GraphQL library for the Bun runtime. Re-exports the runtime modules (core, http, ws, context, errors, plugins, playground) and selected schema helpers; the NestJS integration ships separately as @leaven-graphql/nestjs.",
+  "description": "Meta-package for Leaven, a high-performance GraphQL library for the Bun runtime. Re-exports the runtime modules (core, http, ws, sse, context, errors, plugins, playground) and selected schema helpers; the NestJS integration ships separately as @leaven-graphql/nestjs.",
   "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
@@ -56,6 +56,7 @@
     "@leaven-graphql/playground": "workspace:*",
     "@leaven-graphql/plugins": "workspace:*",
     "@leaven-graphql/schema": "workspace:*",
+    "@leaven-graphql/sse": "workspace:*",
     "@leaven-graphql/ws": "workspace:*"
   },
   "devDependencies": {

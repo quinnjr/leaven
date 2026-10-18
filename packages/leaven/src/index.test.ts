@@ -27,6 +27,11 @@ import {
   PubSub,
   createPubSub,
   createWebSocketHandler,
+  // SSE
+  createEventStream,
+  createEventStreamResponse,
+  acceptsEventStream,
+  SSE_CONTENT_TYPE,
   // Context
   createContextBuilder,
   createRequestContext,
@@ -69,6 +74,13 @@ describe('meta-package export surface', () => {
     expect(PubSub).toBeInstanceOf(Function);
     expect(createPubSub).toBeInstanceOf(Function);
     expect(createWebSocketHandler).toBeInstanceOf(Function);
+  });
+
+  test('re-exports server-sent events symbols', () => {
+    expect(createEventStream).toBeInstanceOf(Function);
+    expect(createEventStreamResponse).toBeInstanceOf(Function);
+    expect(acceptsEventStream).toBeInstanceOf(Function);
+    expect(SSE_CONTENT_TYPE).toBe('text/event-stream; charset=utf-8');
   });
 
   test('re-exports context symbols', () => {

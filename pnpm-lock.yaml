@@ -228,6 +228,9 @@ importers:
       '@leaven-graphql/schema':
         specifier: workspace:*
         version: link:../schema
+      '@leaven-graphql/sse':
+        specifier: workspace:*
+        version: link:../sse
       '@leaven-graphql/ws':
         specifier: workspace:*
         version: link:../ws

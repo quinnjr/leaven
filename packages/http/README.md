@@ -85,12 +85,30 @@ const server = createServer({
   // Subscriptions: upgrades `Upgrade: websocket` requests on `path`
   websocket: new WebSocketHandler({ schema }),
 
+  // GraphQL over SSE (graphql-sse, distinct connections). Off by default;
+  // answers requests that Accept text/event-stream. `true` or
+  // `{ keepAliveInterval: 8000 }` (ms, 0 disables)
+  sse: true,
+
   // Lifecycle hooks
   onStart: (server) => console.log('Server started'),
   onStop: () => console.log('Server stopped'),
   onError: (error, request) => new Response('Error', { status: 500 }),
 });
 ```
+
+### Server-Sent Events
+
+Set `sse` to serve GraphQL over SSE (graphql-sse, distinct connections mode) to
+requests that `Accept` `text/event-stream`. It is off by default; with `sse`
+unset behaviour is unchanged. Subscriptions stream results, queries and
+mutations answer with one `next` event then `complete`, and operations that fail
+before producing data get a plain JSON response. `LeavenServer` disables Bun's
+idle timeout for SSE requests. See [`@leaven-graphql/sse`](../sse) for the
+client and the low-level API.
+
+A mutation sent with `GET` is rejected with `405` and `Allow: POST` on every
+path, whether or not `sse` is enabled.
 
 ### CORS Configuration
 
@@ -210,6 +228,11 @@ interface HandlerConfig<TContext = unknown> {
   introspection?: boolean;
   maxBodySize?: number;
   bodyReadTimeoutMs?: number;
+  sse?: boolean | SSEOptions;
+}
+
+interface SSEOptions {
+  keepAliveInterval?: number; // default 8000, 0 disables
 }
 ```
 

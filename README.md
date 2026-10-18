@@ -66,6 +66,7 @@ console.log('🥖 Server ready at http://localhost:4000/graphql');
 | [`@leaven-graphql/core`](./packages/core) | Core execution engine with caching and metrics |
 | [`@leaven-graphql/http`](./packages/http) | High-performance HTTP server for Bun |
 | [`@leaven-graphql/ws`](./packages/ws) | WebSocket subscriptions with graphql-ws protocol |
+| [`@leaven-graphql/sse`](./packages/sse) | GraphQL over Server-Sent Events (graphql-sse) |
 | [`@leaven-graphql/context`](./packages/context) | Request context with AsyncLocalStorage |
 | [`@leaven-graphql/errors`](./packages/errors) | Error handling and formatting |
 | [`@leaven-graphql/schema`](./packages/schema) | Schema building and merging utilities |
@@ -154,6 +155,19 @@ const resolvers = {
   },
 };
 ```
+
+Prefer plain HTTP? Subscriptions also work over Server-Sent Events
+([graphql-sse](https://github.com/enisdenjo/graphql-sse), distinct connections
+mode). It is opt-in:
+
+```typescript
+import { createServer } from '@leaven-graphql/http';
+
+createServer({ schema, sse: true }).start();
+```
+
+Clients use `createClient({ url: '/graphql' })` from `graphql-sse`. See
+[`@leaven-graphql/sse`](./packages/sse) for details.
 
 ## 🧩 Plugin System
 
@@ -293,6 +307,7 @@ Visit our documentation site for comprehensive guides:
 - [Schema Building](https://leaven.dev/schema)
 - [HTTP Server](https://leaven.dev/http)
 - [WebSocket Subscriptions](https://leaven.dev/websockets)
+- [Server-Sent Events](https://leaven.dev/websockets#server-sent-events)
 - [Plugin System](https://leaven.dev/plugins)
 - [Error Handling](https://leaven.dev/errors)
 - [NestJS Integration](https://leaven.dev/nestjs)
@@ -321,6 +336,7 @@ pnpm build
 - [x] Core execution engine
 - [x] HTTP server integration
 - [x] WebSocket subscriptions
+- [x] Server-Sent Events subscriptions (graphql-sse)
 - [x] Plugin system
 - [x] NestJS integration
 - [ ] Persisted queries

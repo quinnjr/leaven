@@ -69,6 +69,7 @@ import { SeoService } from '../services/seo.service';
             <li><code class="text-amber-400">@leaven-graphql/core</code> - Execution engine, parsing, validation, caching</li>
             <li><code class="text-amber-400">@leaven-graphql/http</code> - Bun HTTP server integration</li>
             <li><code class="text-amber-400">@leaven-graphql/ws</code> - WebSocket support for subscriptions</li>
+            <li><code class="text-amber-400">@leaven-graphql/sse</code> - GraphQL over Server-Sent Events (graphql-sse)</li>
             <li><code class="text-amber-400">@leaven-graphql/context</code> - Request context with AsyncLocalStorage</li>
             <li><code class="text-amber-400">@leaven-graphql/errors</code> - Error classes and formatting</li>
             <li><code class="text-amber-400">@leaven-graphql/schema</code> - Schema building utilities</li>
@@ -145,7 +146,10 @@ bun add @leaven-graphql/core graphql
 bun add @leaven-graphql/core @leaven-graphql/http graphql
 
 # With WebSocket subscriptions
-bun add @leaven-graphql/core @leaven-graphql/http @leaven-graphql/ws graphql`;
+bun add @leaven-graphql/core @leaven-graphql/http @leaven-graphql/ws graphql
+
+# With Server-Sent Events subscriptions
+bun add @leaven-graphql/core @leaven-graphql/http @leaven-graphql/sse graphql`;
 
   // doc-check: skip - JSON, not TypeScript
   tsconfigCode = `{
