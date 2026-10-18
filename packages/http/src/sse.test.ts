@@ -191,36 +191,100 @@ describe('GraphQL over SSE', () => {
     });
   });
 
-  test('should disable the idle timeout for SSE requests', async () => {
+  /** Record every server.timeout call made while the test runs */
+  function recordTimeouts(server: LeavenServer): Array<[Request, number]> {
+    const bun = server.getServer()!;
+    const original = bun.timeout.bind(bun);
+    const calls: Array<[Request, number]> = [];
+    bun.timeout = (request: Request, seconds: number): void => {
+      calls.push([request, seconds]);
+      original(request, seconds);
+    };
+    return calls;
+  }
+
+  async function waitFor(predicate: () => boolean): Promise<void> {
+    const deadline = Date.now() + 1000;
+    while (!predicate() && Date.now() < deadline) {
+      await Bun.sleep(5);
+    }
+  }
+
+  const sseHeaders = { 'Content-Type': 'application/json', Accept: 'text/event-stream' };
+
+  test('should not touch the idle timeout for a JSON request', async () => {
     await withClient(async (_client, server, port) => {
-      const bun = server.getServer()!;
-      const original = bun.timeout.bind(bun);
-      const calls: Array<[Request, number]> = [];
-      bun.timeout = (request: Request, seconds: number): void => {
-        calls.push([request, seconds]);
-        original(request, seconds);
-      };
-
-      const url = `http://localhost:${port}/graphql`;
-      const body = JSON.stringify({ query: '{ hello }' });
-
-      const json = await fetch(url, {
+      const calls = recordTimeouts(server);
+      const res = await fetch(`http://localhost:${port}/graphql`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body,
+        body: JSON.stringify({ query: '{ hello }' }),
       });
-      await json.text();
+      await res.text();
       expect(calls).toHaveLength(0);
+    });
+  });
 
-      const sse = await fetch(url, {
+  test('should disable the idle timeout for a stream and restore it when it completes', async () => {
+    await withClient(async (_client, server, port) => {
+      const calls = recordTimeouts(server);
+      const res = await fetch(`http://localhost:${port}/graphql`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-        body,
+        headers: sseHeaders,
+        body: JSON.stringify({ query: 'subscription { count }' }),
       });
-      await sse.text();
-      expect(calls).toHaveLength(1);
+      expect(res.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
+      expect(await res.text()).toContain('event: complete');
+      await waitFor(() => calls.length >= 2);
+      expect(calls.map(([, seconds]) => seconds)).toEqual([0, 10]);
       expect(calls[0]![0]).toBeInstanceOf(Request);
-      expect(calls[0]![1]).toBe(0);
+      expect(calls[1]![0]).toBe(calls[0]![0]);
+    });
+  });
+
+  test('should restore the idle timeout when the client abandons the stream', async () => {
+    await withClient(async (_client, server, port) => {
+      const calls = recordTimeouts(server);
+      const controller = new AbortController();
+      const res = await fetch(`http://localhost:${port}/graphql`, {
+        method: 'POST',
+        headers: sseHeaders,
+        body: JSON.stringify({ query: 'subscription { ticks }' }),
+        signal: controller.signal,
+      });
+      const reader = res.body!.getReader();
+      await reader.read();
+      controller.abort();
+      await reader.cancel().catch(() => {});
+      await waitFor(() => calls.length >= 2);
+      expect(calls.map(([, seconds]) => seconds)).toEqual([0, 10]);
+    });
+  });
+
+  test('should keep the idle timeout for a pre-stream JSON failure', async () => {
+    await withClient(async (_client, server, port) => {
+      const calls = recordTimeouts(server);
+      const res = await fetch(`http://localhost:${port}/graphql`, {
+        method: 'POST',
+        headers: sseHeaders,
+        body: JSON.stringify({ query: '{ nope }' }),
+      });
+      expect(res.status).toBe(400);
+      await res.text();
+      expect(calls).toHaveLength(0);
+    });
+  });
+
+  test('should never disable the idle timeout for a method other than GET or POST', async () => {
+    await withClient(async (_client, server, port) => {
+      const calls = recordTimeouts(server);
+      const res = await fetch(`http://localhost:${port}/graphql`, {
+        method: 'PUT',
+        headers: sseHeaders,
+        body: JSON.stringify({ query: '{ hello }' }),
+      });
+      await res.text();
+      expect(calls).toHaveLength(0);
     });
   });
 });

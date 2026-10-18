@@ -7,8 +7,10 @@
 
 import type { Server } from 'bun';
 import type { WebSocketHandler, WebSocketContext } from '@leaven-graphql/ws';
-import { acceptsEventStream } from '@leaven-graphql/sse';
 import { createHandler, type HandlerConfig, type GraphQLHandler } from './handler';
+
+/** Bun's default `idleTimeout`, in seconds; LeavenServer does not override it */
+const DEFAULT_IDLE_TIMEOUT_SECONDS = 10;
 
 /**
  * Server configuration
@@ -30,7 +32,7 @@ export interface ServerConfig<TContext = unknown> extends HandlerConfig<TContext
    * handled via the graphql-transport-ws protocol. For subscriptions over
    * plain HTTP, set `sse` instead (or as well): requests that Accept
    * `text/event-stream` are streamed as server-sent events, with Bun's idle
-   * timeout disabled for that request.
+   * timeout disabled while the stream is open and restored when it closes.
    */
   websocket?: WebSocketHandler;
   /** Called when server starts */
@@ -109,13 +111,7 @@ export class LeavenServer {
           return new Response('WebSocket upgrade failed', { status: 400 });
         }
 
-        // An event stream may stay quiet longer than Bun's idle timeout
-        // between events; keep-alives cover proxies, this covers Bun itself.
-        if (this.config.sse && this.server && acceptsEventStream(request)) {
-          this.server.timeout(request, 0);
-        }
-
-        return await this.handler(request);
+        return this.holdOpenForStream(request, await this.handler(request));
       }
 
       // Fallback handler
@@ -133,6 +129,76 @@ export class LeavenServer {
       console.error('Request error:', error);
       return new Response('Internal Server Error', { status: 500 });
     }
+  }
+
+  /**
+   * Keep Bun's idle timeout from closing an open event stream.
+   *
+   * An event stream may stay quiet longer than Bun's idle timeout between
+   * events; keep-alives cover proxies, this covers Bun itself. The timeout is
+   * only disabled once the handler has actually answered a GET or POST with
+   * an event stream — never for a JSON error — and it is restored when the
+   * stream ends or the client cancels it, so the keep-alive socket that
+   * carried the stream is not left without a timeout afterwards.
+   *
+   * @param request - The request Bun handed to `fetch`
+   * @param response - The handler's response
+   * @returns The response, with its body wrapped when it is an event stream
+   */
+  private holdOpenForStream(request: Request, response: Response): Response {
+    const server = this.server;
+    const method = request.method.toUpperCase();
+    if (
+      !this.config.sse ||
+      !server ||
+      (method !== 'GET' && method !== 'POST') ||
+      !response.body ||
+      !(response.headers.get('content-type') ?? '').toLowerCase().startsWith('text/event-stream')
+    ) {
+      return response;
+    }
+
+    server.timeout(request, 0);
+    let restored = false;
+    const restore = (): void => {
+      if (restored) {
+        return;
+      }
+      restored = true;
+      try {
+        server.timeout(request, DEFAULT_IDLE_TIMEOUT_SECONDS);
+      } catch {
+        // The socket is already gone; there is no timeout left to restore
+      }
+    };
+
+    const reader = response.body.getReader();
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller): Promise<void> {
+        try {
+          const { done, value } = await reader.read();
+          if (done) {
+            restore();
+            controller.close();
+            return;
+          }
+          controller.enqueue(value);
+        } catch (error) {
+          restore();
+          controller.error(error);
+        }
+      },
+      async cancel(reason): Promise<void> {
+        restore();
+        await reader.cancel(reason);
+      },
+    });
+
+    return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
   }
 
   /**
