@@ -187,7 +187,6 @@ describe('createEventStream', () => {
     expect(decoder.decode(first.value)).toBe(formatNextEvent({ data: { n: 1 } }));
     controller.abort();
     expect((await reader.read()).done).toBe(true);
-    await wait(5);
     expect(iterator.returnCalls).toBe(1);
     expect(closes).toBe(1);
   });
@@ -435,9 +434,14 @@ describe('createEventStream backpressure', () => {
   test('should skip keep-alive ticks while the queue is full', async () => {
     const iterator = pendingIterator([{ data: { n: 1 } }]);
     const stream = createEventStream(iterator, { keepAliveInterval: 5 });
+    // Eight ticks elapse while the single queued `next` fills the queue
     await wait(40);
     const reader = stream.getReader();
     expect(decoder.decode((await reader.read()).value)).toBe(formatNextEvent({ data: { n: 1 } }));
+    // A read on a non-empty queue resolves at once, so it wins this race only
+    // if a keep-alive was enqueued behind the `next` while the queue was full
+    const second = await Promise.race([reader.read(), Promise.resolve('empty' as const)]);
+    expect(second).toBe('empty');
     await reader.cancel();
     expect(iterator.returnCalls).toBe(1);
   });

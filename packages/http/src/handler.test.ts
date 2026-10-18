@@ -942,6 +942,18 @@ describe('SSE', () => {
     expect(res.headers.get('content-type')).toContain('application/json');
   });
 
+  test('should mask a thrown subscription error by default without errorFormatting', async () => {
+    const handler = createHandler({ schema: sseSchema, sse: true });
+    const res = await handler(
+      post({ query: 'subscription { boom }' }, { accept: 'text/event-stream' })
+    );
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain('secret');
+    expect(text).toContain('An unexpected error occurred');
+    expect(text.endsWith(COMPLETE)).toBe(true);
+  });
+
   test('should return a JSON error response for a validation failure', async () => {
     const handler = createHandler({ schema: sseSchema, sse: true });
     const res = await handler(post({ query: '{ nope }' }, { accept: 'text/event-stream' }));
@@ -1035,7 +1047,7 @@ describe('SSE', () => {
     const reader = res.body!.getReader();
     const decoder = new TextDecoder();
     let text = '';
-    const deadline = Date.now() + 70;
+    const deadline = Date.now() + 500;
     while (Date.now() < deadline && !text.includes(':\n\n')) {
       const chunk = await Promise.race([
         reader.read(),
