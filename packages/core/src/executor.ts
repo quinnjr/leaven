@@ -149,8 +149,10 @@ const requestRejections = new WeakSet<object>();
 
 /**
  * Errors thrown by the executor's own analysis (parsing with its limits, and
- * query compilation with its visit budget), which no user code runs inside.
- * A response built from one of them in a catch block is a rejection.
+ * query compilation with its visit budget). The analysis can run user code,
+ * namely `compilerOptions.complexityCalculator`, but never a resolver, so a
+ * throw from the calculator is still a pre-execution rejection. A response
+ * built from one of these errors in a catch block is a rejection.
  */
 const rejectionThrows = new WeakSet<object>();
 
@@ -185,7 +187,10 @@ function rejectionThrow(error: unknown): never {
  *
  * The check is identity-based: pass the very `response` object that
  * `execute()` (inside its `ExecutionResult`) or `subscribe()` returned, not a
- * copy or a formatted clone. The mark changes nothing on the wire: the
+ * copy or a formatted clone. The mark is also module-scoped, so the caller
+ * must use the same installed copy of `@leaven-graphql/core` as the executor
+ * that produced the response. With duplicate copies this returns false, which
+ * is safe: the response streams instead of being answered non-200. The mark changes nothing on the wire: the
  * response serialises exactly as before.
  *
  * @param response - A response returned by the executor

@@ -119,6 +119,8 @@ accepts either a subscription iterator or a single response. Mask errors with
 them to `formatErrors` would mask intentional errors such as `UNAUTHENTICATED`
 and drop their `path`.
 
+Only send subscription operations to `executor.subscribe()`: graphql-js runs the root resolver of a query or mutation if you pass one, which is why the sample routes by operation type first.
+
 ```typescript
 import { getOperationAST } from 'graphql';
 import { LeavenExecutor, type GraphQLRequest, type GraphQLResponse } from '@leaven-graphql/core';

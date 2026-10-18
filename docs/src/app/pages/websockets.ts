@@ -154,7 +154,9 @@ import { SeoService } from '../services/seo.service';
           Frameworks that own routing, such as Knead, can use the low-level API: build the context, run the operation with
           <code class="text-green-400">executor.subscribe</code> or <code class="text-green-400">executor.execute</code>,
           answer request errors as plain JSON, stream the rest, and mask errors with
-          <code class="text-green-400">formatResultErrors</code>:
+          <code class="text-green-400">formatResultErrors</code>. Only send subscription operations to
+          <code class="text-green-400">executor.subscribe()</code>: graphql-js runs the root resolver of a query or
+          mutation if you pass one, which is why the sample routes by operation type first.
         </p>
         <app-code-block [code]="sseLowLevelCode" title="custom-transport.ts" />
       </section>
