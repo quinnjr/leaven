@@ -996,6 +996,19 @@ describe('SSE', () => {
     await res.text();
   });
 
+  test('should keep the SSE content type and cache headers over config.response.headers', async () => {
+    const handler = createHandler({
+      schema: sseSchema,
+      sse: true,
+      response: { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public', 'X-App': '1' } },
+    });
+    const res = await handler(post({ query: '{ hello }' }, { accept: 'text/event-stream' }));
+    expect(res.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
+    expect(res.headers.get('cache-control')).toBe('no-cache, no-transform');
+    expect(res.headers.get('x-app')).toBe('1');
+    await res.text();
+  });
+
   test('should answer JSON when sse is not enabled', async () => {
     const handler = createHandler({ schema: sseSchema });
     const res = await handler(post({ query: '{ hello }' }, { accept: 'text/event-stream' }));

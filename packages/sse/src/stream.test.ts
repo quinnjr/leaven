@@ -557,18 +557,35 @@ describe('createEventStreamResponse', () => {
     );
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
-    expect(res.headers.get('cache-control')).toBe('no-cache');
+    expect(res.headers.get('cache-control')).toBe('no-cache, no-transform');
     expect(res.headers.get('connection')).toBe('keep-alive');
     expect(res.headers.get('x-accel-buffering')).toBe('no');
+    expect(res.headers.get('content-encoding')).toBe('none');
     expect(res.headers.get('access-control-allow-origin')).toBe('*');
   });
 
-  test('should let a lowercase header override the default value', () => {
+  test('should not let extra headers override Content-Type or Cache-Control', () => {
     const res = createEventStreamResponse(
       { data: {} },
-      { headers: { 'content-type': 'text/event-stream' } }
+      {
+        headers: {
+          'content-type': 'application/json',
+          'Cache-Control': 'max-age=3600',
+          'X-Request-Id': 'abc',
+        },
+      }
     );
-    expect(res.headers.get('content-type')).toBe('text/event-stream');
+    expect(res.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
+    expect(res.headers.get('cache-control')).toBe('no-cache, no-transform');
+    expect(res.headers.get('x-request-id')).toBe('abc');
+  });
+
+  test('should merge non-conflicting extra headers case-insensitively', () => {
+    const res = createEventStreamResponse(
+      { data: {} },
+      { headers: { 'x-trace': 'one', 'X-Trace': 'two' } }
+    );
+    expect(res.headers.get('x-trace')).toBe('two');
   });
 
   test('should stream the events as the body', async () => {

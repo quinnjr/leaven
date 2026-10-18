@@ -44,7 +44,11 @@ export interface EventStreamOptions<TData = Record<string, unknown>> {
 /** Options for {@link createEventStreamResponse} */
 export interface EventStreamResponseOptions<TData = Record<string, unknown>>
   extends EventStreamOptions<TData> {
-  /** Extra response headers, merged over the SSE headers */
+  /**
+   * Extra response headers (CORS, for example). They are merged
+   * case-insensitively, but cannot override the SSE headers: Content-Type,
+   * Cache-Control and the other {@link SSE_HEADERS} always keep their values.
+   */
   headers?: Record<string, string>;
 }
 
@@ -107,6 +111,7 @@ export function createEventStream<TData = Record<string, unknown>>(
   let closed = false;
   let iteratorFinished = false;
 
+  // A null desiredSize (an errored stream) is unreachable: this stream never calls controller.error
   const hasDemand = (): boolean => (controller?.desiredSize ?? 0) > 0;
 
   /** Release a pump waiting for demand (called by pull and close) */
@@ -263,6 +268,10 @@ export function createEventStream<TData = Record<string, unknown>>(
 /**
  * Wrap an executor result in a `200` event-stream response
  *
+ * Extra headers are applied first and {@link SSE_HEADERS} last, so a
+ * caller-supplied header can add to the response but never replace the
+ * event-stream Content-Type or Cache-Control.
+ *
  * @param source - A single response or a subscription iterator
  * @param options - Stream options plus extra headers
  * @returns The streaming response
@@ -272,8 +281,8 @@ export function createEventStreamResponse<TData = Record<string, unknown>>(
   options: EventStreamResponseOptions<TData> = {}
 ): Response {
   const { headers, ...streamOptions } = options;
-  const responseHeaders = new Headers(SSE_HEADERS);
-  for (const [name, value] of Object.entries(headers ?? {})) {
+  const responseHeaders = new Headers();
+  for (const [name, value] of [...Object.entries(headers ?? {}), ...Object.entries(SSE_HEADERS)]) {
     responseHeaders.set(name, value);
   }
   return new Response(createEventStream(source, streamOptions), {
