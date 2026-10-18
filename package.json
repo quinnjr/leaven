@@ -19,7 +19,7 @@
     "commitlint": "commitlint --edit",
     "release": "changeset publish",
     "version-packages": "changeset version",
-    "build:dist": "pnpm clean && pnpm --filter '@leaven-graphql/context' --filter '@leaven-graphql/core' --filter '@leaven-graphql/errors' --filter '@leaven-graphql/schema' --filter '@leaven-graphql/playground' build && pnpm --filter '@leaven-graphql/http' --filter '@leaven-graphql/ws' --filter '@leaven-graphql/plugins' build && pnpm --filter '@leaven-graphql/nestjs' --filter '@leaven-graphql/leaven' build",
+    "build:dist": "pnpm clean && pnpm --filter '@leaven-graphql/context' --filter '@leaven-graphql/core' --filter '@leaven-graphql/errors' --filter '@leaven-graphql/schema' --filter '@leaven-graphql/sse' --filter '@leaven-graphql/playground' build && pnpm --filter '@leaven-graphql/http' --filter '@leaven-graphql/ws' --filter '@leaven-graphql/plugins' build && pnpm --filter '@leaven-graphql/nestjs' --filter '@leaven-graphql/leaven' build",
     "publish:dist": "pnpm build:dist && pnpm -r --filter='!docs' --filter='!leaven-monorepo' publish --access public --no-git-checks",
     "trust:npm": "bash scripts/trust-npm-publishers.sh"
   },
