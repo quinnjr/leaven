@@ -82,6 +82,7 @@ export {
   createEventStream,
   createEventStreamResponse,
   acceptsEventStream,
+  formatResultErrors,
 } from '@leaven-graphql/sse';
 
 export {

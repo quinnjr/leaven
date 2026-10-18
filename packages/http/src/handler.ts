@@ -13,16 +13,12 @@ import {
   type GraphQLResponse,
 } from '@leaven-graphql/core';
 import { createRequestContext, type RequestContextConfig } from '@leaven-graphql/context';
-import {
-  formatError,
-  fromFormattedError,
-  isLeavenError,
-  type ErrorMaskingOptions,
-} from '@leaven-graphql/errors';
+import { formatError, isLeavenError, type ErrorMaskingOptions } from '@leaven-graphql/errors';
 import { renderGraphiQL } from '@leaven-graphql/playground';
 import {
   acceptsEventStream,
   createEventStreamResponse,
+  formatResultErrors,
   isSubscriptionIterator,
   type EventStreamSource,
 } from '@leaven-graphql/sse';
@@ -204,21 +200,15 @@ async function operationTypeOf(
 /**
  * Apply the configured error formatting to a response.
  *
- * The executor hands back already-formatted errors, so each one is rebuilt
- * into a GraphQLError first — formatting a formatted error would stringify it
- * to "[object Object]". Without options the response is returned unchanged.
+ * Delegates to `formatResultErrors`, which rebuilds the executor's
+ * already-formatted errors before formatting them. Without options the
+ * response is returned unchanged, so nothing is masked by default.
  */
 function formatResponseErrors<TData>(
   response: GraphQLResponse<TData>,
   options?: ErrorMaskingOptions
 ): GraphQLResponse<TData> {
-  if (!response.errors || !options) {
-    return response;
-  }
-  return {
-    ...response,
-    errors: response.errors.map((e) => formatError(fromFormattedError(e), options)),
-  };
+  return options ? formatResultErrors(response, options) : response;
 }
 
 /**

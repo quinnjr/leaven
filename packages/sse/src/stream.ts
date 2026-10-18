@@ -27,7 +27,13 @@ export interface EventStreamOptions<TData = Record<string, unknown>> {
   signal?: AbortSignal;
   /** Keep-alive comment interval in ms (default DEFAULT_KEEP_ALIVE_INTERVAL; 0 disables) */
   keepAliveInterval?: number;
-  /** Transform each result before it is JSON-encoded (default identity) */
+  /**
+   * Transform each result before it is JSON-encoded (default identity).
+   *
+   * `result.errors` are already `GraphQLFormattedError`s, not `GraphQLError`s:
+   * to mask them, use {@link formatResultErrors}, which rebuilds each one
+   * first so intentional errors keep their code and `path`.
+   */
   formatResult?: (result: GraphQLResponse<TData>) => unknown | Promise<unknown>;
   /** Format an error thrown by the iterator or formatResult (default: masked formatError) */
   formatError?: (error: unknown) => GraphQLFormattedError;

@@ -22,3 +22,5 @@ export type {
   EventStreamResponseOptions,
 } from './stream';
 export { isSubscriptionIterator, createEventStream, createEventStreamResponse } from './stream';
+
+export { formatResultErrors } from './format';
