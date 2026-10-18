@@ -272,7 +272,12 @@ const resolvers = {
   },
 };`;
 
-  formatCode = `import { formatError, formatErrors, errorToGraphQL } from '@leaven-graphql/errors';
+  formatCode = `import {
+  formatError,
+  formatErrors,
+  errorToGraphQL,
+  fromFormattedError,
+} from '@leaven-graphql/errors';
 
 // Format a single error
 const formatted = formatError(error, {
@@ -294,7 +299,13 @@ const formatted = formatError(error, {
 const formattedErrors = formatErrors(errors, options);
 
 // Convert any error to a GraphQLError
-const graphqlError = errorToGraphQL(error);`;
+const graphqlError = errorToGraphQL(error);
+
+// Executor output is already formatted (GraphQLFormattedError): rebuild it
+// first, or formatError would stringify it to "[object Object]"
+const reformatted = result.response.errors?.map((e) =>
+  formatError(fromFormattedError(e), { maskErrors: true })
+);`;
 
   maskCode = `import { createServer } from '@leaven-graphql/http';
 import { maskError } from '@leaven-graphql/errors';

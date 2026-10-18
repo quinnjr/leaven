@@ -5,15 +5,15 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import {
-  GraphQLError,
-  type GraphQLSchema,
-  type GraphQLFormattedError,
-  type SourceLocation,
-} from 'graphql';
+import type { GraphQLSchema } from 'graphql';
 import { LeavenExecutor, type ExecutorConfig, type GraphQLRequest } from '@leaven-graphql/core';
 import { createRequestContext, type RequestContextConfig } from '@leaven-graphql/context';
-import { formatError, isLeavenError, type ErrorMaskingOptions } from '@leaven-graphql/errors';
+import {
+  formatError,
+  fromFormattedError,
+  isLeavenError,
+  type ErrorMaskingOptions,
+} from '@leaven-graphql/errors';
 import { renderGraphiQL } from '@leaven-graphql/playground';
 
 import { parseBody, parseQuery, validateRequest } from './request';
@@ -155,38 +155,6 @@ async function readBodyWithLimit(
     headers: request.headers,
     body: buffer,
   });
-}
-
-/**
- * Rebuild a `GraphQLError` from an error the executor already formatted.
- *
- * `LeavenExecutor.execute` returns plain `GraphQLFormattedError` objects (via
- * `GraphQLError.toJSON()`). Feeding one of those back to `formatError` is
- * destructive: `errorToGraphQL` has no branch for a formatted error, so it
- * falls through to `new GraphQLError(String(error))` — the message becomes
- * `"[object Object]"`, path and locations are dropped, and the real code is
- * overwritten with INTERNAL_ERROR, masking Leaven errors that must never be
- * masked and driving a spurious 500.
- *
- * Reconstructing first makes the round trip lossless, so masking decisions are
- * made against the error the executor actually produced.
- */
-function fromFormattedError(formatted: GraphQLFormattedError): GraphQLError {
-  const error = new GraphQLError(formatted.message, {
-    path: formatted.path ? [...formatted.path] : undefined,
-    extensions: formatted.extensions ? { ...formatted.extensions } : undefined,
-  });
-
-  // `locations` are normally derived from AST nodes or source positions, which
-  // a formatted error no longer carries, so restore them directly. The field is
-  // a plain writable property; `readonly` is a compile-time contract only.
-  if (formatted.locations && formatted.locations.length > 0) {
-    (error as { locations?: ReadonlyArray<SourceLocation> }).locations = [
-      ...formatted.locations,
-    ];
-  }
-
-  return error;
 }
 
 /**

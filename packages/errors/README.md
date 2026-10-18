@@ -237,6 +237,7 @@ import {
   formatErrors,
   maskError,
   errorToGraphQL,
+  fromFormattedError,
   isLeavenError,
   type ErrorFormatter,
   type ErrorMaskingOptions,
@@ -341,6 +342,27 @@ Normalises anything into a `GraphQLError` that carries an `ErrorCode`:
   `positions`, `path` and `originalError` so `locations` survive;
 - any other `Error` or value becomes a `GraphQLError` with
   `extensions.code = ErrorCode.INTERNAL_ERROR`.
+
+### `fromFormattedError(formatted: GraphQLFormattedError): GraphQLError`
+
+`LeavenExecutor` hands back errors that are already serialised
+(`GraphQLFormattedError`, the output of `GraphQLError.toJSON()`). Passing one
+straight to `formatError` is destructive: `errorToGraphQL` has no branch for a
+plain object, so the message becomes `"[object Object]"`, `path` and
+`locations` are lost, and the real code is replaced by `INTERNAL_ERROR`.
+`fromFormattedError` rebuilds a `GraphQLError` with the same `message`, `path`,
+`locations` and `extensions`, so masking decides on the error the executor
+actually produced:
+
+```typescript
+import { formatError, fromFormattedError } from '@leaven-graphql/errors';
+
+const errors = result.response.errors?.map((e) =>
+  formatError(fromFormattedError(e), { maskErrors: true })
+);
+```
+
+`@leaven-graphql/http` does this when `errorFormatting` is configured.
 
 ### `isLeavenError(error: unknown): error is LeavenError`
 

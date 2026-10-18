@@ -5,7 +5,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import { GraphQLError, type GraphQLFormattedError } from 'graphql';
+import { GraphQLError, type GraphQLFormattedError, type SourceLocation } from 'graphql';
 import { LeavenError } from './errors';
 import { ErrorCode, getErrorCode } from './codes';
 
@@ -84,6 +84,39 @@ export function errorToGraphQL(error: unknown): GraphQLError {
       code: ErrorCode.INTERNAL_ERROR,
     },
   });
+}
+
+/**
+ * Rebuild a `GraphQLError` from an error that was already formatted.
+ *
+ * `LeavenExecutor` returns plain `GraphQLFormattedError` objects (via
+ * `GraphQLError.toJSON()` or `formatExecutionError`). Feeding one of those to
+ * {@link formatError} directly is destructive: {@link errorToGraphQL} has no
+ * branch for a formatted error, so it falls through to
+ * `new GraphQLError(String(error))`. The message becomes `"[object Object]"`,
+ * path and locations are dropped, and the real code is overwritten with
+ * INTERNAL_ERROR, which masks Leaven errors that must never be masked.
+ *
+ * Reconstructing first makes the round trip lossless, so masking decisions are
+ * made against the error the executor actually produced. Every transport that
+ * applies `ErrorMaskingOptions` to executor output does this.
+ */
+export function fromFormattedError(formatted: GraphQLFormattedError): GraphQLError {
+  const error = new GraphQLError(formatted.message, {
+    path: formatted.path ? [...formatted.path] : undefined,
+    extensions: formatted.extensions ? { ...formatted.extensions } : undefined,
+  });
+
+  // `locations` are normally derived from AST nodes or source positions, which
+  // a formatted error no longer carries, so restore them directly. The field is
+  // a plain writable property; `readonly` is a compile-time contract only.
+  if (formatted.locations && formatted.locations.length > 0) {
+    (error as { locations?: ReadonlyArray<SourceLocation> }).locations = [
+      ...formatted.locations,
+    ];
+  }
+
+  return error;
 }
 
 /**
