@@ -1647,3 +1647,52 @@ describe('createExecutor', () => {
     expect(executor).toBeInstanceOf(LeavenExecutor);
   });
 });
+
+describe('a throwing onError hook', () => {
+  const throwingOnError = (): void => {
+    throw new Error('logger down');
+  };
+  const rejectingOnError = async (): Promise<void> => {
+    throw new Error('logger down');
+  };
+
+  test.each([
+    ['throws', throwingOnError],
+    ['rejects', rejectingOnError],
+  ])('should not escape execute when it %s', async (_label, onError) => {
+    const executor = new LeavenExecutor({
+      schema,
+      rootValue,
+      hooks: {
+        onExecute: () => {
+          throw new Error('original failure');
+        },
+        onError,
+      },
+    });
+    const { response } = await executor.execute({ query: '{ hello }' });
+    expect(response.errors).toEqual([
+      { message: 'original failure', extensions: { code: ErrorCode.INTERNAL_ERROR } },
+    ]);
+  });
+
+  test.each([
+    ['throws', throwingOnError],
+    ['rejects', rejectingOnError],
+  ])('should not escape subscribe when it %s', async (_label, onError) => {
+    const executor = new LeavenExecutor({
+      schema,
+      rootValue,
+      hooks: {
+        onExecute: () => {
+          throw new Error('original failure');
+        },
+        onError,
+      },
+    });
+    const result = await executor.subscribe({ query: 'subscription { countdown(from: 1) }' });
+    expect(result).toEqual({
+      errors: [{ message: 'original failure', extensions: { code: ErrorCode.INTERNAL_ERROR } }],
+    });
+  });
+});

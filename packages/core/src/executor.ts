@@ -740,9 +740,7 @@ export class LeavenExecutor {
         metrics: this.metricsEnabled ? buildMetrics(executionTime) : undefined,
       };
     } catch (error) {
-      if (this.hooks?.onError) {
-        await this.hooks.onError(error as Error);
-      }
+      await this.reportError(error);
 
       return {
         response: {
@@ -750,6 +748,24 @@ export class LeavenExecutor {
         },
         metrics: this.metricsEnabled ? buildMetrics() : undefined,
       };
+    }
+  }
+
+  /**
+   * Run the onError hook without letting it fail the request.
+   *
+   * It is called from the executor's catch blocks, which must still return
+   * the original error as a response: a throwing or rejecting hook is
+   * ignored, as a throwing onCacheError hook is.
+   */
+  private async reportError(error: unknown): Promise<void> {
+    if (!this.hooks?.onError) {
+      return;
+    }
+    try {
+      await this.hooks.onError(error as Error);
+    } catch {
+      // The error hook itself must never fail the request
     }
   }
 
@@ -889,9 +905,7 @@ export class LeavenExecutor {
         },
       } as SubscriptionIterator<TData>;
     } catch (error) {
-      if (this.hooks?.onError) {
-        await this.hooks.onError(error as Error);
-      }
+      await this.reportError(error);
 
       return { errors: [this.formatCaughtError(error)] };
     }
