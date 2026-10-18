@@ -7,7 +7,7 @@
 
 import { describe, test, expect } from 'bun:test';
 import { parse, buildSchema, GraphQLError } from 'graphql';
-import { ErrorCode } from '@leaven-graphql/errors';
+import { ErrorCode, LeavenError } from '@leaven-graphql/errors';
 import { CompiledQuery, compileQuery } from './compiler';
 import { MAX_ANALYSIS_VISITS } from './parser';
 
@@ -51,7 +51,28 @@ describe('CompiledQuery', () => {
 
     test('should throw for non-existent operation', () => {
       const document = parse('query GetHello { hello }');
-      expect(() => new CompiledQuery(schema, document, 'NonExistent')).toThrow();
+      let thrown: unknown;
+      try {
+        new CompiledQuery(schema, document, 'NonExistent');
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(LeavenError);
+      expect((thrown as LeavenError).message).toBe('Unknown operation named "NonExistent".');
+      expect((thrown as LeavenError).code).toBe(ErrorCode.BAD_REQUEST);
+    });
+
+    test('should require an operation name for a multi-operation document', () => {
+      const document = parse('query A { hello } query B { hello }');
+      expect(() => new CompiledQuery(schema, document)).toThrow(
+        'Must provide operation name if query contains multiple operations.'
+      );
+    });
+
+    test('should reject a document with no operation', () => {
+      const document = parse('fragment F on Query { hello }');
+      expect(() => new CompiledQuery(schema, document)).toThrow('Must provide an operation.');
     });
 
     test('should escape and cap a client operation name in the error text', () => {

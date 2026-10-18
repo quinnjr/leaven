@@ -7,12 +7,14 @@
 
 import { describe, test, expect, spyOn } from 'bun:test';
 import {
+  GraphQLError,
   GraphQLInt,
   GraphQLObjectType,
   GraphQLSchema,
   GraphQLString,
 } from 'graphql';
 import { LeavenExecutor, type GraphQLResponse } from '@leaven-graphql/core';
+import { ErrorCode, LeavenError } from '@leaven-graphql/errors';
 import { SubscriptionManager, createSubscriptionManager } from './manager';
 
 /** Records whether an iterator was released via return() */
@@ -768,6 +770,172 @@ describe('SubscriptionManager', () => {
 
       expect(response.errors).toBeUndefined();
       expect(response.data?.hello).toBe('world');
+    });
+  });
+
+  describe('errorFormatting', () => {
+    function failingSchema(): GraphQLSchema {
+      return new GraphQLSchema({
+        query: new GraphQLObjectType({
+          name: 'Query',
+          fields: {
+            secret: {
+              type: GraphQLString,
+              resolve: () => {
+                throw new Error('mongodb://root:pw@db leaked');
+              },
+            },
+          },
+        }),
+        subscription: new GraphQLObjectType({
+          name: 'Subscription',
+          fields: {
+            forbidden: {
+              type: GraphQLInt,
+              subscribe: async function* () {
+                yield { forbidden: 1 };
+                throw new GraphQLError('No access', {
+                  extensions: { code: ErrorCode.FORBIDDEN },
+                });
+              },
+            },
+            crashing: {
+              type: GraphQLInt,
+              subscribe: async function* () {
+                yield { crashing: 1 };
+                throw new Error('stream reset by 10.0.0.5');
+              },
+            },
+            unauthenticated: {
+              type: GraphQLInt,
+              subscribe: async function* () {
+                yield { unauthenticated: 1 };
+                throw new LeavenError('Session ended', ErrorCode.UNAUTHENTICATED);
+              },
+            },
+          },
+        }),
+      });
+    }
+
+    async function streamErrors(
+      manager: SubscriptionManager,
+      query: string
+    ): Promise<readonly { message: string; extensions?: Record<string, unknown> }[]> {
+      let received: readonly { message: string; extensions?: Record<string, unknown> }[] = [];
+      let done = false;
+      await manager.subscribe(
+        'conn-1',
+        'sub-1',
+        { query },
+        undefined,
+        () => {},
+        () => {
+          done = true;
+        },
+        (errors) => {
+          received = errors;
+          done = true;
+        }
+      );
+      await waitFor(() => done);
+      return received;
+    }
+
+    test('should keep the code of a GraphQLError thrown by the source stream', async () => {
+      const manager = new SubscriptionManager({
+        schema: failingSchema(),
+        errorFormatting: { maskErrors: true },
+      });
+
+      const errors = await streamErrors(manager, 'subscription { forbidden }');
+
+      expect(errors[0]?.message).toBe('No access');
+      expect(errors[0]?.extensions?.code).toBe(ErrorCode.FORBIDDEN);
+    });
+
+    test('should report a raw source stream Error as INTERNAL_ERROR without masking', async () => {
+      const manager = new SubscriptionManager({ schema: failingSchema() });
+
+      const errors = await streamErrors(manager, 'subscription { crashing }');
+
+      expect(errors[0]?.message).toBe('stream reset by 10.0.0.5');
+      expect(errors[0]?.extensions?.code).toBe(ErrorCode.INTERNAL_ERROR);
+    });
+
+    test('should mask a raw source stream Error when maskErrors is on', async () => {
+      const manager = new SubscriptionManager({
+        schema: failingSchema(),
+        errorFormatting: { maskErrors: true, maskedMessage: 'Try again later' },
+      });
+
+      const errors = await streamErrors(manager, 'subscription { crashing }');
+
+      expect(errors[0]?.message).toBe('Try again later');
+      expect(errors[0]?.extensions?.code).toBe(ErrorCode.INTERNAL_ERROR);
+    });
+
+    test('should keep a LeavenError message and code under masking', async () => {
+      const manager = new SubscriptionManager({
+        schema: failingSchema(),
+        errorFormatting: { maskErrors: true },
+      });
+
+      const errors = await streamErrors(manager, 'subscription { unauthenticated }');
+
+      expect(errors[0]?.message).toBe('Session ended');
+      expect(errors[0]?.extensions?.code).toBe(ErrorCode.UNAUTHENTICATED);
+    });
+
+    test('should mask execution errors returned by execute', async () => {
+      const manager = new SubscriptionManager({
+        schema: failingSchema(),
+        errorFormatting: { maskErrors: true },
+      });
+
+      const response = await manager.execute({ query: '{ secret }' });
+
+      expect(response.errors?.[0]?.message).toBe('An unexpected error occurred');
+      expect(response.errors?.[0]?.extensions?.code).toBe(ErrorCode.INTERNAL_ERROR);
+    });
+
+    test('should leave execute errors untouched when errorFormatting is unset', async () => {
+      const manager = new SubscriptionManager({ schema: failingSchema() });
+
+      const response = await manager.execute({ query: '{ secret }' });
+
+      expect(response.errors?.[0]?.message).toBe('mongodb://root:pw@db leaked');
+      expect(response.errors?.[0]?.path).toEqual(['secret']);
+    });
+
+    test('should refuse the per-connection limit with BAD_REQUEST', async () => {
+      const manager = new SubscriptionManager({
+        schema: createTestSchema(),
+        maxSubscriptionsPerConnection: 1,
+      });
+      await manager.subscribe(
+        'conn-1',
+        'sub-1',
+        { query: 'subscription { forever }' },
+        undefined,
+        () => {},
+        () => {},
+        () => {}
+      );
+
+      const attempt = manager.subscribe(
+        'conn-1',
+        'sub-2',
+        { query: 'subscription { forever }' },
+        undefined,
+        () => {},
+        () => {},
+        () => {}
+      );
+
+      await expect(attempt).rejects.toBeInstanceOf(LeavenError);
+      await expect(attempt).rejects.toMatchObject({ code: ErrorCode.BAD_REQUEST });
+      manager.clear();
     });
   });
 

@@ -217,12 +217,9 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
       // Format errors if formatter is provided. The formatter has an arity-1
       // contract, so it must not be handed to `map` directly (which would
       // also pass the index and array).
-      let formattedErrors =
-        response.errors as unknown as readonly GraphQLFormattedError[] | undefined;
-      if (formattedErrors && this.options.formatError) {
-        const formatErrorFn = this.options.formatError;
-        formattedErrors = formattedErrors.map((error) => formatErrorFn(error));
-      }
+      const formattedErrors = this.formatResultErrors(
+        response.errors as unknown as readonly GraphQLFormattedError[] | undefined
+      );
 
       // Add metrics to extensions if enabled
       let extensions = response.extensions;
@@ -244,16 +241,41 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Turn an error thrown out of the executor into a response error.
+   * Apply a configured `formatError` to errors the executor reported.
    *
-   * Leaven errors keep their code, extensions, and message as-is. Unexpected
-   * errors are masked only in production — masking them in development would
-   * hide the real message from the developer — and
-   * `includeStacktraceInErrorResponses` suppresses masking outright, since a
-   * masked error carries no stack to include. A configured `formatError` gets
-   * the last word, exactly as it does for errors the executor reports itself.
+   * The formatter has an arity-1 contract, so it must not be handed to `map`
+   * directly (which would also pass the index and array).
    */
-  private formatThrownError(error: unknown): GraphQLFormattedError {
+  private formatResultErrors(
+    errors: readonly GraphQLFormattedError[] | undefined
+  ): readonly GraphQLFormattedError[] | undefined {
+    const formatErrorFn = this.options.formatError;
+    if (!errors || !formatErrorFn) {
+      return errors;
+    }
+    return errors.map((error) => formatErrorFn(error));
+  }
+
+  /**
+   * Turn a thrown error into a response error.
+   *
+   * Leaven errors keep their code, extensions, and message as-is; any other
+   * `GraphQLError` keeps its `extensions.code`, and everything else is
+   * reported as `INTERNAL_ERROR`. Unexpected errors are masked only in
+   * production — masking them in development would hide the real message from
+   * the developer — and `includeStacktraceInErrorResponses` suppresses masking
+   * outright, since a masked error carries no stack to include. A configured
+   * `formatError` gets the last word, exactly as it does for errors the
+   * executor reports itself.
+   *
+   * Public so the subscription transport formats the errors it catches (a
+   * failing `onSubscribe`, `context` or `onOperation` hook, a source stream
+   * that throws) exactly as this driver formats its own.
+   *
+   * @param error - Anything thrown
+   * @returns The formatted error to send to the client
+   */
+  public formatThrownError(error: unknown): GraphQLFormattedError {
     const isProduction = process.env.NODE_ENV === 'production';
     const includeStack = this.options.includeStacktraceInErrorResponses ?? false;
     const formattedError = formatError(error, {
@@ -303,15 +325,13 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
       );
 
       if (!(Symbol.asyncIterator in result)) {
-        let errors = result.errors as unknown as readonly GraphQLFormattedError[] | undefined;
-        if (errors && this.options.formatError) {
-          const formatErrorFn = this.options.formatError;
-          errors = errors.map((error) => formatErrorFn(error));
-        }
+        const errors = this.formatResultErrors(
+          result.errors as unknown as readonly GraphQLFormattedError[] | undefined
+        );
         return { errors } as HandlerResult<TData>;
       }
 
-      return result as unknown as AsyncIterableIterator<HandlerResult<TData>>;
+      return this.formatStream(result as unknown as AsyncIterableIterator<HandlerResult<TData>>);
     } catch (error) {
       // `LeavenExecutor.subscribe` throws (rather than returning errors) on a
       // syntax error, an over-depth document, or a failure inside a subscribe
@@ -319,6 +339,44 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
       // rejects, so those surface as a `HandlerResult` here.
       return { errors: [this.formatThrownError(error)] } as HandlerResult<TData>;
     }
+  }
+
+  /**
+   * Wrap a subscription stream so the errors of every event get the same
+   * `formatError` pass as {@link execute} applies, rather than reaching the
+   * client exactly as the executor serialised them. An error thrown by the
+   * stream itself is left for the caller to format with
+   * {@link formatThrownError}.
+   */
+  private formatStream<TData>(
+    iterator: AsyncIterableIterator<HandlerResult<TData>>
+  ): AsyncIterableIterator<HandlerResult<TData>> {
+    if (!this.options.formatError) {
+      return iterator;
+    }
+    const format = (value: HandlerResult<TData>): HandlerResult<TData> =>
+      value?.errors ? { ...value, errors: this.formatResultErrors(value.errors) } : value;
+
+    return {
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+      async next(): Promise<IteratorResult<HandlerResult<TData>>> {
+        const step = await iterator.next();
+        return step.done ? step : { value: format(step.value), done: false };
+      },
+      async return(value?: unknown): Promise<IteratorResult<HandlerResult<TData>>> {
+        return iterator.return
+          ? iterator.return(value)
+          : { value: undefined, done: true };
+      },
+      async throw(error?: unknown): Promise<IteratorResult<HandlerResult<TData>>> {
+        if (iterator.throw) {
+          return iterator.throw(error);
+        }
+        throw error;
+      },
+    };
   }
 
   /**

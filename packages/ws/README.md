@@ -170,6 +170,37 @@ const handler = createWebSocketHandler({
 The lifecycle hooks may be async; a hook that rejects is logged and never
 takes the connection (or the process) down with it.
 
+### Error Formatting and Masking
+
+`errorFormatting` takes the same `ErrorMaskingOptions` as the HTTP
+transport's option of that name, and is applied the same way:
+
+- An error thrown by `onSubscribe`, the context factory or a source stream is
+  sent through `formatError(error, errorFormatting)` from
+  `@leaven-graphql/errors`. A `GraphQLError` or `LeavenError` keeps its
+  message and `extensions.code`; anything else is reported with
+  `INTERNAL_ERROR`, and masked when `maskErrors` is `true`.
+- Execution errors the executor already serialised (the `errors` of a `next`
+  payload, or of an `error` frame for a rejected operation) are re-formatted
+  only when `errorFormatting` is set, as HTTP does.
+
+```typescript
+import { createWebSocketHandler } from '@leaven-graphql/ws';
+
+const handler = createWebSocketHandler({
+  schema,
+  context: async () => ({ db: await getDatabase() }),
+  // A failing getDatabase() is sent as "An unexpected error occurred", not the DSN
+  errorFormatting: { maskErrors: process.env.NODE_ENV === 'production' },
+});
+```
+
+Without `maskErrors`, a thrown error's message reaches the client verbatim,
+so turn it on in production. Errors with a known Leaven code other than
+`INTERNAL_ERROR` (an `AuthenticationError`, a `FORBIDDEN` `GraphQLError`, the
+`BAD_REQUEST` sent when `maxSubscriptionsPerConnection` is reached) are never
+masked.
+
 ### Schema Definition
 
 ```graphql
@@ -288,6 +319,12 @@ interface WebSocketHandlerConfig<TContext = unknown> {
    * Passed on to the SubscriptionManager unless it sets its own.
    */
   logger?: WebSocketLogger;
+  /**
+   * How errors sent in `error` and `next` frames are formatted and masked,
+   * as for the HTTP transport (see "Error Formatting and Masking"). Passed on
+   * to the SubscriptionManager unless it sets its own.
+   */
+  errorFormatting?: ErrorMaskingOptions;
   /** Return false to reject the connection with 4403 */
   onConnect?: (
     socket: ServerWebSocket<WebSocketContext>,
@@ -392,6 +429,12 @@ interface SubscriptionManagerConfig {
   executor?: LeavenExecutor | Omit<ExecutorConfig, 'schema'>;
   /** Destination for timeout and callback diagnostics (default `console`) */
   logger?: WebSocketLogger;
+  /**
+   * Formats the errors passed to `onError` and `onNext` and returned by
+   * `execute`: thrown errors always go through `formatError`, executor
+   * errors only when this is set
+   */
+  errorFormatting?: ErrorMaskingOptions;
 }
 
 interface Subscription {

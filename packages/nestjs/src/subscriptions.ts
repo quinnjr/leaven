@@ -38,7 +38,12 @@ import {
   type OnModuleInit,
   type OnModuleDestroy,
 } from '@nestjs/common';
-import { parse, getOperationAST, type DocumentNode } from 'graphql';
+import {
+  parse,
+  getOperationAST,
+  type DocumentNode,
+  type GraphQLFormattedError,
+} from 'graphql';
 import type { ServerWebSocket } from 'bun';
 import { escapeLog } from '@leaven-graphql/core';
 import { isValidOperationId } from '@leaven-graphql/ws';
@@ -772,8 +777,11 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
         state.subscriptions.delete(message.id);
       }
 
-      const errorMessage = error instanceof Error ? error.message : 'Subscription failed';
-      this.sendError(socket, message.id, errorMessage);
+      // Formatted and masked exactly as the driver formats a thrown error: a
+      // failing `context`, `onSubscribe` or `onOperation` hook must not send
+      // its raw text (a DSN, a connection failure) to the client in
+      // production, and a coded error keeps its code.
+      this.sendErrors(socket, message.id, [this.driver.formatThrownError(error)]);
     }
   }
 
@@ -864,8 +872,7 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
       }
     } catch (error) {
       if (owns()) {
-        const message = error instanceof Error ? error.message : 'Subscription failed';
-        this.sendError(socket, id, message);
+        this.sendErrors(socket, id, [this.driver.formatThrownError(error)]);
       }
     } finally {
       if (owns()) {
@@ -1040,10 +1047,21 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
    * Send error to client
    */
   private sendError(socket: SubscriptionSocket, id: string, message: string): void {
+    this.sendErrors(socket, id, [{ message }]);
+  }
+
+  /**
+   * Send already-formatted errors to the client as one `error` frame
+   */
+  private sendErrors(
+    socket: SubscriptionSocket,
+    id: string,
+    errors: readonly GraphQLFormattedError[]
+  ): void {
     this.send(socket, {
       id,
       type: 'error',
-      payload: [{ message }],
+      payload: [...errors],
     });
   }
 

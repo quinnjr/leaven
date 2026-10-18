@@ -24,6 +24,7 @@ export {
   maskError,
   isLeavenError,
   errorToGraphQL,
+  fromFormattedError,
   type ErrorFormatter,
   type ErrorMaskingOptions,
 } from './formatter';

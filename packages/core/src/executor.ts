@@ -21,7 +21,14 @@ import {
 import { ComplexityError, ErrorCode, isLeavenError } from '@leaven-graphql/errors';
 
 import { DocumentCache, type DocumentCacheConfig, type CachedValidation, type IDocumentCache, resolveValue } from './cache';
-import { parseDocument, validateDocument, type ParseOptions, type ValidationResult } from './parser';
+import {
+  operationSelectionError,
+  parseDocument,
+  withErrorCode,
+  validateDocument,
+  type ParseOptions,
+  type ValidationResult,
+} from './parser';
 import { type CompiledQuery, compileQuery, type CompilerOptions } from './compiler';
 import { CompiledQueryCache } from './compiled-cache';
 import type {
@@ -57,6 +64,15 @@ export interface ExecutorConfig {
   introspection?: boolean;
   /** Maximum query depth */
   maxDepth?: number;
+  /**
+   * Maximum depth of introspection selections (`__schema`/`__type` at an
+   * operation root), counted instead of `maxDepth` for those paths. Lets
+   * GraphiQL and codegen send `getIntrospectionQuery()` (depth 15) while
+   * ordinary queries stay under a tighter `maxDepth`. When unset,
+   * introspection counts against `maxDepth`. See
+   * {@link ParseOptions.maxIntrospectionDepth}.
+   */
+  maxIntrospectionDepth?: number;
   /**
    * Maximum query complexity.
    *
@@ -215,8 +231,9 @@ export class LeavenExecutor {
   private readonly rootValue: unknown;
   private readonly cache: IDocumentCache | null;
   /**
-   * Effective parser options, with a configured `maxDepth` already folded in
-   * so the value used at parse time is the value that was fingerprinted.
+   * Effective parser options, with a configured `maxDepth` and
+   * `maxIntrospectionDepth` already folded in so the values used at parse
+   * time are the values that were fingerprinted.
    */
   private readonly parseOptions: ParseOptions;
   private readonly compilerOptions?: CompilerOptions;
@@ -252,14 +269,18 @@ export class LeavenExecutor {
   constructor(config: ExecutorConfig) {
     this.schema = config.schema;
     this.rootValue = config.rootValue;
-    // `maxDepth` is only overridden when the executor was configured with one,
-    // so a `parseOptions.maxDepth` is not clobbered. Resolved here (not per
-    // parse) so the fingerprint below covers exactly what parsing will use.
-    const parseOptions = config.parseOptions ?? {};
-    this.parseOptions =
-      config.maxDepth !== undefined
-        ? { ...parseOptions, maxDepth: config.maxDepth }
-        : parseOptions;
+    // `maxDepth` and `maxIntrospectionDepth` are only overridden when the
+    // executor was configured with them, so the `parseOptions` values are not
+    // clobbered. Resolved here (not per parse) so the fingerprint below covers
+    // exactly what parsing will use.
+    let parseOptions = config.parseOptions ?? {};
+    if (config.maxDepth !== undefined) {
+      parseOptions = { ...parseOptions, maxDepth: config.maxDepth };
+    }
+    if (config.maxIntrospectionDepth !== undefined) {
+      parseOptions = { ...parseOptions, maxIntrospectionDepth: config.maxIntrospectionDepth };
+    }
+    this.parseOptions = parseOptions;
     // Ensure complexity is calculated whenever a complexity limit is set,
     // otherwise `maxComplexity` would be silently ignored.
     this.compilerOptions =
@@ -352,10 +373,11 @@ export class LeavenExecutor {
    * - a document parsed under `maxDepth: 100` would be served from cache to an
    *   executor configured with `maxDepth: 1`, whose depth check never re-runs
    *   because the document is never re-parsed — silently disabling the depth
-   *   DoS control.
+   *   DoS control. The same goes for `maxIntrospectionDepth`.
    *
    * The fingerprint therefore covers the schema, the validation rules and the
-   * parser options (`maxDepth`, `maxTokens`, `graphqlOptions`).
+   * parser options (`maxDepth`, `maxIntrospectionDepth`, `maxTokens`,
+   * `graphqlOptions`).
    */
   private cacheKeyFor(query: string): string {
     return `${this.validationFingerprint}\x00${query}`;
@@ -565,7 +587,24 @@ export class LeavenExecutor {
     }
 
     if (!validation.valid) {
-      return { errors: validation.errors.map((e) => e.toJSON()) };
+      return {
+        errors: validation.errors.map((e) =>
+          withErrorCode(e, ErrorCode.VALIDATION_ERROR).toJSON()
+        ),
+      };
+    }
+
+    // Validation does not look at `operationName`, so an unknown name, or a
+    // missing one for a multi-operation document, gets this far. Both are
+    // client mistakes: reject them here as BAD_REQUEST, on every path (the
+    // compiler and graphql-js would otherwise report them as an uncoded or
+    // INTERNAL_ERROR failure, which a masking transport hides as a 500).
+    if (!getOperationAST(document, request.operationName)) {
+      return {
+        errors: [
+          operationSelectionError(document, request.operationName).toGraphQLError().toJSON(),
+        ],
+      };
     }
 
     // Check complexity if compiler is enabled. The compiled plan is only
@@ -687,7 +726,9 @@ export class LeavenExecutor {
 
       const response: GraphQLResponse<TData> = {
         data: result.data as TData | undefined,
-        errors: result.errors?.map((e) => this.serializeExecutionError(e)),
+        errors: result.errors?.map((e) =>
+          this.serializeExecutionError(LeavenExecutor.codeRequestError(e, result.data))
+        ),
       };
 
       if (this.hooks?.onExecuted) {
@@ -710,6 +751,22 @@ export class LeavenExecutor {
         metrics: this.metricsEnabled ? buildMetrics() : undefined,
       };
     }
+  }
+
+  /**
+   * Give a graphql-js *request* error the client code `BAD_REQUEST`.
+   *
+   * graphql-js reports a request it cannot start (in practice a variable that
+   * fails to coerce, since operation selection is checked earlier) as errors
+   * with no `data` and no `path`, and with no code. Those are client mistakes;
+   * an error with a `path` (a subscribe resolver that threw) is not, and is
+   * left as it is. Applied before `formatExecutionError`, which still gets the
+   * last word.
+   */
+  private static codeRequestError(error: GraphQLError, data: unknown): GraphQLError {
+    return data === undefined && error.path === undefined
+      ? withErrorCode(error, ErrorCode.BAD_REQUEST)
+      : error;
   }
 
   /**
@@ -792,7 +849,9 @@ export class LeavenExecutor {
       // If it's an error result (not an async iterable), return it as a response
       if (!(Symbol.asyncIterator in result)) {
         return {
-          errors: (result as GraphQLExecutionResult).errors?.map((e) => serializeError(e)),
+          errors: (result as GraphQLExecutionResult).errors?.map((e) =>
+            serializeError(LeavenExecutor.codeRequestError(e, undefined))
+          ),
         };
       }
 

@@ -1,5 +1,23 @@
 # @leaven-graphql/http
 
+## 0.2.4
+
+### Patch Changes
+
+- 37f6299: Export `fromFormattedError` from `@leaven-graphql/errors`. It rebuilds a `GraphQLError` from an
+  already-serialised `GraphQLFormattedError` (what `LeavenExecutor` returns), so `formatError` can
+  mask it without turning it into `"[object Object]"` or losing its code, path and locations.
+  `@leaven-graphql/http` now uses the shared helper instead of its private copy; its behaviour is
+  unchanged.
+- Updated dependencies [37f6299]
+- Updated dependencies [37f6299]
+- Updated dependencies [37f6299]
+- Updated dependencies [37f6299]
+- Updated dependencies [37f6299]
+  - @leaven-graphql/core@0.3.0
+  - @leaven-graphql/errors@0.3.0
+  - @leaven-graphql/ws@0.3.0
+
 ## 0.2.3
 
 ### Patch Changes

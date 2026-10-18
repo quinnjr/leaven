@@ -7,12 +7,14 @@
 
 import { describe, test, expect, spyOn } from 'bun:test';
 import {
+  GraphQLError,
   GraphQLInt,
   GraphQLObjectType,
   GraphQLSchema,
   GraphQLString,
 } from 'graphql';
 import type { ServerWebSocket } from 'bun';
+import { AuthenticationError, ErrorCode } from '@leaven-graphql/errors';
 import {
   WebSocketHandler,
   createWebSocketHandler,
@@ -185,8 +187,8 @@ interface Frame {
   id?: string;
   payload?: {
     data?: Record<string, unknown> | null;
-    errors?: Array<{ message: string }>;
-  } & Array<{ message: string }>;
+    errors?: Array<{ message: string; extensions?: Record<string, unknown> }>;
+  } & Array<{ message: string; extensions?: Record<string, unknown> }>;
 }
 
 type TestSocket = ServerWebSocket<WebSocketContext> & {
@@ -1300,6 +1302,351 @@ describe('WebSocketHandler', () => {
       // close this socket from a timer stack
       await handler.handleClose(socket);
     });
+  });
+});
+
+/**
+ * A schema whose subscription sources fail in the ways the error-formatting
+ * tests need: a source stream throwing a coded GraphQLError, one throwing a
+ * raw Error, and an event whose resolver throws (an execution error inside a
+ * `next` payload).
+ */
+function createFailingSchema(): GraphQLSchema {
+  return new GraphQLSchema({
+    query: new GraphQLObjectType({
+      name: 'Query',
+      fields: {
+        hello: { type: GraphQLString, resolve: () => 'world' },
+        boom: {
+          type: GraphQLString,
+          resolve: () => {
+            throw new Error('redis://admin:hunter2@cache:6379 unreachable');
+          },
+        },
+      },
+    }),
+    subscription: new GraphQLObjectType({
+      name: 'Subscription',
+      fields: {
+        forbidden: {
+          type: GraphQLInt,
+          subscribe: async function* () {
+            yield { forbidden: 1 };
+            throw new GraphQLError('Not allowed to watch this', {
+              extensions: { code: ErrorCode.FORBIDDEN },
+            });
+          },
+        },
+        crashing: {
+          type: GraphQLInt,
+          subscribe: async function* () {
+            yield { crashing: 1 };
+            throw new Error('postgres://u:p@h/db stream reset');
+          },
+        },
+        poisoned: {
+          type: GraphQLInt,
+          subscribe: async function* () {
+            yield { poisoned: 1 };
+          },
+          resolve: () => {
+            throw new Error('decrypt failed with key sk_live_123');
+          },
+        },
+      },
+    }),
+  });
+}
+
+function subscribeFrame(id: string, query: string): string {
+  return JSON.stringify({ id, type: 'subscribe', payload: { query } });
+}
+
+describe('error formatting', () => {
+  const MASKED = 'An unexpected error occurred';
+
+  test('should mask a context factory failure when maskErrors is on', async () => {
+    const handler = createHandler({
+      errorFormatting: { maskErrors: true },
+      context: () => {
+        throw new Error('postgres://u:p@h/db refused');
+      },
+    });
+    const socket = createFakeSocket();
+
+    await openAndInit(handler, socket);
+    await handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+
+    const errorFrame = frames(socket).find((f) => f.type === 'error');
+    expect(errorFrame?.id).toBe('sub-1');
+    expect(errorFrame?.payload?.[0]?.message).toBe(MASKED);
+    expect(errorFrame?.payload?.[0]?.extensions?.code).toBe(ErrorCode.INTERNAL_ERROR);
+    expect(socket.sent.join('')).not.toContain('postgres://');
+    expect(socket.closed).toBeNull();
+
+    await handler.handleClose(socket);
+  });
+
+  test('should send a context factory failure with INTERNAL_ERROR when not masking', async () => {
+    const handler = createHandler({
+      context: () => {
+        throw new Error('postgres://u:p@h/db refused');
+      },
+    });
+    const socket = createFakeSocket();
+
+    await openAndInit(handler, socket);
+    await handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+
+    const errorFrame = frames(socket).find((f) => f.type === 'error');
+    expect(errorFrame?.payload?.[0]?.message).toBe('postgres://u:p@h/db refused');
+    expect(errorFrame?.payload?.[0]?.extensions?.code).toBe(ErrorCode.INTERNAL_ERROR);
+
+    await handler.handleClose(socket);
+  });
+
+  test('should mask an onSubscribe failure when maskErrors is on', async () => {
+    const handler = createHandler({
+      errorFormatting: { maskErrors: true },
+      onSubscribe: () => {
+        throw new Error('ldap bind failed for cn=admin');
+      },
+    });
+    const socket = createFakeSocket();
+
+    await openAndInit(handler, socket);
+    await handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+
+    const errorFrame = frames(socket).find((f) => f.type === 'error');
+    expect(errorFrame?.payload?.[0]?.message).toBe(MASKED);
+
+    await handler.handleClose(socket);
+  });
+
+  test('should keep a LeavenError message and code under masking', async () => {
+    const handler = createHandler({
+      errorFormatting: { maskErrors: true },
+      context: () => {
+        throw new AuthenticationError('Token expired');
+      },
+    });
+    const socket = createFakeSocket();
+
+    await openAndInit(handler, socket);
+    await handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+
+    const errorFrame = frames(socket).find((f) => f.type === 'error');
+    expect(errorFrame?.payload?.[0]?.message).toBe('Token expired');
+    expect(errorFrame?.payload?.[0]?.extensions?.code).toBe(ErrorCode.UNAUTHENTICATED);
+
+    await handler.handleClose(socket);
+  });
+
+  test('should keep the code of a GraphQLError thrown by the source stream', async () => {
+    const handler = createHandler({
+      schema: createFailingSchema(),
+      errorFormatting: { maskErrors: true },
+    });
+    const socket = createFakeSocket();
+
+    await openAndInit(handler, socket);
+    await handler.handleMessage(socket, subscribeFrame('s1', 'subscription { forbidden }'));
+    await waitFor(() => frames(socket).some((f) => f.type === 'error'));
+
+    const errorFrame = frames(socket).find((f) => f.type === 'error');
+    expect(errorFrame?.id).toBe('s1');
+    expect(errorFrame?.payload?.[0]?.message).toBe('Not allowed to watch this');
+    expect(errorFrame?.payload?.[0]?.extensions?.code).toBe(ErrorCode.FORBIDDEN);
+
+    await handler.handleClose(socket);
+  });
+
+  test('should keep the code of a source stream GraphQLError without masking', async () => {
+    const handler = createHandler({ schema: createFailingSchema() });
+    const socket = createFakeSocket();
+
+    await openAndInit(handler, socket);
+    await handler.handleMessage(socket, subscribeFrame('s1', 'subscription { forbidden }'));
+    await waitFor(() => frames(socket).some((f) => f.type === 'error'));
+
+    const errorFrame = frames(socket).find((f) => f.type === 'error');
+    expect(errorFrame?.payload?.[0]?.extensions?.code).toBe(ErrorCode.FORBIDDEN);
+
+    await handler.handleClose(socket);
+  });
+
+  test('should mask a raw Error thrown by the source stream', async () => {
+    const handler = createHandler({
+      schema: createFailingSchema(),
+      errorFormatting: { maskErrors: true },
+    });
+    const socket = createFakeSocket();
+
+    await openAndInit(handler, socket);
+    await handler.handleMessage(socket, subscribeFrame('s1', 'subscription { crashing }'));
+    await waitFor(() => frames(socket).some((f) => f.type === 'error'));
+
+    const errorFrame = frames(socket).find((f) => f.type === 'error');
+    expect(errorFrame?.payload?.[0]?.message).toBe(MASKED);
+    expect(socket.sent.join('')).not.toContain('postgres://');
+
+    await handler.handleClose(socket);
+  });
+
+  test('should mask execution errors inside a subscription next payload', async () => {
+    const handler = createHandler({
+      schema: createFailingSchema(),
+      errorFormatting: { maskErrors: true },
+    });
+    const socket = createFakeSocket();
+
+    await openAndInit(handler, socket);
+    await handler.handleMessage(socket, subscribeFrame('s1', 'subscription { poisoned }'));
+    await waitFor(() => frames(socket).some((f) => f.type === 'complete'));
+
+    const next = frames(socket).find((f) => f.type === 'next');
+    expect(next?.payload?.errors?.[0]?.message).toBe(MASKED);
+    expect(next?.payload?.errors?.[0]?.extensions?.code).toBe(ErrorCode.INTERNAL_ERROR);
+    expect(socket.sent.join('')).not.toContain('sk_live_123');
+
+    await handler.handleClose(socket);
+  });
+
+  test('should mask execution errors inside a query next payload', async () => {
+    const handler = createHandler({
+      schema: createFailingSchema(),
+      errorFormatting: { maskErrors: true },
+    });
+    const socket = createFakeSocket();
+
+    await openAndInit(handler, socket);
+    await handler.handleMessage(socket, subscribeFrame('q1', '{ boom }'));
+
+    const next = frames(socket).find((f) => f.type === 'next');
+    expect(next?.payload?.errors?.[0]?.message).toBe(MASKED);
+    expect(next?.payload?.errors?.[0]?.extensions?.code).toBe(ErrorCode.INTERNAL_ERROR);
+    expect(socket.sent.join('')).not.toContain('hunter2');
+
+    await handler.handleClose(socket);
+  });
+
+  test('should leave executor errors as formatted when errorFormatting is unset', async () => {
+    const handler = createHandler({ schema: createFailingSchema() });
+    const socket = createFakeSocket();
+
+    await openAndInit(handler, socket);
+    await handler.handleMessage(socket, subscribeFrame('q1', '{ boom }'));
+
+    const next = frames(socket).find((f) => f.type === 'next');
+    expect(next?.payload?.errors?.[0]?.message).toBe(
+      'redis://admin:hunter2@cache:6379 unreachable'
+    );
+    expect(next?.payload?.errors?.[0]?.extensions).toBeUndefined();
+
+    await handler.handleClose(socket);
+  });
+
+  test('should apply a custom formatter to every error the transport sends', async () => {
+    const seen: string[] = [];
+    const handler = createHandler({
+      schema: createFailingSchema(),
+      errorFormatting: {
+        formatter: (error) => {
+          seen.push(error.message);
+          return { message: 'formatted', extensions: { code: 'CUSTOM' } };
+        },
+      },
+      context: (_socket, request) => {
+        if (request.query.includes('crashing')) {
+          throw new Error('context failed');
+        }
+        return {};
+      },
+    });
+    const socket = createFakeSocket();
+
+    await openAndInit(handler, socket);
+    await handler.handleMessage(socket, subscribeFrame('q1', '{ boom }'));
+    await handler.handleMessage(socket, subscribeFrame('s1', 'subscription { crashing }'));
+
+    expect(seen).toEqual(['redis://admin:hunter2@cache:6379 unreachable', 'context failed']);
+    for (const frame of frames(socket)) {
+      const errors = frame.type === 'error' ? frame.payload : frame.payload?.errors;
+      for (const error of errors ?? []) {
+        expect(error.message).toBe('formatted');
+      }
+    }
+
+    await handler.handleClose(socket);
+  });
+
+  test('should keep the per-connection limit message visible under masking', async () => {
+    const handler = createHandler({
+      errorFormatting: { maskErrors: true },
+      subscriptionManager: { maxSubscriptionsPerConnection: 1 },
+    });
+    const socket = createFakeSocket();
+
+    await openAndInit(handler, socket);
+    await handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+    await handler.handleMessage(socket, subscribeFrame('sub-2', 'subscription { forever }'));
+
+    const errorFrame = frames(socket).find((f) => f.type === 'error');
+    expect(errorFrame?.payload?.[0]?.message).toBe('Maximum subscriptions per connection reached');
+    expect(errorFrame?.payload?.[0]?.extensions?.code).toBe(ErrorCode.BAD_REQUEST);
+
+    await handler.handleClose(socket);
+  });
+
+  for (const [label, query] of [
+    ['query', 'query A { hello }'],
+    ['subscription', 'subscription A { count }'],
+  ] as const) {
+    test(`should send an unknown ${label} operation name as a BAD_REQUEST error frame`, async () => {
+      const handler = createHandler({ errorFormatting: { maskErrors: true } });
+      const socket = createFakeSocket();
+
+      await openAndInit(handler, socket);
+      await handler.handleMessage(
+        socket,
+        JSON.stringify({ id: 'op', type: 'subscribe', payload: { query, operationName: 'B' } })
+      );
+      await waitFor(() => frames(socket).some((f) => f.type === 'error'));
+
+      const errorFrame = frames(socket).find((f) => f.type === 'error');
+      expect(errorFrame?.id).toBe('op');
+      expect(errorFrame?.payload?.[0]?.message).toBe('Unknown operation named "B".');
+      expect(errorFrame?.payload?.[0]?.extensions?.code).toBe(ErrorCode.BAD_REQUEST);
+      expect(socket.closed).toBeNull();
+
+      await handler.handleClose(socket);
+    });
+  }
+
+  test('should keep a validation error visible under masking', async () => {
+    const handler = createHandler({ errorFormatting: { maskErrors: true } });
+    const socket = createFakeSocket();
+
+    await openAndInit(handler, socket);
+    await handler.handleMessage(socket, subscribeFrame('s1', 'subscription { nonexistent }'));
+    await handler.handleMessage(socket, subscribeFrame('q1', '{ nonexistent }'));
+
+    const errorFrames = frames(socket).filter((f) => f.type === 'error');
+    expect(errorFrames.map((f) => f.id)).toEqual(['s1', 'q1']);
+    for (const frame of errorFrames) {
+      expect(frame.payload?.[0]?.message).toMatch(/Cannot query field "nonexistent"/);
+      expect(frame.payload?.[0]?.extensions?.code).toBe(ErrorCode.VALIDATION_ERROR);
+    }
+
+    await handler.handleClose(socket);
+  });
+
+  test('should pass errorFormatting to the subscription manager', async () => {
+    const handler = createHandler({ errorFormatting: { maskErrors: true } });
+    const manager = managerOf(handler) as unknown as {
+      errorFormatting?: { maskErrors?: boolean };
+    };
+    expect(manager.errorFormatting?.maskErrors).toBe(true);
   });
 });
 

@@ -5,7 +5,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import type { DocumentNode, GraphQLSchema } from 'graphql';
+import type { DocumentNode, GraphQLFormattedError, GraphQLSchema } from 'graphql';
 import {
   LeavenExecutor,
   escapeLog,
@@ -13,6 +13,13 @@ import {
   type GraphQLRequest,
   type GraphQLResponse,
 } from '@leaven-graphql/core';
+import {
+  ErrorCode,
+  LeavenError,
+  formatError,
+  fromFormattedError,
+  type ErrorMaskingOptions,
+} from '@leaven-graphql/errors';
 
 import { logWarning, type WebSocketLogger } from './logger';
 
@@ -71,6 +78,19 @@ export interface SubscriptionManagerConfig {
    * are logged. Defaults to `console`.
    */
   logger?: WebSocketLogger;
+  /**
+   * How errors reported through `onError`, `onNext` and {@link
+   * SubscriptionManager.execute} are formatted, matching the HTTP transport's
+   * `errorFormatting`.
+   *
+   * Errors thrown while subscribing or by a source stream always go through
+   * `formatError(error, errorFormatting)`, so a `GraphQLError` or
+   * `LeavenError` keeps its `extensions.code` and anything else is reported
+   * as `INTERNAL_ERROR`. Execution errors the executor already serialised
+   * (`errors` of a result or of a stream event) are re-formatted only when
+   * this is set. Nothing is masked unless `maskErrors` is `true`.
+   */
+  errorFormatting?: ErrorMaskingOptions;
 }
 
 /**
@@ -92,6 +112,7 @@ export class SubscriptionManager {
   private readonly maxSubscriptionsPerConnection: number;
   private readonly subscriptionTimeout: number;
   private readonly logger: WebSocketLogger;
+  private readonly errorFormatting?: ErrorMaskingOptions;
 
   constructor(config: SubscriptionManagerConfig) {
     this.executor =
@@ -102,6 +123,32 @@ export class SubscriptionManager {
     this.maxSubscriptionsPerConnection = config.maxSubscriptionsPerConnection ?? 100;
     this.subscriptionTimeout = config.subscriptionTimeout ?? 0;
     this.logger = config.logger ?? console;
+    this.errorFormatting = config.errorFormatting;
+  }
+
+  /**
+   * Format an error thrown during setup or by a source stream, the way the
+   * HTTP transport formats an error thrown outside execution.
+   */
+  private formatThrown(error: unknown): GraphQLFormattedError[] {
+    return [formatError(error, this.errorFormatting)];
+  }
+
+  /**
+   * Re-format the errors the executor serialised into a response, when
+   * `errorFormatting` is configured (as the HTTP transport does). Each one is
+   * rebuilt into a `GraphQLError` first: formatting the serialised form
+   * directly would turn it into `"[object Object]"`.
+   */
+  private formatResponse<TData>(response: GraphQLResponse<TData>): GraphQLResponse<TData> {
+    const options = this.errorFormatting;
+    if (!options || !response.errors) {
+      return response;
+    }
+    return {
+      ...response,
+      errors: response.errors.map((error) => formatError(fromFormattedError(error), options)),
+    };
   }
 
   /**
@@ -130,7 +177,7 @@ export class SubscriptionManager {
     context?: TContext
   ): Promise<GraphQLResponse> {
     const { response } = await this.executor.execute(request, context);
-    return response;
+    return this.formatResponse(response);
   }
 
   /**
@@ -148,14 +195,19 @@ export class SubscriptionManager {
     // Check subscription limit. Entries are registered synchronously below,
     // before the executor is awaited, so pending subscriptions count too.
     const existing = this.connections.get(connectionId);
+    // LeavenErrors with a client code, so a masking transport still shows
+    // the client why its subscribe was refused
     if (existing && existing.size >= this.maxSubscriptionsPerConnection) {
-      throw new Error('Maximum subscriptions per connection reached');
+      throw new LeavenError('Maximum subscriptions per connection reached', ErrorCode.BAD_REQUEST);
     }
 
     // Never overwrite a registered id: the displaced subscription's iterator
     // would be orphaned, still running with nothing left to return() it
     if (existing?.has(subscriptionId)) {
-      throw new Error(`Subscription ${escapeLog(subscriptionId)} already exists`);
+      throw new LeavenError(
+        `Subscription ${escapeLog(subscriptionId)} already exists`,
+        ErrorCode.BAD_REQUEST
+      );
     }
 
     // Create subscription entry
@@ -197,8 +249,8 @@ export class SubscriptionManager {
       // Check if it's an error result (a plain response object, not an async iterable)
       if (!(Symbol.asyncIterator in Object(result))) {
         subscription.status = 'error';
-        const errors = (result as GraphQLResponse).errors ?? [{ message: 'Subscription failed' }];
-        onError(errors);
+        const { errors } = this.formatResponse(result as GraphQLResponse);
+        onError(errors ?? this.formatThrown(new Error('Subscription failed')));
         this.unsubscribe(connectionId, subscriptionId);
         return subscription;
       }
@@ -267,8 +319,7 @@ export class SubscriptionManager {
         return subscription;
       }
       subscription.status = 'error';
-      const message = error instanceof Error ? error.message : 'Subscription failed';
-      onError([{ message }]);
+      onError(this.formatThrown(error));
       this.unsubscribe(connectionId, subscriptionId);
       return subscription;
     }
@@ -302,7 +353,7 @@ export class SubscriptionManager {
           break;
         }
 
-        onNext(result);
+        onNext(this.formatResponse(result));
       }
 
       if (this.isCurrent(subscription)) {
@@ -313,8 +364,7 @@ export class SubscriptionManager {
     } catch (error) {
       if (this.isCurrent(subscription)) {
         subscription.status = 'error';
-        const message = error instanceof Error ? error.message : 'Subscription error';
-        onError([{ message }]);
+        onError(this.formatThrown(error));
         this.unsubscribe(connectionId, subscriptionId);
       }
     }

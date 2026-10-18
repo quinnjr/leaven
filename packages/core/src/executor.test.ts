@@ -8,6 +8,7 @@
 import { describe, test, expect, beforeEach, spyOn } from 'bun:test';
 import {
   buildSchema,
+  getIntrospectionQuery,
   parse,
   GraphQLError,
   type GraphQLFormattedError,
@@ -354,6 +355,163 @@ describe('LeavenExecutor', () => {
     });
   });
 
+  describe('request error codes', () => {
+    const executor = new LeavenExecutor({ schema, rootValue });
+
+    test('should give a syntax error PARSE_ERROR and keep its location', async () => {
+      const result = await executor.execute({ query: '{ hello' });
+
+      expect(result.response.errors?.[0]?.message).toMatch(/^Syntax Error/);
+      expect(result.response.errors?.[0]?.extensions?.code).toBe(ErrorCode.PARSE_ERROR);
+      expect(result.response.errors?.[0]?.locations).toEqual([{ line: 1, column: 8 }]);
+    });
+
+    test('should give an exceeded maxTokens PARSE_ERROR', async () => {
+      const limited = new LeavenExecutor({ schema, rootValue, parseOptions: { maxTokens: 2 } });
+
+      const result = await limited.execute({ query: '{ hello }' });
+
+      expect(result.response.errors?.[0]?.message).toMatch(/tokens/);
+      expect(result.response.errors?.[0]?.extensions?.code).toBe(ErrorCode.PARSE_ERROR);
+    });
+
+    test('should give a validation error VALIDATION_ERROR and keep its location', async () => {
+      const result = await executor.execute({ query: '{ nope }' });
+
+      expect(result.response.errors?.[0]?.message).toBe('Cannot query field "nope" on type "Query".');
+      expect(result.response.errors?.[0]?.extensions?.code).toBe(ErrorCode.VALIDATION_ERROR);
+      expect(result.response.errors?.[0]?.locations).toEqual([{ line: 1, column: 3 }]);
+    });
+
+    test('should give disabled introspection VALIDATION_ERROR', async () => {
+      const closed = new LeavenExecutor({ schema, rootValue, introspection: false });
+
+      const result = await closed.execute({ query: '{ __schema { queryType { name } } }' });
+
+      expect(result.response.errors?.[0]?.extensions?.code).toBe(ErrorCode.VALIDATION_ERROR);
+    });
+
+    test('should give a variable coercion error BAD_REQUEST before formatExecutionError runs', async () => {
+      const seen: unknown[] = [];
+      const hooked = new LeavenExecutor({
+        schema,
+        rootValue,
+        formatExecutionError: (error) => {
+          seen.push(error.extensions.code);
+          return error.toJSON();
+        },
+      });
+
+      const result = await hooked.execute({ query: 'query ($id: ID!) { user(id: $id) { id } }' });
+
+      expect(result.response.data).toBeUndefined();
+      expect(result.response.errors?.[0]?.message).toMatch(/Variable "\$id"/);
+      expect(result.response.errors?.[0]?.extensions?.code).toBe(ErrorCode.BAD_REQUEST);
+      expect(seen).toEqual([ErrorCode.BAD_REQUEST]);
+    });
+
+    test('should leave resolver errors uncoded', async () => {
+      const result = await executor.execute({ query: '{ error }' });
+
+      expect(result.response.data).toEqual({ error: null });
+      expect(result.response.errors?.[0]?.extensions).toBeUndefined();
+    });
+
+    test('should give subscribe syntax, validation and variable errors client codes', async () => {
+      const syntax = (await executor.subscribe({ query: 'subscription {' })) as GraphQLResponse;
+      const invalid = (await executor.subscribe({ query: 'subscription { nope }' })) as GraphQLResponse;
+      const variables = (await executor.subscribe({
+        query: 'subscription ($from: Int!) { countdown(from: $from) }',
+      })) as GraphQLResponse;
+
+      expect(syntax.errors?.[0]?.extensions?.code).toBe(ErrorCode.PARSE_ERROR);
+      expect(invalid.errors?.[0]?.extensions?.code).toBe(ErrorCode.VALIDATION_ERROR);
+      expect(variables.errors?.[0]?.extensions?.code).toBe(ErrorCode.BAD_REQUEST);
+    });
+
+    test('should leave a failing subscribe resolver uncoded', async () => {
+      const result = (await executor.subscribe({ query: 'subscription { failing }' })) as GraphQLResponse;
+
+      expect(result.errors?.[0]?.message).toBe('Subscribe failed');
+      expect(result.errors?.[0]?.path).toEqual(['failing']);
+      expect(result.errors?.[0]?.extensions?.code).toBeUndefined();
+    });
+  });
+
+  describe('operation selection errors', () => {
+    const compiled = new LeavenExecutor({ schema, rootValue, compilerOptions: {} });
+    const plain = new LeavenExecutor({ schema, rootValue });
+
+    for (const [label, executor] of [
+      ['without the compiler', plain],
+      ['with the compiler', compiled],
+    ] as const) {
+      test(`should report an unknown operation name as BAD_REQUEST ${label}`, async () => {
+        const result = await executor.execute({
+          query: 'query A { hello }',
+          operationName: 'B',
+        });
+
+        expect(result.response.data).toBeUndefined();
+        expect(result.response.errors).toEqual([
+          { message: 'Unknown operation named "B".', extensions: { code: ErrorCode.BAD_REQUEST } },
+        ]);
+      });
+
+      test(`should report a missing operation name as BAD_REQUEST ${label}`, async () => {
+        const result = await executor.execute({ query: 'query A { hello } query B { hello }' });
+
+        expect(result.response.errors).toEqual([
+          {
+            message: 'Must provide operation name if query contains multiple operations.',
+            extensions: { code: ErrorCode.BAD_REQUEST },
+          },
+        ]);
+      });
+    }
+
+    test('should report an unknown operation name on subscribe as BAD_REQUEST', async () => {
+      const result = await plain.subscribe({
+        query: 'subscription A { countdown(from: 1) }',
+        operationName: 'B',
+      });
+
+      expect(Symbol.asyncIterator in result).toBe(false);
+      expect((result as GraphQLResponse).errors?.[0]?.extensions?.code).toBe(ErrorCode.BAD_REQUEST);
+      expect((result as GraphQLResponse).errors?.[0]?.message).toBe(
+        'Unknown operation named "B".'
+      );
+    });
+
+    test('should escape a client operation name in the error text', async () => {
+      const result = await plain.execute({
+        query: 'query A { hello }',
+        operationName: 'Evil\r\nINFO forged',
+      });
+
+      expect(result.response.errors?.[0]?.message).toBe(
+        'Unknown operation named "Evil\\r\\nINFO forged".'
+      );
+    });
+
+    test('should not call onError for an operation selection error', async () => {
+      let called = false;
+      const hooked = new LeavenExecutor({
+        schema,
+        rootValue,
+        hooks: {
+          onError: () => {
+            called = true;
+          },
+        },
+      });
+
+      await hooked.execute({ query: 'query A { hello }', operationName: 'B' });
+
+      expect(called).toBe(false);
+    });
+  });
+
   describe('execute with depth limits', () => {
     test('should treat maxDepth: 0 as a limit that rejects everything', async () => {
       const zeroExecutor = new LeavenExecutor({ schema, rootValue, maxDepth: 0 });
@@ -365,6 +523,82 @@ describe('LeavenExecutor', () => {
         /exceeds maximum allowed depth/
       );
       expect(result.response.errors![0]?.extensions?.code).toBe('DEPTH_LIMIT');
+    });
+
+    test('should accept getIntrospectionQuery() under maxDepth 10 with maxIntrospectionDepth 20', async () => {
+      const executor = new LeavenExecutor({
+        schema,
+        rootValue,
+        maxDepth: 10,
+        maxIntrospectionDepth: 20,
+      });
+
+      const result = await executor.execute({ query: getIntrospectionQuery() });
+
+      expect(result.response.errors).toBeUndefined();
+      expect(result.response.data).toHaveProperty('__schema');
+    });
+
+    test('should reject getIntrospectionQuery() under maxIntrospectionDepth 5', async () => {
+      const executor = new LeavenExecutor({
+        schema,
+        rootValue,
+        maxDepth: 10,
+        maxIntrospectionDepth: 5,
+      });
+
+      const result = await executor.execute({ query: getIntrospectionQuery() });
+
+      expect(result.response.data).toBeUndefined();
+      expect(result.response.errors![0]?.extensions?.code).toBe(ErrorCode.DEPTH_LIMIT);
+      expect(result.response.errors![0]?.extensions?.limit).toBe('maxIntrospectionDepth');
+    });
+
+    test('should keep counting introspection against maxDepth when maxIntrospectionDepth is unset', async () => {
+      const executor = new LeavenExecutor({ schema, rootValue, maxDepth: 10 });
+
+      const result = await executor.execute({ query: getIntrospectionQuery() });
+
+      expect(result.response.errors![0]?.extensions?.code).toBe(ErrorCode.DEPTH_LIMIT);
+    });
+
+    test('should let maxIntrospectionDepth override parseOptions.maxIntrospectionDepth', async () => {
+      const executor = new LeavenExecutor({
+        schema,
+        rootValue,
+        maxDepth: 10,
+        maxIntrospectionDepth: 20,
+        parseOptions: { maxIntrospectionDepth: 1 },
+      });
+
+      const result = await executor.execute({ query: getIntrospectionQuery() });
+
+      expect(result.response.errors).toBeUndefined();
+    });
+
+    test('should not serve a document cached under a looser maxIntrospectionDepth', async () => {
+      const sharedCache = new DocumentCache();
+      const query = getIntrospectionQuery();
+      const permissive = new LeavenExecutor({
+        schema,
+        rootValue,
+        cache: sharedCache,
+        maxDepth: 10,
+        maxIntrospectionDepth: 20,
+      });
+      const strict = new LeavenExecutor({
+        schema,
+        rootValue,
+        cache: sharedCache,
+        maxDepth: 10,
+        maxIntrospectionDepth: 5,
+      });
+
+      expect((await permissive.execute({ query })).response.errors).toBeUndefined();
+
+      const denied = await strict.execute({ query });
+      expect(denied.response.data).toBeUndefined();
+      expect(denied.response.errors![0]?.extensions?.limit).toBe('maxIntrospectionDepth');
     });
 
     test('should honour parseOptions.maxDepth when no executor maxDepth is set', async () => {

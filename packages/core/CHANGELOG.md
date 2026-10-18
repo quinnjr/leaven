@@ -1,5 +1,42 @@
 # @leaven-graphql/core
 
+## 0.3.0
+
+### Minor Changes
+
+- 37f6299: Add `maxIntrospectionDepth` (on `ExecutorConfig` and `ParseOptions`). When set, paths that enter
+  `__schema` or `__type` at an operation root count against it instead of `maxDepth`, so
+  `getIntrospectionQuery()` (depth 15) passes under a typical `maxDepth: 10` while introspection
+  stays bounded. When unset nothing changes: introspection counts against `maxDepth`. Either limit
+  raises a `DepthLimitError` whose `extensions.limit` names the limit (only when
+  `maxIntrospectionDepth` is configured). The option is part of the document-cache fingerprint.
+  New `calculateQueryDepths(document)` returns `{ depth, introspectionDepth }`.
+
+### Patch Changes
+
+- 37f6299: Report a missing or unknown operation name as a client error. These used to surface as
+  `INTERNAL_ERROR` (with the compiler on) or with no code at all, so HTTP answered 500 and a
+  masking transport hid them as "An unexpected error occurred". The executor now rejects them
+  after validation with a `BAD_REQUEST` (400) error on every path (`execute`, `subscribe`, with
+  or without the compiler), and `parseRequest` and `CompiledQuery` throw the same `LeavenError`.
+
+  **Wording change:** the messages now match graphql-js: `Unknown operation named "x".`,
+  `Must provide operation name if query contains multiple operations.` and, for a document with
+  no operation, `Must provide an operation.` They replace `Operation "x" not found in document`,
+  `Operation "x" not found` and `No operation found in document`; code matching the old text must
+  match the new text or, better, `extensions.code`. The client-chosen name is still escaped.
+
+- 37f6299: Give request errors a client `ErrorCode`. graphql-js reports syntax, validation and
+  variable-coercion failures without `extensions.code`, so `@leaven-graphql/http` answered them
+  with 500 and, with `maskErrors`, replaced the message with "An unexpected error occurred" (the
+  same happened over the WebSocket transport). The executor now codes them, keeping their
+  `locations`: syntax errors and an exceeded `maxTokens` are `PARSE_ERROR`, validation errors
+  (including disabled introspection) are `VALIDATION_ERROR`, and variable-coercion errors are
+  `BAD_REQUEST` (applied before `formatExecutionError`). All three map to HTTP 400. Errors that
+  already carry a code, and resolver errors, are unchanged.
+- Updated dependencies [37f6299]
+  - @leaven-graphql/errors@0.3.0
+
 ## 0.2.3
 
 ### Patch Changes

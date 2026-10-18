@@ -13,11 +13,10 @@ import type {
   SelectionSetNode,
   FragmentDefinitionNode,
 } from 'graphql';
-import { Kind, getOperationAST } from 'graphql';
+import { Kind } from 'graphql';
 
-import { createVisitBudget } from './parser';
+import { createVisitBudget, selectOperation } from './parser';
 import type { OperationType, Variables } from './types';
-import { escapeLog } from './escape-log';
 
 /**
  * Options for query compilation
@@ -67,14 +66,8 @@ export class CompiledQuery<_TData = Record<string, unknown>> {
     this.schema = schema;
     this.document = document;
 
-    const operation = getOperationAST(document, operationName);
-    if (!operation) {
-      throw new Error(
-        operationName
-          ? `Operation "${escapeLog(operationName)}" not found`
-          : 'No operation found in document'
-      );
-    }
+    // A BAD_REQUEST LeavenError when the operation cannot be selected
+    const operation = selectOperation(document, operationName);
 
     this.operationType = operation.operation as OperationType;
     this.operationName = operation.name?.value ?? null;
