@@ -649,6 +649,78 @@ describe('createHandler', () => {
   });
 });
 
+describe('GET mutations', () => {
+  const mutationSchema = new GraphQLSchema({
+    query: new GraphQLObjectType({
+      name: 'Query',
+      fields: { hello: { type: GraphQLString, resolve: () => 'world' } },
+    }),
+    mutation: new GraphQLObjectType({
+      name: 'Mutation',
+      fields: { noop: { type: GraphQLString, resolve: () => 'done' } },
+    }),
+  });
+  const getUrl = (query: string, extra = ''): string =>
+    'http://x/graphql?query=' + encodeURIComponent(query) + extra;
+
+  test('should reject a mutation sent over GET with 405 and Allow: POST', async () => {
+    const handler = createHandler({ schema: mutationSchema });
+    const res = await handler(new Request(getUrl('mutation { noop }')));
+    expect(res.status).toBe(405);
+    expect(res.headers.get('allow')).toBe('POST');
+    const body = await res.json();
+    expect(body.errors[0].message).toBe('Mutations can only be sent with POST');
+  });
+
+  test('should keep CORS headers on the 405 response', async () => {
+    const handler = createHandler({ schema: mutationSchema, cors: true });
+    const res = await handler(
+      new Request(getUrl('mutation { noop }'), { headers: { Origin: 'http://example.com' } })
+    );
+    expect(res.status).toBe(405);
+    expect(res.headers.get('access-control-allow-origin')).not.toBeNull();
+  });
+
+  test('should select the named operation when deciding', async () => {
+    const handler = createHandler({ schema: mutationSchema });
+    const doc = 'query Q { hello } mutation M { noop }';
+    const q = await handler(new Request(getUrl(doc, '&operationName=Q')));
+    expect(q.status).toBe(200);
+    const m = await handler(new Request(getUrl(doc, '&operationName=M')));
+    expect(m.status).toBe(405);
+  });
+
+  test('should not run the context factory for a rejected GET mutation', async () => {
+    let calls = 0;
+    const handler = createHandler({
+      schema: mutationSchema,
+      context: () => {
+        calls++;
+        return {};
+      },
+    });
+    const res = await handler(new Request(getUrl('mutation { noop }')));
+    expect(res.status).toBe(405);
+    expect(calls).toBe(0);
+  });
+
+  test('should still execute a mutation sent with POST', async () => {
+    const handler = createHandler({ schema: mutationSchema });
+    const res = await handler(postRequest(JSON.stringify({ query: 'mutation { noop }' })));
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toEqual({ noop: 'done' });
+  });
+
+  test('should let a GET query with a syntax error reach execution and report it', async () => {
+    const handler = createHandler({ schema: mutationSchema });
+    const res = await handler(new Request(getUrl('{ hello')));
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.errors[0].message).toContain('Syntax Error');
+    expect(body.errors[0].extensions.code).toBe('PARSE_ERROR');
+  });
+});
+
 describe('createBunHandler', () => {
   test('should behave like createHandler', async () => {
     const handler = createBunHandler({ schema });

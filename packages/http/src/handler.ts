@@ -5,7 +5,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import type { GraphQLSchema } from 'graphql';
+import { getOperationAST, OperationTypeNode, type GraphQLSchema } from 'graphql';
 import { LeavenExecutor, type ExecutorConfig, type GraphQLRequest } from '@leaven-graphql/core';
 import { createRequestContext, type RequestContextConfig } from '@leaven-graphql/context';
 import {
@@ -158,6 +158,24 @@ async function readBodyWithLimit(
 }
 
 /**
+ * Determine the operation type a request would execute.
+ *
+ * Returns `undefined` on a parse failure or an ambiguous operation, so that
+ * execution reports the real error.
+ */
+async function operationTypeOf(
+  executor: LeavenExecutor,
+  request: GraphQLRequest
+): Promise<OperationTypeNode | undefined> {
+  try {
+    const document = await executor.parse(request.query);
+    return getOperationAST(document, request.operationName ?? undefined)?.operation;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Create a GraphQL HTTP handler for Bun
  */
 export function createHandler<TContext = unknown>(
@@ -296,6 +314,23 @@ export function createHandler<TContext = unknown>(
       }
 
       const graphqlRequest = validation.request!;
+
+      // Mutations are not safe over GET (GraphQL over HTTP spec); reject
+      // before any per-request work such as the context factory runs.
+      if (
+        method === 'GET' &&
+        (await operationTypeOf(executor, graphqlRequest)) === OperationTypeNode.MUTATION
+      ) {
+        return buildErrorResponse(
+          'Mutations can only be sent with POST',
+          405,
+          'BAD_REQUEST',
+          {
+            ...responseOptions,
+            headers: { ...responseOptions.headers, Allow: 'POST' },
+          }
+        );
+      }
 
       // Build context
       let context: TContext | undefined;
