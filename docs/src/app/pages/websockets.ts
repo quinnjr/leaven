@@ -144,8 +144,8 @@ import { SeoService } from '../services/seo.service';
           subscriptions on one page call for HTTP/2.
         </p>
         <p class="text-zinc-400 mb-4">
-          Only request errors (no <code class="text-green-400">data</code>, and every error coded as a
-          pre-execution rejection such as <code class="text-green-400">VALIDATION_ERROR</code>; see
+          Only request errors (no <code class="text-green-400">data</code>, and rejected by the executor
+          before any resolver ran, such as a validation error; see
           <code class="text-green-400">isRequestError</code>) are answered as non-200 JSON.
           Execution errors are streamed, because the graphql-sse client retries every non-200 response
           (<code class="text-green-400">retryAttempts</code>, default 5), and a retried mutation would run again.
@@ -619,9 +619,9 @@ export async function handleGraphQL(request: Request): Promise<Response> {
       ? await executor.subscribe(graphqlRequest, context)
       : (await executor.execute(graphqlRequest, context)).response;
 
-  // Only a rejection before anything ran (no data, every error coded as a
-  // pre-execution rejection) is answered as JSON. Everything else is streamed,
-  // or the client's retries would run its resolvers again.
+  // Only a result the executor rejected before running anything is answered as
+  // JSON. Check the executor's own object: the mark does not survive a copy.
+  // Everything else is streamed, or the client's retries would run it again.
   if (!isSubscriptionIterator(source) && isRequestError(source)) {
     return json(formatResultErrors(source, masking));
   }

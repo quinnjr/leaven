@@ -37,16 +37,18 @@ single `next` event followed by `complete`. Mutations are only accepted over
 `POST`: a `GET` mutation is rejected with `405` and `Allow: POST`.
 
 Only a *request error* is answered as a plain JSON response with the usual
-status code rather than as a stream: one rejected before anything ran, with no
-`data` and every error coded as a pre-execution rejection (`REQUEST_ERROR_CODES`:
-`PARSE_ERROR`, `VALIDATION_ERROR`, `COMPLEXITY_LIMIT`, `DEPTH_LIMIT`,
-`BAD_REQUEST`, `PERSISTED_QUERY_NOT_FOUND`, `PERSISTED_QUERY_INVALID`).
-Everything else is streamed as `200` `next` + `complete`, including a result
-with `data: null`, an error raised by a resolver or by a subscribe resolver at
-subscription start (an `AuthenticationError`, for example), and an uncoded
-failure such as a throwing `onExecuted` hook. The client receives those as a
-result carrying `errors`. The list is an allowlist on purpose: streaming is the
-safe default, because a stream is never retried.
+status code rather than as a stream: a result with no `data` that the executor
+itself rejected before running any resolver (a syntax error, a parser limit,
+validation, complexity, operation selection or variable coercion). The executor
+marks those responses, and `isRequestError` checks the mark
+(`isRequestRejection` from `@leaven-graphql/core`), so the decision is
+structural rather than by error code. Everything else is streamed as `200`
+`next` + `complete`, including a result with `data: null`, and any error raised
+after execution started, whatever its code: by a resolver, by a subscribe
+resolver at subscription start (an `AuthenticationError` or a
+`ValidationError`, for example), or by an `onExecuted` hook. The client receives
+those as a result carrying `errors`. Streaming is the safe default, because a
+stream is never retried.
 
 ### Retries
 
@@ -166,9 +168,9 @@ export async function handleGraphQL(request: Request): Promise<Response> {
       ? await executor.subscribe(graphqlRequest, context)
       : (await executor.execute(graphqlRequest, context)).response;
 
-  // Only a rejection before anything ran (no data, every error coded as a
-  // pre-execution rejection) is answered as JSON. Everything else is streamed,
-  // or the client's retries would run its resolvers again.
+  // Only a result the executor rejected before running anything is answered as
+  // JSON. Check the executor's own object: the mark does not survive a copy.
+  // Everything else is streamed, or the client's retries would run it again.
   if (!isSubscriptionIterator(source) && isRequestError(source)) {
     return json(formatResultErrors(source, masking));
   }
@@ -200,7 +202,7 @@ to `formatResult`.
 | `acceptsEventStream(request)` | Whether the request `Accept`s `text/event-stream` |
 | `isSubscriptionIterator(value)` | Distinguish an iterator from a single response |
 | `formatResultErrors(result, options?)` | Format (mask) the already-formatted errors of an executor result |
-| `isRequestError(result)`, `REQUEST_ERROR_CODES` | Whether a single result was rejected before execution, and the codes that count |
+| `isRequestError(result)` | Whether a single executor result was rejected before execution (check the executor's own object, not a copy) |
 | `formatSSEEvent`, `formatNextEvent`, `formatCompleteEvent` | Event encoders |
 | `SSE_CONTENT_TYPE`, `SSE_HEADERS`, `SSE_KEEP_ALIVE` | Protocol constants |
 | `DEFAULT_KEEP_ALIVE_INTERVAL` | `8000` ms |

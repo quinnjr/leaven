@@ -218,7 +218,9 @@ function formatResponseErrors<TData>(
  * Subscriptions go through `subscribe`, everything else through `execute`.
  * Returns the source to stream, or the single response to answer as JSON
  * when it is a request error (`isRequestError` from `@leaven-graphql/sse`:
- * no data, and every error coded as a pre-execution rejection). The rule applies
+ * no data, and marked by the executor as rejected before execution). The
+ * check runs on the executor's own object, before `formatResponseErrors`
+ * clones it, because the mark is identity-based. The rule applies
  * to an `execute()` response and to a `subscribe()` result that is not an
  * iterator alike.
  */

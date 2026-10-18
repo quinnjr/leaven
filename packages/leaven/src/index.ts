@@ -84,7 +84,6 @@ export {
   acceptsEventStream,
   formatResultErrors,
   isRequestError,
-  REQUEST_ERROR_CODES,
 } from '@leaven-graphql/sse';
 
 export {

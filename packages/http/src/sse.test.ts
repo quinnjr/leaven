@@ -14,18 +14,26 @@ import {
   GraphQLString,
 } from 'graphql';
 import { createClient, NetworkError, type Client, type ClientOptions } from 'graphql-sse';
-import { AuthenticationError } from '@leaven-graphql/errors';
+import { AuthenticationError, ValidationError } from '@leaven-graphql/errors';
 import { createServer, type LeavenServer, type ServerConfig } from './server';
 
 let finished = false;
 let chargeCalls = 0;
 let guardedCalls = 0;
 let recordCalls = 0;
+let rejectedCalls = 0;
 
 const schema = new GraphQLSchema({
   query: new GraphQLObjectType({
     name: 'Query',
-    fields: { hello: { type: GraphQLString, resolve: () => 'world' } },
+    fields: {
+      hello: { type: GraphQLString, resolve: () => 'world' },
+      echo: {
+        type: GraphQLInt,
+        args: { n: { type: new GraphQLNonNull(GraphQLInt) } },
+        resolve: (_root, args: { n: number }) => args.n,
+      },
+    },
   }),
   mutation: new GraphQLObjectType({
     name: 'Mutation',
@@ -68,6 +76,13 @@ const schema = new GraphQLSchema({
           } finally {
             finished = true;
           }
+        },
+      },
+      rejected: {
+        type: GraphQLInt,
+        subscribe: () => {
+          rejectedCalls++;
+          throw new ValidationError('Filter is invalid');
         },
       },
       guarded: {
@@ -168,19 +183,53 @@ describe('GraphQL over SSE', () => {
         }
         expect(recordCalls).toBe(1);
         expect(results).toHaveLength(1);
-        expect(results[0]!.errors?.length).toBe(1);
+        expect(results[0]!.errors?.[0]?.message).toBe('audit rejected the result');
       },
       retrying,
       {
         executor: {
           hooks: {
             onExecuted: () => {
-              throw new Error('audit log down');
+              throw new ValidationError('audit rejected the result');
             },
           },
         },
       }
     );
+  });
+
+  test('should deliver a subscribe-time ValidationError in-stream and subscribe once', async () => {
+    rejectedCalls = 0;
+    await withClient(async (client) => {
+      const results: Array<{
+        errors?: ReadonlyArray<{ message: string; extensions?: Record<string, unknown> }>;
+      }> = [];
+      for await (const result of client.iterate({ query: 'subscription { rejected }' })) {
+        results.push(result);
+      }
+      expect(rejectedCalls).toBe(1);
+      expect(results).toHaveLength(1);
+      expect(results[0]!.errors?.[0]?.message).toBe('Filter is invalid');
+      expect(results[0]!.errors?.[0]?.extensions?.code).toBe('VALIDATION_ERROR');
+    }, retrying);
+  });
+
+  test.each([
+    ['a parse error', { query: '{ hello' }],
+    ['a variable coercion error', { query: 'query ($n: Int!) { echo(n: $n) }', variables: { n: 'x' } }],
+  ])('should surface %s to the client as a 400 rejection', async (_label, payload) => {
+    await withClient(async (client) => {
+      let caught: unknown;
+      try {
+        for await (const _result of client.iterate(payload)) {
+          // unreachable
+        }
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(NetworkError);
+      expect((caught as NetworkError<Response>).response?.status).toBe(400);
+    });
   });
 
   test('should deliver a subscribe-time AuthenticationError as an event, not a NetworkError', async () => {
@@ -311,14 +360,26 @@ describe('GraphQL over SSE', () => {
 
   test('should never disable the idle timeout for a method other than GET or POST', async () => {
     await withClient(async (_client, server, port) => {
+      // Answer every method with an event stream, so only the method gate
+      // in LeavenServer decides whether the timeout is touched
+      (server as unknown as { handler: (request: Request) => Promise<Response> }).handler =
+        async () =>
+          new Response('event: complete\ndata:\n\n', {
+            headers: { 'Content-Type': 'text/event-stream; charset=utf-8' },
+          });
       const calls = recordTimeouts(server);
-      const res = await fetch(`http://localhost:${port}/graphql`, {
-        method: 'PUT',
-        headers: sseHeaders,
-        body: JSON.stringify({ query: '{ hello }' }),
-      });
-      await res.text();
+      const url = `http://localhost:${port}/graphql`;
+
+      const put = await fetch(url, { method: 'PUT', headers: sseHeaders, body: '{}' });
+      expect(put.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
+      await put.text();
       expect(calls).toHaveLength(0);
+
+      // Control: the same stream answered to a POST does disable it
+      const post = await fetch(url, { method: 'POST', headers: sseHeaders, body: '{}' });
+      await post.text();
+      await waitFor(() => calls.length >= 2);
+      expect(calls.map(([, seconds]) => seconds)).toEqual([0, 10]);
     });
   });
 });

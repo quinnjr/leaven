@@ -103,10 +103,11 @@ Set `sse` to serve GraphQL over SSE (graphql-sse, distinct connections mode) to
 requests that `Accept` `text/event-stream`. It is off by default; with `sse`
 unset behaviour is unchanged. Subscriptions stream results, and queries and
 mutations answer with one `next` event then `complete`. Only request errors
-(no `data`, and every error coded as a pre-execution rejection such as
-`PARSE_ERROR`, `VALIDATION_ERROR` or `BAD_REQUEST`; see `isRequestError` in
-`@leaven-graphql/sse`) get a plain JSON response. Everything else, `data: null`
-and uncoded failures included, is streamed, because the `graphql-sse` client
+(no `data`, and rejected by the executor before any resolver ran: a syntax,
+validation, complexity, depth, operation-selection or variable-coercion error;
+see `isRequestError` in `@leaven-graphql/sse`) get a plain JSON response.
+Everything else, `data: null` and coded errors raised after execution started
+included, is streamed, because the `graphql-sse` client
 retries non-`200` responses. `LeavenServer` disables Bun's idle timeout while an event
 stream is open and restores it when the stream closes. See
 [`@leaven-graphql/sse`](../sse) for the client and the low-level API.

@@ -6,55 +6,53 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { ErrorCode } from '@leaven-graphql/errors';
-import { REQUEST_ERROR_CODES, isRequestError } from './request-error';
+import { GraphQLObjectType, GraphQLSchema, GraphQLString } from 'graphql';
+import { LeavenExecutor } from '@leaven-graphql/core';
+import { ValidationError } from '@leaven-graphql/errors';
+import { isRequestError } from './request-error';
 
-const coded = (code: string): { message: string; extensions: { code: string } } => ({
-  message: 'x',
-  extensions: { code },
+const executor = new LeavenExecutor({
+  schema: new GraphQLSchema({
+    query: new GraphQLObjectType({
+      name: 'Query',
+      fields: {
+        hello: { type: GraphQLString, resolve: () => 'world' },
+        bad: {
+          type: GraphQLString,
+          resolve: () => {
+            throw new ValidationError('bad');
+          },
+        },
+      },
+    }),
+  }),
 });
 
 describe('isRequestError', () => {
-  test.each([...REQUEST_ERROR_CODES])('should treat a data-less %s rejection as a request error', (code) => {
-    expect(isRequestError({ errors: [coded(code)] })).toBe(true);
+  test('should be true for a response the executor rejected before execution', async () => {
+    const { response } = await executor.execute({ query: '{ nope }' });
+    expect(isRequestError(response)).toBe(true);
   });
 
-  test('should allow exactly the pre-execution rejection codes', () => {
-    expect([...REQUEST_ERROR_CODES].sort()).toEqual(
-      [
-        ErrorCode.BAD_REQUEST,
-        ErrorCode.COMPLEXITY_LIMIT,
-        ErrorCode.DEPTH_LIMIT,
-        ErrorCode.PARSE_ERROR,
-        ErrorCode.PERSISTED_QUERY_INVALID,
-        ErrorCode.PERSISTED_QUERY_NOT_FOUND,
-        ErrorCode.VALIDATION_ERROR,
-      ].sort()
-    );
+  test('should be false for a copy of a rejected response', async () => {
+    const { response } = await executor.execute({ query: '{ nope }' });
+    expect(isRequestError({ ...response })).toBe(false);
   });
 
-  test('should stream a data-less error whose code is not a rejection code', () => {
-    expect(isRequestError({ errors: [coded('INTERNAL_ERROR')] })).toBe(false);
-    expect(isRequestError({ errors: [coded('UNAUTHENTICATED')] })).toBe(false);
-  });
-
-  test('should stream a data-less error without a code', () => {
-    expect(isRequestError({ errors: [{ message: 'hook failed' }] })).toBe(false);
-  });
-
-  test('should stream when any one error is not a rejection', () => {
+  test('should be false for a look-alike response the executor did not produce', () => {
     expect(
-      isRequestError({ errors: [coded('VALIDATION_ERROR'), coded('INTERNAL_ERROR')] })
+      isRequestError({ errors: [{ message: 'x', extensions: { code: 'VALIDATION_ERROR' } }] })
     ).toBe(false);
   });
 
-  test('should stream a result that has data, null included', () => {
-    expect(isRequestError({ data: null, errors: [coded('BAD_REQUEST')] })).toBe(false);
-    expect(isRequestError({ data: { a: 1 }, errors: [coded('VALIDATION_ERROR')] })).toBe(false);
+  test('should be false for a coded resolver error', async () => {
+    const { response } = await executor.execute({ query: '{ bad }' });
+    expect(response.errors?.[0]?.extensions?.code).toBe('VALIDATION_ERROR');
+    expect(isRequestError(response)).toBe(false);
   });
 
-  test('should stream a result with no errors', () => {
-    expect(isRequestError({})).toBe(false);
-    expect(isRequestError({ errors: [] })).toBe(false);
+  test('should be false for a successful response', async () => {
+    const { response } = await executor.execute({ query: '{ hello }' });
+    expect(isRequestError(response)).toBe(false);
   });
 });
