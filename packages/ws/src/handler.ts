@@ -8,6 +8,12 @@
 import { OperationTypeNode, getOperationAST, type DocumentNode, type GraphQLSchema } from 'graphql';
 import type { ServerWebSocket } from 'bun';
 import type { GraphQLRequest } from '@leaven-graphql/core';
+import {
+  ErrorCode,
+  LeavenError,
+  formatError,
+  type ErrorMaskingOptions,
+} from '@leaven-graphql/errors';
 
 import { SubscriptionManager, type SubscriptionManagerConfig } from './manager';
 import type { WebSocketLogger } from './logger';
@@ -66,6 +72,20 @@ export interface WebSocketHandlerConfig<TContext = unknown> {
    * `subscriptionManager.logger` is set.
    */
   logger?: WebSocketLogger;
+  /**
+   * Error formatting options, as for the HTTP transport's `errorFormatting`.
+   *
+   * Every error sent in an `error` or `next` frame goes through
+   * `formatError` from `@leaven-graphql/errors`: one thrown by `onSubscribe`,
+   * the context factory or a source stream always (so its `extensions.code`
+   * is kept, and anything uncoded is reported as `INTERNAL_ERROR`); execution
+   * errors the executor already serialised only when this is set. Unexpected
+   * errors are masked only when `maskErrors` is `true`, so set it in
+   * production: otherwise a throwing context factory sends its raw message
+   * (a DSN, a connection failure) to the client. Also passed to the
+   * subscription manager unless `subscriptionManager.errorFormatting` is set.
+   */
+  errorFormatting?: ErrorMaskingOptions;
   /** Called when a connection is initialized */
   onConnect?: (
     socket: ServerWebSocket<WebSocketContext>,
@@ -128,6 +148,7 @@ export class WebSocketHandler<TContext = unknown> {
   private readonly onSubscribe?: WebSocketHandlerConfig<TContext>['onSubscribe'];
   private readonly onComplete?: WebSocketHandlerConfig<TContext>['onComplete'];
   private readonly logger: WebSocketLogger;
+  private readonly errorFormatting?: ErrorMaskingOptions;
 
   private readonly initTimeouts: Map<string, ReturnType<typeof setTimeout>>;
   private readonly keepAliveTimers: Map<string, ReturnType<typeof setInterval>>;
@@ -139,9 +160,11 @@ export class WebSocketHandler<TContext = unknown> {
     this.connectionInitTimeout = config.connectionInitTimeout ?? 3000;
     this.keepAliveInterval = config.keepAliveInterval ?? 12000;
     this.logger = config.logger ?? console;
+    this.errorFormatting = config.errorFormatting;
     this.subscriptionManager = new SubscriptionManager({
       schema: config.schema,
       logger: this.logger,
+      errorFormatting: config.errorFormatting,
       ...config.subscriptionManager,
     });
     this.onConnect = config.onConnect;
@@ -367,10 +390,12 @@ export class WebSocketHandler<TContext = unknown> {
     // context factory have run, so without this a burst of frames would run
     // all of that work before any of them hit the manager's limit.
     if (socket.data.subscriptions.size >= this.subscriptionManager.subscriptionLimit) {
+      const limitError = new LeavenError(
+        'Maximum subscriptions per connection reached',
+        ErrorCode.BAD_REQUEST
+      );
       socket.send(
-        formatMessage(
-          createErrorMessage(id, [{ message: 'Maximum subscriptions per connection reached' }])
-        )
+        formatMessage(createErrorMessage(id, [formatError(limitError, this.errorFormatting)]))
       );
       return;
     }
@@ -468,9 +493,13 @@ export class WebSocketHandler<TContext = unknown> {
       settle();
       // Per graphql-ws, operation setup failures are reported as an Error
       // message on the offending ID — the connection (and its other
-      // subscriptions) must stay open
-      const errorText = error instanceof Error ? error.message : 'Subscription failed';
-      socket.send(formatMessage(createErrorMessage(id, [{ message: errorText }])));
+      // subscriptions) must stay open. Formatted like HTTP formats an error
+      // thrown outside execution: a throwing onSubscribe hook or context
+      // factory must not send its raw text (a DSN, a connection failure) to
+      // the client when masking is on, and a coded error keeps its code.
+      socket.send(
+        formatMessage(createErrorMessage(id, [formatError(error, this.errorFormatting)]))
+      );
       socket.data.subscriptions.delete(id);
       // Terminal, like the other three paths: the id is finished, so the
       // hook fires here too rather than only for operations that reached

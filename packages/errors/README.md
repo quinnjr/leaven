@@ -362,7 +362,8 @@ const errors = result.response.errors?.map((e) =>
 );
 ```
 
-`@leaven-graphql/http` does this when `errorFormatting` is configured.
+`@leaven-graphql/http` and `@leaven-graphql/ws` both do this when `errorFormatting` is
+configured.
 
 ### `isLeavenError(error: unknown): error is LeavenError`
 

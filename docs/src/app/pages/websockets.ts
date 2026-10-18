@@ -82,6 +82,21 @@ import { SeoService } from '../services/seo.service';
         <app-code-block [code]="authCode" title="auth.ts" />
       </section>
 
+      <!-- Error masking -->
+      <section class="mb-12">
+        <h2 class="text-2xl font-semibold text-white mb-4">Error Formatting</h2>
+        <p class="text-zinc-400 mb-4">
+          <code class="text-green-400">errorFormatting</code> takes the same options as the HTTP
+          transport. Errors thrown by <code class="text-green-400">onSubscribe</code>, the context
+          factory or a source stream always go through <code class="text-green-400">formatError</code>,
+          so coded errors keep their <code class="text-green-400">extensions.code</code>; execution
+          errors in <code class="text-green-400">next</code> payloads are re-formatted when the option
+          is set. Turn on <code class="text-green-400">maskErrors</code> in production so a failing
+          context factory never sends its raw message to the client:
+        </p>
+        <app-code-block [code]="errorFormattingCode" title="masking.ts" />
+      </section>
+
       <!-- Protocol Messages -->
       <section class="mb-12">
         <h2 class="text-2xl font-semibold text-white mb-4">Protocol Messages</h2>
@@ -377,6 +392,16 @@ const websocket = createWebSocketHandler({
   onDisconnect: (socket) => {
     console.log('closed', socket.data.connectionId);
   },
+});`;
+
+  errorFormattingCode = `import { createWebSocketHandler } from '@leaven-graphql/ws';
+
+const websocket = createWebSocketHandler({
+  schema,
+  context: async () => ({ db: await getDatabase() }),
+  // Unexpected errors become "An unexpected error occurred"; Leaven errors and
+  // errors with a known code (FORBIDDEN, UNAUTHENTICATED, ...) pass through
+  errorFormatting: { maskErrors: process.env.NODE_ENV === 'production' },
 });`;
 
   protocolCode = `import {
