@@ -62,6 +62,10 @@ function defaultFormatError(error: unknown): GraphQLFormattedError {
   return formatLeavenError(error, { maskErrors: true });
 }
 
+const FALLBACK_ERROR: GraphQLFormattedError = Object.freeze({
+  message: 'An unexpected error occurred',
+});
+
 /**
  * Encode an executor result as a graphql-sse event stream
  *
@@ -70,6 +74,9 @@ function defaultFormatError(error: unknown): GraphQLFormattedError {
  * carrying `{ errors: [formatError(error)] }`, then the stream completes. An
  * abort, a consumer cancel, or a failure to format or enqueue ends the stream
  * early and calls `iterator.return()`.
+ *
+ * The stream honours backpressure: the iterator is not advanced, and
+ * keep-alive ticks are skipped, while the consumer's queue is full.
  *
  * @param source - A single response or a subscription iterator
  * @param options - Stream options
@@ -90,8 +97,27 @@ export function createEventStream<TData = Record<string, unknown>>(
   const encoder = new TextEncoder();
   let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
+  let resumePump: (() => void) | undefined;
   let closed = false;
   let iteratorFinished = false;
+
+  const hasDemand = (): boolean => (controller?.desiredSize ?? 0) > 0;
+
+  /** Release a pump waiting for demand (called by pull and close) */
+  const wake = (): void => {
+    const resume = resumePump;
+    resumePump = undefined;
+    resume?.();
+  };
+
+  const waitForDemand = (): Promise<void> => {
+    if (closed || hasDemand()) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      resumePump = resolve;
+    });
+  };
 
   const close = (): void => {
     if (closed) {
@@ -102,6 +128,7 @@ export function createEventStream<TData = Record<string, unknown>>(
       clearInterval(timer);
     }
     signal?.removeEventListener('abort', close);
+    wake();
     if (iterator && !iteratorFinished) {
       try {
         void Promise.resolve(iterator.return?.()).catch(() => undefined);
@@ -114,7 +141,11 @@ export function createEventStream<TData = Record<string, unknown>>(
     } catch {
       // Already closed or cancelled by the consumer
     }
-    onClose?.();
+    try {
+      onClose?.();
+    } catch {
+      // close() runs from abort listeners, timers and cancel(); user code must not escape
+    }
   };
 
   const send = (chunk: string): void => {
@@ -124,18 +155,31 @@ export function createEventStream<TData = Record<string, unknown>>(
     try {
       controller?.enqueue(encoder.encode(chunk));
     } catch {
+      // enqueue throws if the consumer tore the stream down before close() ran
       close();
     }
   };
 
   const sendError = (error: unknown): void => {
-    send(formatNextEvent({ errors: [formatError(error)] }));
+    if (closed) {
+      return;
+    }
+    let formatted: GraphQLFormattedError;
+    try {
+      formatted = formatError(error);
+    } catch {
+      formatted = FALLBACK_ERROR;
+    }
+    send(formatNextEvent({ errors: [formatted] }));
   };
 
-  /** Send one result; false when the stream must complete now */
+  /** Send one result; false when the stream must complete now. Callers check `closed` first. */
   const emit = async (result: GraphQLResponse<TData>): Promise<boolean> => {
     try {
       const formatted = await formatResult(result);
+      if (closed) {
+        return false;
+      }
       send(formatNextEvent(formatted));
     } catch (error) {
       sendError(error);
@@ -156,6 +200,10 @@ export function createEventStream<TData = Record<string, unknown>>(
       return;
     }
     for (;;) {
+      await waitForDemand();
+      if (closed) {
+        return;
+      }
       let step: IteratorResult<GraphQLResponse<TData>>;
       try {
         step = await iterator.next();
@@ -189,9 +237,16 @@ export function createEventStream<TData = Record<string, unknown>>(
       }
       signal?.addEventListener('abort', close, { once: true });
       if (keepAliveInterval > 0) {
-        timer = setInterval(() => send(SSE_KEEP_ALIVE), keepAliveInterval);
+        timer = setInterval(() => {
+          if (hasDemand()) {
+            send(SSE_KEEP_ALIVE);
+          }
+        }, keepAliveInterval);
       }
       void pump().catch(close);
+    },
+    pull(): void {
+      wake();
     },
     cancel(): void {
       close();
@@ -211,8 +266,12 @@ export function createEventStreamResponse<TData = Record<string, unknown>>(
   options: EventStreamResponseOptions<TData> = {}
 ): Response {
   const { headers, ...streamOptions } = options;
+  const responseHeaders = new Headers(SSE_HEADERS);
+  for (const [name, value] of Object.entries(headers ?? {})) {
+    responseHeaders.set(name, value);
+  }
   return new Response(createEventStream(source, streamOptions), {
     status: 200,
-    headers: { ...SSE_HEADERS, ...headers },
+    headers: responseHeaders,
   });
 }
