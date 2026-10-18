@@ -427,6 +427,15 @@ import { LeavenModule, SubscriptionManager } from '@leaven-graphql/nestjs';
 export class AppModule {}
 ```
 
+Errors sent over the WebSocket get the same formatting as HTTP responses. An
+error thrown by the `context`, `onSubscribe` or `onOperation` hook, or by a
+subscription's source stream, goes through `LeavenDriver.formatThrownError`:
+unexpected errors are masked in production (unless
+`includeStacktraceInErrorResponses` is set), Leaven errors and coded
+`GraphQLError`s keep their message and `extensions.code`, and `formatError`
+runs last. Execution errors inside each `next` payload go through
+`formatError` too.
+
 #### Wiring the WebSocket transport
 
 Two things are yours to do: **register the upgrade route**, and **hand each
@@ -599,7 +608,7 @@ export class SchemaService {
 | `parseOptions` | `ParseOptions` | `{ maxTokens: 10000 }` | Parser limits (core executor shape). Applied by the executor, the guard query analysis and the subscription transport's operation-type detection, so an oversized document is never parsed in full; over the limit it is rejected through the executor's normal error response. Set `maxTokens: Infinity` to opt out |
 | `metrics` | `boolean` | `false` | Enable execution metrics |
 | `context` | `ContextFactory` | - | Custom context factory |
-| `formatError` | `FormatErrorFn` | - | Error formatting function |
+| `formatError` | `FormatErrorFn` | - | Final pass over every error sent to a client: HTTP responses, and the `next` and `error` frames of the WebSocket transport |
 | `publicUrl` | `string` | `http://localhost` | Canonical origin (scheme + authority) used to build `request.url` for the context factory. The `Host` header is client-controlled, so it is not trusted: set this when a factory resolves tenancy or issues redirects from `request.url` |
 | `cors` | `boolean \| CorsOptions` | *unset — no CORS headers* | CORS handling. **Opt-in:** while unset the endpoint emits no `Access-Control-*` headers and delegates `OPTIONS` preflights to the next handler. `true` (or an options object without `origin`) enables `Access-Control-Allow-Origin: *`; set `origin` to narrow it. `false` is equivalent to unset |
 | `includeStacktraceInErrorResponses` | `boolean` | `false` | Include stack traces in errors (also suppresses production masking — honored in every environment, not just development) |
