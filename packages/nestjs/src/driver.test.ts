@@ -199,6 +199,73 @@ describe('LeavenDriver', () => {
       await formattedDriver.onModuleDestroy();
     });
 
+    test('should format the errors of every subscription event with the same formatter', async () => {
+      const formatError = (error: { message: string }): { message: string } => ({
+        ...error,
+        message: `Formatted: ${error.message}`,
+      });
+
+      const formattedDriver = new LeavenDriver({
+        schema: new GraphQLSchema({
+          query: new GraphQLObjectType({
+            name: 'Query',
+            fields: { hello: { type: GraphQLString, resolve: () => 'world' } },
+          }),
+          subscription: new GraphQLObjectType({
+            name: 'Subscription',
+            fields: {
+              poisoned: {
+                type: GraphQLString,
+                subscribe: async function* (): AsyncGenerator<{ poisoned: string }> {
+                  yield { poisoned: 'a' };
+                  yield { poisoned: 'b' };
+                },
+                resolve: (payload: { poisoned: string }) => {
+                  if (payload.poisoned === 'a') {
+                    throw new Error('internal detail');
+                  }
+                  return payload.poisoned;
+                },
+              },
+            },
+          }),
+        }),
+        formatError,
+      });
+      await formattedDriver.onModuleInit();
+
+      const result = await formattedDriver.subscribe('subscription { poisoned }');
+      expect(Symbol.asyncIterator in result).toBe(true);
+
+      const events: Array<{ data?: unknown; errors?: readonly { message: string }[] }> = [];
+      for await (const event of result as AsyncIterableIterator<{
+        data?: unknown;
+        errors?: readonly { message: string }[];
+      }>) {
+        events.push(event);
+      }
+
+      expect(events[0]?.errors?.[0]?.message).toBe('Formatted: internal detail');
+      expect(events[1]?.errors).toBeUndefined();
+      expect(events[1]?.data).toEqual({ poisoned: 'b' });
+      await formattedDriver.onModuleDestroy();
+    });
+
+    test('should expose formatThrownError with the masking rules of execute', async () => {
+      const originalEnv = process.env.NODE_ENV;
+      process.env.NODE_ENV = 'production';
+      try {
+        const plain = new LeavenDriver({});
+        expect(plain.formatThrownError(new Error('dsn leaked'))).toEqual({
+          message: 'An unexpected error occurred',
+          extensions: { code: 'INTERNAL_ERROR' },
+        });
+        expect(plain.formatThrownError(new AuthenticationError('Log in')).message).toBe('Log in');
+      } finally {
+        process.env.NODE_ENV = originalEnv;
+      }
+    });
+
     test('should invoke formatError with exactly one argument', async () => {
       const receivedArgCounts: number[] = [];
       const formatError = ((...args: unknown[]) => {

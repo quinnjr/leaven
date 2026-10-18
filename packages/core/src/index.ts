@@ -25,6 +25,7 @@ export {
   parseDocument,
   validateDocument,
   calculateQueryDepth,
+  calculateQueryDepths,
   parseRequest,
   countFields,
   getOperationNames,
@@ -32,7 +33,7 @@ export {
   createVisitBudget,
   MAX_ANALYSIS_VISITS,
 } from './parser';
-export type { ParseOptions, ValidationResult } from './parser';
+export type { ParseOptions, QueryDepths, ValidationResult } from './parser';
 
 export { compileQuery, CompiledQuery } from './compiler';
 export type { CompilerOptions, CompiledField, CompiledFragment } from './compiler';

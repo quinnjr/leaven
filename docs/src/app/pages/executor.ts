@@ -167,6 +167,8 @@ console.log(result.response.data);
   compilerOptions?: CompilerOptions;  // Enables query compilation
   introspection?: boolean;            // Enable introspection queries (default: true)
   maxDepth?: number;                  // Query depth limit
+  maxIntrospectionDepth?: number;     // Separate limit for __schema/__type paths
+                                      // (unset: introspection counts against maxDepth)
   maxComplexity?: number;             // Query complexity limit
   hooks?: ExecutionHooks;             // Lifecycle hooks
   metrics?: boolean;                  // Enable execution metrics (execute() only)

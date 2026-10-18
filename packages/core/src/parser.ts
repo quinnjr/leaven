@@ -14,9 +14,10 @@ import {
   type ParseOptions as GraphQLParseOptions,
   getOperationAST,
   Kind,
+  type OperationDefinitionNode,
 } from 'graphql';
 
-import { DepthLimitError, ErrorCode } from '@leaven-graphql/errors';
+import { DepthLimitError, ErrorCode, LeavenError } from '@leaven-graphql/errors';
 
 import type { OperationType, ParsedRequest, GraphQLRequest } from './types';
 import { escapeLog } from './escape-log';
@@ -53,13 +54,56 @@ export function createVisitBudget(): () => void {
 }
 
 /**
+ * Give a graphql-js error an `ErrorCode` unless it already has one.
+ *
+ * graphql-js reports syntax, validation and variable-coercion failures with
+ * no `extensions` at all. Every error leaving Leaven must carry a code, and
+ * these are client mistakes: left uncoded, `errorToGraphQL` files them under
+ * INTERNAL_ERROR, so a masking transport hides them and HTTP answers 500.
+ * `nodes`, `source` and `positions` are carried over so `locations` survive.
+ */
+export function withErrorCode(error: GraphQLError, code: ErrorCode): GraphQLError {
+  if (error.extensions?.code !== undefined) {
+    return error;
+  }
+  return new GraphQLError(error.message, {
+    nodes: error.nodes,
+    source: error.source,
+    positions: error.positions,
+    path: error.path,
+    originalError: error.originalError,
+    extensions: { ...error.extensions, code },
+  });
+}
+
+/**
  * Options for parsing GraphQL documents
  */
 export interface ParseOptions {
   /** GraphQL parse options */
   graphqlOptions?: GraphQLParseOptions;
-  /** Maximum query depth allowed */
+  /**
+   * Maximum query depth allowed.
+   *
+   * Without {@link ParseOptions.maxIntrospectionDepth}, every selection
+   * counts against it, introspection included.
+   */
   maxDepth?: number;
+  /**
+   * Maximum depth allowed for introspection selections.
+   *
+   * When set, a path that enters the introspection meta-fields `__schema` or
+   * `__type` at an operation's root (directly, or through root-level inline
+   * fragments and fragment spreads) counts against this limit instead of
+   * {@link ParseOptions.maxDepth}, so a client like GraphiQL can send
+   * graphql-js's `getIntrospectionQuery()` (depth 15) while ordinary queries
+   * stay under a tighter `maxDepth`. Introspection depth is still bounded:
+   * deep `__type { ofType { ofType ... } } }` nesting is a known DoS vector.
+   * `__typename`, and a meta-field below the root, count as ordinary fields.
+   *
+   * When unset, introspection counts against `maxDepth`, as it always has.
+   */
+  maxIntrospectionDepth?: number;
   /** Maximum number of tokens allowed */
   maxTokens?: number;
 }
@@ -91,17 +135,37 @@ export function parseDocument(query: string, options?: ParseOptions): DocumentNo
   }
 
   try {
-    const document = parse(query, parseOptions);
+    let document: DocumentNode;
+    try {
+      document = parse(query, parseOptions);
+    } catch (error) {
+      // A syntax error, including an exceeded maxTokens, is the client's
+      throw error instanceof GraphQLError ? withErrorCode(error, ErrorCode.PARSE_ERROR) : error;
+    }
 
-    // Validate query depth if specified
-    if (options?.maxDepth !== undefined) {
+    // Validate query depth if specified. DepthLimitError owns the message,
+    // the ErrorCode and the `depth`/`maxDepth` extensions, and carries a 400
+    // statusCode for the HTTP layer — a hand-rolled GraphQLError with a
+    // literal code string has none of that.
+    const maxDepth = options?.maxDepth;
+    const maxIntrospectionDepth = options?.maxIntrospectionDepth;
+    if (maxIntrospectionDepth !== undefined) {
+      // Two limits: `extensions.limit` says which one was exceeded
+      const { depth, introspectionDepth } = calculateQueryDepths(document);
+      if (maxDepth !== undefined && depth > maxDepth) {
+        throw new DepthLimitError(depth, maxDepth, {
+          extensions: { limit: 'maxDepth' },
+        }).toGraphQLError();
+      }
+      if (introspectionDepth > maxIntrospectionDepth) {
+        throw new DepthLimitError(introspectionDepth, maxIntrospectionDepth, {
+          extensions: { limit: 'maxIntrospectionDepth' },
+        }).toGraphQLError();
+      }
+    } else if (maxDepth !== undefined) {
       const depth = calculateQueryDepth(document);
-      if (depth > options.maxDepth) {
-        // DepthLimitError owns the message, the ErrorCode and the
-        // `depth`/`maxDepth` extensions, and carries a 400 statusCode for the
-        // HTTP layer — a hand-rolled GraphQLError with a literal code string
-        // has none of that.
-        throw new DepthLimitError(depth, options.maxDepth).toGraphQLError();
+      if (depth > maxDepth) {
+        throw new DepthLimitError(depth, maxDepth).toGraphQLError();
       }
     }
 
@@ -139,7 +203,59 @@ export function validateDocument(
 const NO_DEPTH = -1;
 
 /**
+ * Depth of a document, split by whether a path is introspection.
+ */
+export interface QueryDepths {
+  /** Deepest path that does not enter introspection (0 when there is none) */
+  depth: number;
+  /**
+   * Deepest path that enters `__schema` or `__type` at an operation root
+   * (0 when there is none)
+   */
+  introspectionDepth: number;
+}
+
+/**
+ * How a selection set is being analysed: at an operation's root (where the
+ * introspection meta-fields live), below an ordinary field, or below
+ * `__schema`/`__type`. A fragment's depth can depend on it, so fragments are
+ * memoised per mode.
+ */
+const MODE_ROOT = 0;
+const MODE_NESTED = 1;
+const MODE_INTROSPECTION = 2;
+type DepthMode = typeof MODE_ROOT | typeof MODE_NESTED | typeof MODE_INTROSPECTION;
+
+/** The introspection meta-fields that open an introspection path */
+const INTROSPECTION_ROOT_FIELDS: ReadonlySet<string> = new Set(['__schema', '__type']);
+
+/**
+ * Deepest regular and introspection depth inside one selection, each
+ * NO_DEPTH when the selection reaches no field of that kind.
+ */
+interface DepthPair {
+  regular: number;
+  introspection: number;
+}
+
+/**
  * Calculate the depth of a GraphQL query
+ *
+ * The deepest path of the document, introspection included; see
+ * {@link calculateQueryDepths} for the traversal. Equal to
+ * `Math.max(depth, introspectionDepth)` of that function.
+ *
+ * @throws {GraphQLError} with `extensions.code = 'COMPLEXITY_LIMIT'` when the
+ * traversal exceeds {@link MAX_ANALYSIS_VISITS} nodes.
+ */
+export function calculateQueryDepth(document: DocumentNode): number {
+  const { depth, introspectionDepth } = calculateQueryDepths(document);
+  return Math.max(depth, introspectionDepth);
+}
+
+/**
+ * Calculate the depth of a GraphQL query, reporting introspection paths
+ * separately.
  *
  * Only field selections add a level of depth. Fragment spreads are resolved
  * against the document's fragment definitions and traversed at the current
@@ -147,12 +263,21 @@ const NO_DEPTH = -1;
  * GraphQL response-shape semantics. Cyclic fragment spreads are detected and
  * terminated rather than recursing indefinitely.
  *
+ * A path is an introspection path once it enters `__schema` or `__type` at an
+ * operation's root, directly or through root-level inline fragments and
+ * spreads; every field below it counts towards `introspectionDepth`. Those
+ * meta-fields exist only on the query root, so one below the root is an
+ * ordinary field (and is rejected by validation later), as is `__typename`.
+ *
  * A fragment's contribution is independent of where it is spread — spreading
  * it at depth D simply shifts every field inside it by D — so each fragment
- * is expanded at most once and its relative depth is memoised. Re-expanding
- * per spread site would cost O(2^N) for a document of N fragments each
- * spreading the next twice, which is a trivially cheap denial-of-service
- * vector because this analysis runs before validation.
+ * is expanded at most once per mode (root, nested, introspection) and its
+ * relative depths are memoised. Re-expanding per spread site would cost
+ * O(2^N) for a document of N fragments each spreading the next twice, which
+ * is a trivially cheap denial-of-service vector because this analysis runs
+ * before validation. The mode is part of the memo key because the same
+ * fragment can contribute introspection depth at the root and regular depth
+ * elsewhere.
  *
  * That equivalence only holds for a value computed with no cycle cut in it: a
  * fragment expanded from inside a cycle yields a truncated lower bound that is
@@ -165,7 +290,7 @@ const NO_DEPTH = -1;
  * @throws {GraphQLError} with `extensions.code = 'COMPLEXITY_LIMIT'` when the
  * traversal exceeds {@link MAX_ANALYSIS_VISITS} nodes.
  */
-export function calculateQueryDepth(document: DocumentNode): number {
+export function calculateQueryDepths(document: DocumentNode): QueryDepths {
   // Map of fragment name -> fragment definition, for resolving spreads
   const fragments = new Map<
     string,
@@ -181,10 +306,11 @@ export function calculateQueryDepth(document: DocumentNode): number {
     }
   }
 
-  /** Memoised relative depth of each fragment, measured from depth 0 */
-  const fragmentDepths = new Map<string, number>();
-  /** Fragments currently being expanded, used to cut cycles */
-  const expanding = new Set<string>();
+  /** Memoised relative depths of each fragment, measured from depth 0, per mode */
+  const fragmentDepths: [Map<string, DepthPair>, Map<string, DepthPair>, Map<string, DepthPair>] =
+    [new Map(), new Map(), new Map()];
+  /** Fragments currently being expanded in each mode, used to cut cycles */
+  const expanding: [Set<string>, Set<string>, Set<string>] = [new Set(), new Set(), new Set()];
   /**
    * Number of spreads cut so far by cycle detection. Compared before and
    * after a fragment's expansion to tell a complete value (safe to memoise)
@@ -192,15 +318,21 @@ export function calculateQueryDepth(document: DocumentNode): number {
    */
   let cycleCuts = 0;
   const countVisit = createVisitBudget();
+  const none = (): DepthPair => ({ regular: NO_DEPTH, introspection: NO_DEPTH });
+
+  /** Fold `child` into `into`, keeping the deeper value of each kind */
+  function absorb(into: DepthPair, child: DepthPair): void {
+    if (child.regular > into.regular) into.regular = child.regular;
+    if (child.introspection > into.introspection) into.introspection = child.introspection;
+  }
 
   /**
-   * Maximum depth reached inside a single selection, or NO_DEPTH when the
-   * selection contains no field.
+   * Maximum depths reached inside a single selection.
    */
-  function selectionDepth(node: unknown, currentDepth: number): number {
+  function selectionDepth(node: unknown, currentDepth: number, mode: DepthMode): DepthPair {
     countVisit();
 
-    if (!node || typeof node !== 'object') return NO_DEPTH;
+    if (!node || typeof node !== 'object') return none();
 
     const typedNode = node as {
       kind?: string;
@@ -209,81 +341,94 @@ export function calculateQueryDepth(document: DocumentNode): number {
     };
 
     if (typedNode.kind === Kind.FIELD) {
-      let deepest = currentDepth;
+      const fieldMode: DepthMode =
+        mode === MODE_INTROSPECTION ||
+        (mode === MODE_ROOT && INTROSPECTION_ROOT_FIELDS.has(typedNode.name?.value ?? ''))
+          ? MODE_INTROSPECTION
+          : MODE_NESTED;
+      const deepest: DepthPair =
+        fieldMode === MODE_INTROSPECTION
+          ? { regular: NO_DEPTH, introspection: currentDepth }
+          : { regular: currentDepth, introspection: NO_DEPTH };
       if (typedNode.selectionSet) {
         for (const selection of typedNode.selectionSet.selections) {
-          deepest = Math.max(deepest, selectionDepth(selection, currentDepth + 1));
+          absorb(deepest, selectionDepth(selection, currentDepth + 1, fieldMode));
         }
       }
       return deepest;
     }
 
     if (typedNode.kind === Kind.INLINE_FRAGMENT) {
-      // Inline fragments do not add a level of depth
-      let deepest = NO_DEPTH;
+      // Inline fragments do not add a level of depth, nor change the mode
+      const deepest = none();
       if (typedNode.selectionSet) {
         for (const selection of typedNode.selectionSet.selections) {
-          deepest = Math.max(deepest, selectionDepth(selection, currentDepth));
+          absorb(deepest, selectionDepth(selection, currentDepth, mode));
         }
       }
       return deepest;
     }
 
     if (typedNode.kind === Kind.FRAGMENT_SPREAD && typedNode.name) {
-      const relative = fragmentDepth(typedNode.name.value);
-      return relative === NO_DEPTH ? NO_DEPTH : currentDepth + relative;
+      const relative = fragmentDepth(typedNode.name.value, mode);
+      return {
+        regular: relative.regular === NO_DEPTH ? NO_DEPTH : currentDepth + relative.regular,
+        introspection:
+          relative.introspection === NO_DEPTH ? NO_DEPTH : currentDepth + relative.introspection,
+      };
     }
 
-    return NO_DEPTH;
+    return none();
   }
 
   /**
-   * Relative depth added by a fragment, computed once per document unless a
-   * cycle forces re-expansion (see {@link calculateQueryDepth}).
+   * Relative depths added by a fragment spread in `mode`, computed once per
+   * document and mode unless a cycle forces re-expansion (see
+   * {@link calculateQueryDepths}).
    */
-  function fragmentDepth(fragmentName: string): number {
-    const memoized = fragmentDepths.get(fragmentName);
+  function fragmentDepth(fragmentName: string, mode: DepthMode): DepthPair {
+    const memoized = fragmentDepths[mode].get(fragmentName);
     if (memoized !== undefined) return memoized;
 
     // Stop on cycles so cyclic fragments terminate instead of overflowing
-    if (expanding.has(fragmentName)) {
+    if (expanding[mode].has(fragmentName)) {
       cycleCuts++;
-      return NO_DEPTH;
+      return none();
     }
 
     const fragment = fragments.get(fragmentName);
-    if (!fragment?.selectionSet) return NO_DEPTH;
+    if (!fragment?.selectionSet) return none();
 
-    expanding.add(fragmentName);
+    expanding[mode].add(fragmentName);
     const cutsBefore = cycleCuts;
-    let deepest = NO_DEPTH;
+    const deepest = none();
     for (const selection of fragment.selectionSet.selections) {
-      deepest = Math.max(deepest, selectionDepth(selection, 0));
+      absorb(deepest, selectionDepth(selection, 0, mode));
     }
-    expanding.delete(fragmentName);
+    expanding[mode].delete(fragmentName);
 
     // Only memoise a value nothing was cut out of. A truncated value is a
     // lower bound for THIS expansion path; reusing it at another spread site
     // makes the reported depth depend on root-field order.
     if (cycleCuts === cutsBefore) {
-      fragmentDepths.set(fragmentName, deepest);
+      fragmentDepths[mode].set(fragmentName, deepest);
     }
     return deepest;
   }
 
-  let maxDepth = 0;
+  const total: DepthPair = { regular: 0, introspection: 0 };
   for (const definition of document.definitions) {
     if ((definition as { kind: string }).kind === Kind.OPERATION_DEFINITION) {
       const opDef = definition as { selectionSet?: { selections: unknown[] } };
       if (opDef.selectionSet) {
         for (const selection of opDef.selectionSet.selections) {
-          maxDepth = Math.max(maxDepth, selectionDepth(selection, 1));
+          absorb(total, selectionDepth(selection, 1, MODE_ROOT));
         }
       }
     }
   }
 
-  return maxDepth;
+  return { depth: total.regular, introspectionDepth: total.introspection };
 }
 
 /**
@@ -300,22 +445,68 @@ export function getOperationType(
 }
 
 /**
+ * The client error for a document whose operation cannot be selected, worded
+ * as graphql-js words it.
+ *
+ * Choosing the operation is the client's job (the document and
+ * `operationName` are both request input), so this is a `BAD_REQUEST` (400)
+ * `LeavenError`, never an internal error that a masking transport would hide
+ * behind a 500. The client-chosen name goes through {@link escapeLog}.
+ *
+ * Only meaningful when `getOperationAST(document, operationName)` returned
+ * nothing.
+ */
+export function operationSelectionError(
+  document: DocumentNode,
+  operationName?: string | null
+): LeavenError {
+  if (operationName !== undefined && operationName !== null) {
+    return new LeavenError(
+      `Unknown operation named "${escapeLog(operationName)}".`,
+      ErrorCode.BAD_REQUEST
+    );
+  }
+  const hasOperation = document.definitions.some(
+    (definition) => definition.kind === Kind.OPERATION_DEFINITION
+  );
+  return new LeavenError(
+    hasOperation
+      ? 'Must provide operation name if query contains multiple operations.'
+      : 'Must provide an operation.',
+    ErrorCode.BAD_REQUEST
+  );
+}
+
+/**
+ * Select the operation a request runs.
+ *
+ * @throws {LeavenError} `BAD_REQUEST` when `operationName` names no operation
+ * of the document, or is missing while the document has several (or none);
+ * see {@link operationSelectionError}.
+ */
+export function selectOperation(
+  document: DocumentNode,
+  operationName?: string | null
+): OperationDefinitionNode {
+  const operation = getOperationAST(document, operationName);
+  if (!operation) {
+    throw operationSelectionError(document, operationName);
+  }
+  return operation;
+}
+
+/**
  * Parse and extract full request information
+ *
+ * @throws {LeavenError} `BAD_REQUEST` when the operation cannot be selected
+ * (see {@link selectOperation}).
  */
 export function parseRequest(
   request: GraphQLRequest,
   options?: ParseOptions
 ): ParsedRequest {
   const document = parseDocument(request.query, options);
-  const operation = getOperationAST(document, request.operationName);
-
-  if (!operation) {
-    throw new Error(
-      request.operationName
-        ? `Operation "${escapeLog(request.operationName)}" not found in document`
-        : 'No operation found in document'
-    );
-  }
+  const operation = selectOperation(document, request.operationName);
 
   return {
     ...request,

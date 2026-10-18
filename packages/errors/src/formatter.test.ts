@@ -18,6 +18,7 @@ import {
   maskError,
   isLeavenError,
   errorToGraphQL,
+  fromFormattedError,
 } from './formatter';
 import {
   LeavenError,
@@ -341,5 +342,62 @@ describe('formatErrors', () => {
 
     expect(results[0]?.message).toBe('An unexpected error occurred');
     expect(results[1]?.message).toBe('An unexpected error occurred');
+  });
+});
+
+describe('fromFormattedError', () => {
+  test('should rebuild message, path, locations and extensions', () => {
+    const rebuilt = fromFormattedError({
+      message: 'Field failed',
+      path: ['user', 0, 'name'],
+      locations: [{ line: 2, column: 5 }],
+      extensions: { code: ErrorCode.NOT_FOUND, resourceType: 'User' },
+    });
+
+    expect(rebuilt).toBeInstanceOf(GraphQLError);
+    expect(rebuilt.message).toBe('Field failed');
+    expect(rebuilt.path).toEqual(['user', 0, 'name']);
+    expect(rebuilt.locations).toEqual([{ line: 2, column: 5 }]);
+    expect(rebuilt.extensions).toEqual({ code: ErrorCode.NOT_FOUND, resourceType: 'User' });
+  });
+
+  test('should round-trip through formatError without loss', () => {
+    const formatted = {
+      message: 'Please log in',
+      path: ['me'],
+      locations: [{ line: 1, column: 3 }],
+      extensions: { code: ErrorCode.UNAUTHENTICATED },
+    };
+
+    expect(formatError(fromFormattedError(formatted), { maskErrors: true })).toEqual(formatted);
+  });
+
+  test('should let an uncoded formatted error be masked', () => {
+    const result = formatError(fromFormattedError({ message: 'connect ECONNREFUSED' }), {
+      maskErrors: true,
+    });
+
+    expect(result).toEqual({
+      message: 'An unexpected error occurred',
+      extensions: { code: ErrorCode.INTERNAL_ERROR },
+    });
+  });
+
+  test('should not alias the formatted error arrays or extensions', () => {
+    const formatted = {
+      message: 'x',
+      path: ['a'],
+      locations: [{ line: 1, column: 1 }],
+      extensions: { code: ErrorCode.BAD_REQUEST },
+    };
+    const rebuilt = fromFormattedError(formatted);
+
+    expect(rebuilt.path).not.toBe(formatted.path);
+    expect(rebuilt.locations).not.toBe(formatted.locations);
+    expect(rebuilt.extensions).not.toBe(formatted.extensions);
+  });
+
+  test('should omit locations when the formatted error has none', () => {
+    expect(fromFormattedError({ message: 'x', locations: [] }).locations).toBeUndefined();
   });
 });

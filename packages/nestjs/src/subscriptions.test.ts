@@ -8,7 +8,14 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import 'reflect-metadata';
 import type { ServerWebSocket } from 'bun';
-import { GraphQLSchema, GraphQLObjectType, GraphQLString, GraphQLInt } from 'graphql';
+import {
+  GraphQLError,
+  GraphQLSchema,
+  GraphQLObjectType,
+  GraphQLString,
+  GraphQLInt,
+} from 'graphql';
+import { AuthenticationError, ErrorCode } from '@leaven-graphql/errors';
 import {
   SubscriptionManager,
   Subscription,
@@ -937,6 +944,220 @@ describe('SubscriptionManager streaming', () => {
     expect(harness.manager.getSubscriptionCount()).toBe(1);
 
     await destroyHarness(harness);
+  });
+});
+
+describe('SubscriptionManager error formatting', () => {
+  const MASKED = 'An unexpected error occurred';
+  let originalEnv: string | undefined;
+  let harness: TestHarness | undefined;
+
+  beforeEach(() => {
+    originalEnv = process.env.NODE_ENV;
+  });
+
+  afterEach(async () => {
+    process.env.NODE_ENV = originalEnv;
+    if (harness) {
+      await destroyHarness(harness);
+      harness = undefined;
+    }
+  });
+
+  function failingSchema(): GraphQLSchema {
+    return new GraphQLSchema({
+      query: new GraphQLObjectType({
+        name: 'Query',
+        fields: { hello: { type: GraphQLString, resolve: () => 'world' } },
+      }),
+      subscription: new GraphQLObjectType({
+        name: 'Subscription',
+        fields: {
+          forever: {
+            type: GraphQLInt,
+            subscribe: async function* (): AsyncGenerator<{ forever: number }> {
+              yield { forever: 1 };
+              await new Promise(() => {});
+            },
+          },
+          forbidden: {
+            type: GraphQLInt,
+            subscribe: async function* (): AsyncGenerator<{ forbidden: number }> {
+              yield { forbidden: 1 };
+              throw new GraphQLError('Not allowed to watch this', {
+                extensions: { code: ErrorCode.FORBIDDEN },
+              });
+            },
+          },
+          crashing: {
+            type: GraphQLInt,
+            subscribe: async function* (): AsyncGenerator<{ crashing: number }> {
+              yield { crashing: 1 };
+              throw new Error('postgres://u:p@h/db stream reset');
+            },
+          },
+          poisoned: {
+            type: GraphQLInt,
+            subscribe: async function* (): AsyncGenerator<{ poisoned: number }> {
+              yield { poisoned: 1 };
+            },
+            resolve: () => {
+              throw new Error('decrypt failed with key sk_live_123');
+            },
+          },
+        },
+      }),
+    });
+  }
+
+  async function subscribe(
+    subscriptions: SubscriptionConfig | undefined,
+    query: string,
+    extra: Partial<LeavenModuleOptions> = {}
+  ): Promise<MockWebSocket> {
+    harness = await createManager(subscriptions, undefined, { schema: failingSchema(), ...extra });
+    const socket = await initConnection(harness.manager);
+    socket.simulateMessage(JSON.stringify({ type: 'subscribe', id: 'op-1', payload: { query } }));
+    return socket;
+  }
+
+  function firstError(socket: MockWebSocket): { message: string; extensions?: Record<string, unknown> } {
+    const frame = sentOfType(socket, 'error')[0];
+    return (frame?.payload as Array<{ message: string; extensions?: Record<string, unknown> }>)[0]!;
+  }
+
+  test('masks a context factory failure in production', async () => {
+    process.env.NODE_ENV = 'production';
+    const socket = await subscribe(
+      {
+        context: () => {
+          throw new Error('postgres://u:p@h/db refused');
+        },
+      },
+      'subscription { forever }'
+    );
+    await waitFor(() => sentOfType(socket, 'error').length > 0);
+
+    expect(firstError(socket).message).toBe(MASKED);
+    expect(firstError(socket).extensions?.code).toBe(ErrorCode.INTERNAL_ERROR);
+    expect(JSON.stringify(socket.sentMessages)).not.toContain('postgres://');
+    expect(socket.readyState).toBe(1);
+  });
+
+  test('sends a context factory failure with INTERNAL_ERROR outside production', async () => {
+    process.env.NODE_ENV = 'development';
+    const socket = await subscribe(
+      {
+        context: () => {
+          throw new Error('postgres://u:p@h/db refused');
+        },
+      },
+      'subscription { forever }'
+    );
+    await waitFor(() => sentOfType(socket, 'error').length > 0);
+
+    expect(firstError(socket).message).toBe('postgres://u:p@h/db refused');
+    expect(firstError(socket).extensions?.code).toBe(ErrorCode.INTERNAL_ERROR);
+  });
+
+  test('masks a failing onSubscribe hook on a single-result operation in production', async () => {
+    process.env.NODE_ENV = 'production';
+    const socket = await subscribe(
+      {
+        onSubscribe: () => {
+          throw new Error('ldap bind failed for cn=admin');
+        },
+      },
+      '{ hello }'
+    );
+    await waitFor(() => sentOfType(socket, 'error').length > 0);
+
+    expect(firstError(socket).message).toBe(MASKED);
+  });
+
+  test('keeps a LeavenError message and code in production', async () => {
+    process.env.NODE_ENV = 'production';
+    const socket = await subscribe(
+      {
+        onSubscribe: () => {
+          throw new AuthenticationError('Token expired');
+        },
+      },
+      'subscription { forever }'
+    );
+    await waitFor(() => sentOfType(socket, 'error').length > 0);
+
+    expect(firstError(socket).message).toBe('Token expired');
+    expect(firstError(socket).extensions?.code).toBe(ErrorCode.UNAUTHENTICATED);
+  });
+
+  test('keeps the code of a GraphQLError thrown by the source stream', async () => {
+    process.env.NODE_ENV = 'production';
+    const socket = await subscribe(undefined, 'subscription { forbidden }');
+    await waitFor(() => sentOfType(socket, 'error').length > 0);
+
+    expect(firstError(socket).message).toBe('Not allowed to watch this');
+    expect(firstError(socket).extensions?.code).toBe(ErrorCode.FORBIDDEN);
+  });
+
+  test('masks a raw Error thrown by the source stream in production', async () => {
+    process.env.NODE_ENV = 'production';
+    const socket = await subscribe(undefined, 'subscription { crashing }');
+    await waitFor(() => sentOfType(socket, 'error').length > 0);
+
+    expect(firstError(socket).message).toBe(MASKED);
+    expect(JSON.stringify(socket.sentMessages)).not.toContain('postgres://');
+  });
+
+  test('applies formatError to setup failures, stream failures and next payload errors', async () => {
+    process.env.NODE_ENV = 'development';
+    const seen: string[] = [];
+    harness = await createManager(
+      {
+        context: (ctx) => {
+          if (ctx.connectionParams?.['fail']) {
+            throw new Error('context failed');
+          }
+          return { req: undefined as unknown as Request, res: {} as Response };
+        },
+      },
+      undefined,
+      {
+        schema: failingSchema(),
+        formatError: (error) => {
+          seen.push(error.message);
+          return { message: 'formatted', extensions: { code: 'CUSTOM' } };
+        },
+      }
+    );
+
+    const streaming = await initConnection(harness.manager);
+    streaming.simulateMessage(
+      JSON.stringify({ type: 'subscribe', id: 'p', payload: { query: 'subscription { poisoned }' } })
+    );
+    streaming.simulateMessage(
+      JSON.stringify({ type: 'subscribe', id: 'c', payload: { query: 'subscription { crashing }' } })
+    );
+    await waitFor(() => sentOfType(streaming, 'complete').length > 0);
+    await waitFor(() => sentOfType(streaming, 'error').length > 0);
+
+    const failing = await initConnection(harness.manager, { fail: true });
+    failing.simulateMessage(
+      JSON.stringify({ type: 'subscribe', id: 'f', payload: { query: 'subscription { forever }' } })
+    );
+    await waitFor(() => sentOfType(failing, 'error').length > 0);
+
+    expect(seen).toContain('decrypt failed with key sk_live_123');
+    expect(seen).toContain('postgres://u:p@h/db stream reset');
+    expect(seen).toContain('context failed');
+
+    const next = sentOfType(streaming, 'next').find((frame) => frame.id === 'p');
+    expect((next?.payload as { errors?: Array<{ message: string }> }).errors?.[0]?.message).toBe(
+      'formatted'
+    );
+    expect(firstError(streaming).message).toBe('formatted');
+    expect(firstError(failing).message).toBe('formatted');
+    expect(JSON.stringify(streaming.sentMessages)).not.toContain('sk_live_123');
   });
 });
 
