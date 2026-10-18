@@ -184,7 +184,7 @@ pubsub.publish('MESSAGE_ADDED', message);
 const iterator = pubsub.asyncIterator('MESSAGE_ADDED');
 ```
 
-### From SSE
+### From Server-Sent Events
 
 ```typescript
 import { leaven } from '@leaven-graphql/leaven';

@@ -31,6 +31,8 @@ import {
   createEventStream,
   createEventStreamResponse,
   acceptsEventStream,
+  isSubscriptionIterator,
+  DEFAULT_KEEP_ALIVE_INTERVAL,
   SSE_CONTENT_TYPE,
   // Context
   createContextBuilder,
@@ -80,6 +82,8 @@ describe('meta-package export surface', () => {
     expect(createEventStream).toBeInstanceOf(Function);
     expect(createEventStreamResponse).toBeInstanceOf(Function);
     expect(acceptsEventStream).toBeInstanceOf(Function);
+    expect(isSubscriptionIterator).toBeInstanceOf(Function);
+    expect(DEFAULT_KEEP_ALIVE_INTERVAL).toBe(8000);
     expect(SSE_CONTENT_TYPE).toBe('text/event-stream; charset=utf-8');
   });
 

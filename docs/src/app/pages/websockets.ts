@@ -144,8 +144,9 @@ import { SeoService } from '../services/seo.service';
           subscriptions on one page call for HTTP/2.
         </p>
         <p class="text-zinc-400 mb-4">
-          Frameworks that own routing, such as Knead, can use the low-level API: build the context, call
-          <code class="text-green-400">executor.subscribe</code> and return the stream:
+          Frameworks that own routing, such as Knead, can use the low-level API: build the context, run the operation with
+          <code class="text-green-400">executor.subscribe</code> or <code class="text-green-400">executor.execute</code>,
+          answer failures that happen before any data as plain JSON, and stream the rest:
         </p>
         <app-code-block [code]="sseLowLevelCode" title="custom-transport.ts" />
       </section>
@@ -561,11 +562,19 @@ for await (const result of client.iterate({
   console.log('New message:', result.data);
 }`;
 
-  sseLowLevelCode = `import { LeavenExecutor, type GraphQLRequest } from '@leaven-graphql/core';
-import { acceptsEventStream, createEventStreamResponse } from '@leaven-graphql/sse';
+  sseLowLevelCode = `import { getOperationAST } from 'graphql';
+import { LeavenExecutor, type GraphQLRequest, type GraphQLResponse } from '@leaven-graphql/core';
+import { formatErrors } from '@leaven-graphql/errors';
+import {
+  acceptsEventStream,
+  createEventStreamResponse,
+  isSubscriptionIterator,
+} from '@leaven-graphql/sse';
 import { schema } from './schema';
 
 const executor = new LeavenExecutor({ schema });
+
+const json = (body: GraphQLResponse, status: number): Response => Response.json(body, { status });
 
 export async function handleGraphQL(request: Request): Promise<Response> {
   if (!acceptsEventStream(request)) {
@@ -575,11 +584,39 @@ export async function handleGraphQL(request: Request): Promise<Response> {
   const graphqlRequest = (await request.json()) as GraphQLRequest;
   const context = { user: request.headers.get('authorization') };
 
-  const result = await executor.subscribe(graphqlRequest, context);
+  // executor.parse applies the executor's parser limits; a syntax error throws
+  let operation;
+  try {
+    operation = getOperationAST(
+      await executor.parse(graphqlRequest.query),
+      graphqlRequest.operationName
+    );
+  } catch (error) {
+    return json({ errors: formatErrors([error]) }, 400);
+  }
+  if (!operation) {
+    return json({ errors: [{ message: 'Unknown operation' }] }, 400);
+  }
 
-  return createEventStreamResponse(result, {
+  let source;
+  if (operation.operation === 'subscription') {
+    source = await executor.subscribe(graphqlRequest, context);
+    // Not an iterator: the subscription failed before it started
+    if (!isSubscriptionIterator(source)) return json(source, 400);
+  } else {
+    source = (await executor.execute(graphqlRequest, context)).response;
+    // Errors and no data: a total failure, not a stream
+    if (source.errors?.length && source.data == null) return json(source, 400);
+  }
+
+  return createEventStreamResponse(source, {
+    // Closing the connection ends the stream and returns the iterator
     signal: request.signal,
-    formatResult: (response) => response,
+    // Mask unexpected errors in every result before it is serialised
+    formatResult: (response) => ({
+      ...response,
+      errors: response.errors && formatErrors(response.errors, { maskErrors: true }),
+    }),
   });
 }`;
 }
