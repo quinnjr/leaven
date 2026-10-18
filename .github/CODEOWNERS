@@ -5,6 +5,7 @@
 /packages/core/ @quinnjr
 /packages/http/ @quinnjr
 /packages/ws/ @quinnjr
+/packages/sse/ @quinnjr
 
 # Integration packages
 /packages/nestjs/ @quinnjr

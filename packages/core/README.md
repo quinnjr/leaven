@@ -199,6 +199,9 @@ does **not** fire for resolver-level errors: graphql-js collects those into
 `result.errors` and returns a normal (possibly partial) response. Inspect
 `result.errors` in `onExecuted` to observe them.
 
+A throwing or rejecting `onError` hook is ignored: the original error is still
+returned as `{ errors: [...] }`.
+
 ### Execution Metrics
 
 Track execution performance:
@@ -417,6 +420,26 @@ interface GraphQLResponse<TData = Record<string, unknown>> {
 Rejections carry a machine-readable `extensions.code` from
 `@leaven-graphql/errors` — `DEPTH_LIMIT`, `COMPLEXITY_LIMIT`, `RATE_LIMITED`,
 `INTERNAL_ERROR` and so on — which the HTTP layer maps to a status code.
+
+### isRequestRejection
+
+```typescript
+import { LeavenExecutor, isRequestRejection } from '@leaven-graphql/core';
+
+const executor = new LeavenExecutor({ schema });
+const { response } = await executor.execute({ query: '{ nope }' });
+isRequestRejection(response); // true: rejected before any resolver ran
+```
+
+`isRequestRejection(response)` is true for a response the executor produced
+because it rejected the request before running any resolver: a syntax error, a
+parser limit (`maxTokens`, `maxDepth`, the analysis budget), validation, the
+complexity budget, an unknown or missing operation name, or a variable that
+fails to coerce. Such a request is safe to answer with a non-200 status and to
+retry. An error from a resolver, a subscribe resolver, `onExecute` or
+`onExecuted` is never marked, whatever its code. The check is identity-based:
+pass the object `execute()` or `subscribe()` returned, not a copy. The mark
+changes nothing on the wire.
 
 ### CacheStats
 

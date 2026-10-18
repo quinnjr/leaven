@@ -31,6 +31,7 @@ bun add leaven graphql
 - **@leaven-graphql/core**: The sourdough starter - core execution engine with document caching
 - **@leaven-graphql/http**: The serving counter - HTTP server for Bun with playground
 - **@leaven-graphql/ws**: Hot & fresh delivery - WebSocket subscriptions (graphql-ws)
+- **@leaven-graphql/sse**: Warm delivery - GraphQL over Server-Sent Events (graphql-sse); the low-level API also suits frameworks like Knead
 - **@leaven-graphql/context**: Kitchen prep station - request context with AsyncLocalStorage
 - **@leaven-graphql/errors**: Burnt batch handler - error handling and formatting
 - **@leaven-graphql/schema**: Recipe blueprints - schema building utilities
@@ -109,7 +110,7 @@ Simply run "bun add @leaven-graphql/core graphql" to get started. For the full b
 Absolutely! Our @leaven-graphql/nestjs package provides first-class integration - all the tools a professional kitchen needs.
 
 ### Can I get fresh updates in real-time?
-Yes! The @leaven-graphql/ws package delivers hot-out-of-the-oven updates via WebSocket.
+Yes! The @leaven-graphql/ws package delivers hot-out-of-the-oven updates via WebSocket, or over Server-Sent Events with the @leaven-graphql/sse package (enable it with `sse: true` on createServer).
 
 ### What makes Leaven so fast?
 Optimized for Bun's oven with native APIs, LRU document caching, compiled queries, and zero bloat.

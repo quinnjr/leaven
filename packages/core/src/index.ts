@@ -5,7 +5,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-export { LeavenExecutor, createExecutor } from './executor';
+export { LeavenExecutor, createExecutor, isRequestRejection } from './executor';
 export type { ExecutorConfig, ExecutionResult, ExecutionContext } from './executor';
 
 export {

@@ -6,7 +6,13 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { GraphQLObjectType, GraphQLSchema, GraphQLString } from 'graphql';
+import {
+  GraphQLInt,
+  GraphQLNonNull,
+  GraphQLObjectType,
+  GraphQLSchema,
+  GraphQLString,
+} from 'graphql';
 import { AuthenticationError, NotFoundError } from '@leaven-graphql/errors';
 import { createHandler, createBunHandler } from './handler';
 
@@ -646,6 +652,448 @@ describe('createHandler', () => {
       expect(body.errors[0].message).toBe('Not authenticated');
       expect(body.errors[0].extensions.code).toBe('UNAUTHENTICATED');
     });
+  });
+});
+
+describe('GET mutations', () => {
+  const mutationSchema = new GraphQLSchema({
+    query: new GraphQLObjectType({
+      name: 'Query',
+      fields: { hello: { type: GraphQLString, resolve: () => 'world' } },
+    }),
+    mutation: new GraphQLObjectType({
+      name: 'Mutation',
+      fields: { noop: { type: GraphQLString, resolve: () => 'done' } },
+    }),
+  });
+  const getUrl = (query: string, extra = ''): string =>
+    'http://x/graphql?query=' + encodeURIComponent(query) + extra;
+
+  test('should reject a mutation sent over GET with 405 and Allow: POST', async () => {
+    const handler = createHandler({ schema: mutationSchema });
+    const res = await handler(new Request(getUrl('mutation { noop }')));
+    expect(res.status).toBe(405);
+    expect(res.headers.get('allow')).toBe('POST');
+    const body = await res.json();
+    expect(body.errors[0].message).toBe('Mutations can only be sent with POST');
+  });
+
+  test('should keep CORS headers on the 405 response', async () => {
+    const handler = createHandler({ schema: mutationSchema, cors: true });
+    const res = await handler(
+      new Request(getUrl('mutation { noop }'), { headers: { Origin: 'http://example.com' } })
+    );
+    expect(res.status).toBe(405);
+    expect(res.headers.get('access-control-allow-origin')).not.toBeNull();
+    expect(res.headers.get('allow')).toBe('POST');
+    const body = await res.json();
+    expect(body.errors[0].extensions.code).toBe('BAD_REQUEST');
+  });
+
+  test('should select the named operation when deciding', async () => {
+    const handler = createHandler({ schema: mutationSchema });
+    const doc = 'query Q { hello } mutation M { noop }';
+    const q = await handler(new Request(getUrl(doc, '&operationName=Q')));
+    expect(q.status).toBe(200);
+    const m = await handler(new Request(getUrl(doc, '&operationName=M')));
+    expect(m.status).toBe(405);
+  });
+
+  test('should not run the mutation for an ambiguous multi-operation GET', async () => {
+    let ran = 0;
+    const ambiguousSchema = new GraphQLSchema({
+      query: new GraphQLObjectType({
+        name: 'Query',
+        fields: { hello: { type: GraphQLString, resolve: () => 'world' } },
+      }),
+      mutation: new GraphQLObjectType({
+        name: 'Mutation',
+        fields: {
+          noop: {
+            type: GraphQLString,
+            resolve: () => {
+              ran++;
+              return 'done';
+            },
+          },
+        },
+      }),
+    });
+    const handler = createHandler({ schema: ambiguousSchema });
+    const res = await handler(new Request(getUrl('query Q { hello } mutation M { noop }')));
+    expect(res.status).not.toBe(405);
+    const body = await res.json();
+    expect(body.errors.length).toBeGreaterThan(0);
+    expect(ran).toBe(0);
+  });
+
+  test('should not run the context factory for a rejected GET mutation', async () => {
+    let calls = 0;
+    const handler = createHandler({
+      schema: mutationSchema,
+      context: () => {
+        calls++;
+        return {};
+      },
+    });
+    const res = await handler(new Request(getUrl('mutation { noop }')));
+    expect(res.status).toBe(405);
+    expect(calls).toBe(0);
+  });
+
+  test('should still execute a mutation sent with POST', async () => {
+    const handler = createHandler({ schema: mutationSchema });
+    const res = await handler(postRequest(JSON.stringify({ query: 'mutation { noop }' })));
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toEqual({ noop: 'done' });
+  });
+
+  test('should let a GET query with a syntax error reach execution and report it', async () => {
+    const handler = createHandler({ schema: mutationSchema });
+    const res = await handler(new Request(getUrl('{ hello')));
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.errors[0].message).toContain('Syntax Error');
+    expect(body.errors[0].extensions.code).toBe('PARSE_ERROR');
+  });
+});
+
+describe('SSE', () => {
+  /** An iterator that never yields until it is returned */
+  function pendingIterator(): AsyncIterableIterator<unknown> {
+    let release: (() => void) | undefined;
+    return {
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+      next(): Promise<IteratorResult<unknown>> {
+        return new Promise((resolve) => {
+          release = () => resolve({ value: undefined, done: true });
+        });
+      },
+      return(): Promise<IteratorResult<unknown>> {
+        release?.();
+        return Promise.resolve({ value: undefined, done: true });
+      },
+    };
+  }
+
+  const sseSchema = new GraphQLSchema({
+    query: new GraphQLObjectType({
+      name: 'Query',
+      fields: { hello: { type: GraphQLString, resolve: () => 'world' } },
+    }),
+    mutation: new GraphQLObjectType({
+      name: 'Mutation',
+      fields: {
+        noop: { type: GraphQLString, resolve: () => 'done' },
+        fail: {
+          type: new GraphQLNonNull(GraphQLString),
+          resolve: () => {
+            throw new Error('declined');
+          },
+        },
+      },
+    }),
+    subscription: new GraphQLObjectType({
+      name: 'Subscription',
+      fields: {
+        count: {
+          type: GraphQLInt,
+          subscribe: async function* () {
+            for (const n of [1, 2, 3]) {
+              yield { count: n };
+            }
+          },
+        },
+        boom: {
+          type: GraphQLInt,
+          subscribe: async function* () {
+            throw new Error('secret');
+          },
+        },
+        pending: {
+          type: GraphQLInt,
+          subscribe: () => pendingIterator(),
+        },
+        guarded: {
+          type: GraphQLInt,
+          subscribe: () => {
+            throw new AuthenticationError('Sign in first');
+          },
+        },
+      },
+    }),
+  });
+
+  function post(
+    payload: unknown,
+    headers: Record<string, string> = {}
+  ): Request {
+    return new Request('http://localhost/graphql', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...headers },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  const COMPLETE = 'event: complete\ndata:\n\n';
+
+  test('should stream a query as one next then complete', async () => {
+    const handler = createHandler({ schema: sseSchema, sse: true });
+    const res = await handler(post({ query: '{ hello }' }, { accept: 'text/event-stream' }));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
+    expect(await res.text()).toBe(
+      'event: next\ndata: {"data":{"hello":"world"}}\n\n' + COMPLETE
+    );
+  });
+
+  test('should stream each subscription event', async () => {
+    const handler = createHandler({ schema: sseSchema, sse: true });
+    const res = await handler(
+      post({ query: 'subscription { count }' }, { accept: 'text/event-stream' })
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(
+      'event: next\ndata: {"data":{"count":1}}\n\n' +
+        'event: next\ndata: {"data":{"count":2}}\n\n' +
+        'event: next\ndata: {"data":{"count":3}}\n\n' +
+        COMPLETE
+    );
+  });
+
+  test('should accept a GET subscription with query params', async () => {
+    const handler = createHandler({ schema: sseSchema, sse: true });
+    const res = await handler(
+      new Request(
+        'http://localhost/graphql?query=' + encodeURIComponent('subscription { count }'),
+        { headers: { accept: 'text/event-stream' } }
+      )
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
+    const text = await res.text();
+    expect(text).toContain('{"data":{"count":3}}');
+    expect(text.endsWith(COMPLETE)).toBe(true);
+  });
+
+  test('should reject a GET mutation with 405 on the SSE path', async () => {
+    const handler = createHandler({ schema: sseSchema, sse: true });
+    const res = await handler(
+      new Request(
+        'http://localhost/graphql?query=' + encodeURIComponent('mutation { noop }'),
+        { headers: { accept: 'text/event-stream' } }
+      )
+    );
+    expect(res.status).toBe(405);
+    expect(res.headers.get('allow')).toBe('POST');
+    expect(res.headers.get('content-type')).toContain('application/json');
+  });
+
+  test('should mask a thrown subscription error with errorFormatting', async () => {
+    const handler = createHandler({
+      schema: sseSchema,
+      sse: true,
+      errorFormatting: { maskErrors: true },
+    });
+    const res = await handler(
+      post({ query: 'subscription { boom }' }, { accept: 'text/event-stream' })
+    );
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('event: next');
+    expect(text).not.toContain('secret');
+    expect(text.endsWith(COMPLETE)).toBe(true);
+  });
+
+  test('should stream an execution failure with data null as 200 next then complete', async () => {
+    const handler = createHandler({ schema: sseSchema, sse: true });
+    const res = await handler(post({ query: 'mutation { fail }' }, { accept: 'text/event-stream' }));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
+    const text = await res.text();
+    expect(text).toContain('"data":null');
+    expect(text).toContain('declined');
+    expect(text.endsWith(COMPLETE)).toBe(true);
+  });
+
+  test('should stream a subscribe-time error that carries a path', async () => {
+    const handler = createHandler({ schema: sseSchema, sse: true });
+    const res = await handler(
+      post({ query: 'subscription { guarded }' }, { accept: 'text/event-stream' })
+    );
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('"path":["guarded"]');
+    expect(text).toContain('UNAUTHENTICATED');
+    expect(text.endsWith(COMPLETE)).toBe(true);
+  });
+
+  test('should stream a mutation whose onExecuted hook throws after it ran', async () => {
+    let runs = 0;
+    const handler = createHandler({
+      schema: new GraphQLSchema({
+        query: new GraphQLObjectType({
+          name: 'Query',
+          fields: { hello: { type: GraphQLString, resolve: () => 'world' } },
+        }),
+        mutation: new GraphQLObjectType({
+          name: 'Mutation',
+          fields: { record: { type: GraphQLString, resolve: () => `run ${++runs}` } },
+        }),
+      }),
+      sse: true,
+      executor: {
+        hooks: {
+          onExecuted: () => {
+            throw new Error('audit log down');
+          },
+        },
+      },
+    });
+    const res = await handler(post({ query: 'mutation { record }' }, { accept: 'text/event-stream' }));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
+    const text = await res.text();
+    expect(text).toContain('event: next');
+    expect(text.endsWith(COMPLETE)).toBe(true);
+    expect(runs).toBe(1);
+  });
+
+  // graphql-js rejects a variable that fails to coerce before any resolver
+  // runs, and the executor codes it BAD_REQUEST: a request error, so JSON.
+  test('should answer a variable coercion error as JSON 400', async () => {
+    const handler = createHandler({ schema: sseSchema, sse: true });
+    const res = await handler(
+      post(
+        { query: 'query ($n: Boolean!) { hello @include(if: $n) }', variables: { n: 'x' } },
+        { accept: 'text/event-stream' }
+      )
+    );
+    expect(res.status).toBe(400);
+    expect(res.headers.get('content-type')).toContain('application/json');
+    expect((await res.json()).errors[0].extensions.code).toBe('BAD_REQUEST');
+  });
+
+  test('should mask a thrown subscription error by default without errorFormatting', async () => {
+    const handler = createHandler({ schema: sseSchema, sse: true });
+    const res = await handler(
+      post({ query: 'subscription { boom }' }, { accept: 'text/event-stream' })
+    );
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain('secret');
+    expect(text).toContain('An unexpected error occurred');
+    expect(text.endsWith(COMPLETE)).toBe(true);
+  });
+
+  test('should return a JSON error response for a validation failure', async () => {
+    const handler = createHandler({ schema: sseSchema, sse: true });
+    const res = await handler(post({ query: '{ nope }' }, { accept: 'text/event-stream' }));
+    expect(res.status).toBe(400);
+    expect(res.headers.get('content-type')).toContain('application/json');
+    const body = await res.json();
+    expect(body.errors.length).toBeGreaterThan(0);
+  });
+
+  test('should return a JSON error response for a subscription validation failure', async () => {
+    const handler = createHandler({ schema: sseSchema, sse: true });
+    const res = await handler(
+      post({ query: 'subscription { nope }' }, { accept: 'text/event-stream' })
+    );
+    expect(res.status).toBe(400);
+    expect(res.headers.get('content-type')).toContain('application/json');
+  });
+
+  test('should return a JSON error response when the context factory throws', async () => {
+    const handler = createHandler({
+      schema: sseSchema,
+      sse: true,
+      errorFormatting: { maskErrors: true },
+      context: () => {
+        throw new Error('connect ECONNREFUSED 10.0.3.14:5432');
+      },
+    });
+    const res = await handler(post({ query: '{ hello }' }, { accept: 'text/event-stream' }));
+    expect(res.status).toBe(500);
+    expect(res.headers.get('content-type')).toContain('application/json');
+    const body = await res.json();
+    expect(body.errors[0].message).toBe('An unexpected error occurred');
+  });
+
+  test('should return 413 JSON for an oversize body', async () => {
+    const handler = createHandler({ schema: sseSchema, sse: true, maxBodySize: 10 });
+    const res = await handler(post({ query: '{ hello }' }, { accept: 'text/event-stream' }));
+    expect(res.status).toBe(413);
+    expect(res.headers.get('content-type')).toContain('application/json');
+  });
+
+  test('should include CORS headers on the stream', async () => {
+    const handler = createHandler({ schema: sseSchema, sse: true, cors: true });
+    const res = await handler(
+      post(
+        { query: '{ hello }' },
+        { accept: 'text/event-stream', Origin: 'http://example.com' }
+      )
+    );
+    expect(res.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
+    expect(res.headers.get('access-control-allow-origin')).not.toBeNull();
+    await res.text();
+  });
+
+  test('should keep the SSE content type and cache headers over config.response.headers', async () => {
+    const handler = createHandler({
+      schema: sseSchema,
+      sse: true,
+      response: { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public', 'X-App': '1' } },
+    });
+    const res = await handler(post({ query: '{ hello }' }, { accept: 'text/event-stream' }));
+    expect(res.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
+    expect(res.headers.get('cache-control')).toBe('no-cache, no-transform');
+    expect(res.headers.get('x-app')).toBe('1');
+    await res.text();
+  });
+
+  test('should answer JSON when sse is not enabled', async () => {
+    const handler = createHandler({ schema: sseSchema });
+    const res = await handler(post({ query: '{ hello }' }, { accept: 'text/event-stream' }));
+    expect(res.headers.get('content-type')).toContain('application/json');
+    expect((await res.json()).data).toEqual({ hello: 'world' });
+  });
+
+  test('should answer JSON for Accept */* even with sse enabled', async () => {
+    const handler = createHandler({ schema: sseSchema, sse: true });
+    const res = await handler(post({ query: '{ hello }' }, { accept: '*/*' }));
+    expect(res.headers.get('content-type')).toContain('application/json');
+    expect((await res.json()).data).toEqual({ hello: 'world' });
+  });
+
+  test('should pass the configured keepAliveInterval through', async () => {
+    const handler = createHandler({
+      schema: sseSchema,
+      sse: { keepAliveInterval: 20 },
+    });
+    const res = await handler(
+      post({ query: 'subscription { pending }' }, { accept: 'text/event-stream' })
+    );
+    expect(res.status).toBe(200);
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let text = '';
+    const deadline = Date.now() + 500;
+    while (Date.now() < deadline && !text.includes(':\n\n')) {
+      const chunk = await Promise.race([
+        reader.read(),
+        Bun.sleep(Math.max(0, deadline - Date.now())).then(() => null),
+      ]);
+      if (chunk === null || chunk.done) {
+        break;
+      }
+      text += decoder.decode(chunk.value);
+    }
+    await reader.cancel();
+    expect(text).toContain(':\n\n');
   });
 });
 

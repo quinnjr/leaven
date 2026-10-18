@@ -123,6 +123,44 @@ import { SeoService } from '../services/seo.service';
         <app-code-block [code]="clientCode" title="client.ts" />
       </section>
 
+      <!-- Server-Sent Events -->
+      <section id="server-sent-events" class="mb-12">
+        <h2 class="text-2xl font-semibold text-white mb-4">Server-Sent Events</h2>
+        <p class="text-zinc-400 mb-4">
+          Prefer plain HTTP to WebSockets? <code class="text-green-400">&#64;leaven-graphql/sse</code>
+          implements the graphql-sse protocol in <strong class="text-white">distinct connections
+          mode</strong>: each operation gets its own request and event stream. It is off by default;
+          enable it with the <code class="text-green-400">sse</code> option:
+        </p>
+        <app-code-block [code]="sseServerCode" title="server.ts" />
+        <p class="text-zinc-400 mt-6 mb-4">Connect from the browser with the graphql-sse client:</p>
+        <app-code-block [code]="sseClientCode" title="client.ts" />
+        <p class="text-zinc-400 mt-6 mb-4">
+          Mutations sent with <code class="text-green-400">GET</code> are rejected with
+          <code class="text-green-400">405</code> and <code class="text-green-400">Allow: POST</code>.
+          A keep-alive comment is sent every 8000 ms by default (<code class="text-green-400">0</code>
+          disables it) to stay under Bun's 10 second idle timeout; the server turns that timeout off while
+          a stream is open and restores it afterwards. Over HTTP/1.1 browsers allow only about 6 connections per origin, so many live
+          subscriptions on one page call for HTTP/2.
+        </p>
+        <p class="text-zinc-400 mb-4">
+          Only request errors (no <code class="text-green-400">data</code>, and rejected by the executor
+          before any resolver ran, such as a validation error; see
+          <code class="text-green-400">isRequestError</code>) are answered as non-200 JSON.
+          Execution errors are streamed, because the graphql-sse client retries every non-200 response
+          (<code class="text-green-400">retryAttempts</code>, default 5), and a retried mutation would run again.
+        </p>
+        <p class="text-zinc-400 mb-4">
+          Frameworks that own routing, such as Knead, can use the low-level API: build the context, run the operation with
+          <code class="text-green-400">executor.subscribe</code> or <code class="text-green-400">executor.execute</code>,
+          answer request errors as plain JSON, stream the rest, and mask errors with
+          <code class="text-green-400">formatResultErrors</code>. Only send subscription operations to
+          <code class="text-green-400">executor.subscribe()</code>: graphql-js runs the root resolver of a query or
+          mutation if you pass one, which is why the sample routes by operation type first.
+        </p>
+        <app-code-block [code]="sseLowLevelCode" title="custom-transport.ts" />
+      </section>
+
       <!-- API Reference -->
       <section class="mb-12">
         <h2 class="text-2xl font-semibold text-white mb-4">API Reference</h2>
@@ -514,4 +552,87 @@ const unsubscribe = client.subscribe(
 
 // Later: unsubscribe
 unsubscribe();`;
+
+  sseServerCode = `import { createServer } from '@leaven-graphql/http';
+import { schema } from './schema';
+
+createServer({
+  schema,
+  // true, or tune the keep-alive comment interval in milliseconds
+  sse: { keepAliveInterval: 5000 },
+}).start();`;
+
+  sseClientCode = `import { createClient } from 'graphql-sse';
+
+const client = createClient({ url: '/graphql' });
+
+for await (const result of client.iterate({
+  query: 'subscription { messageAdded { id content } }',
+})) {
+  console.log('New message:', result.data);
+}`;
+
+  sseLowLevelCode = `import { getOperationAST } from 'graphql';
+import { LeavenExecutor, type GraphQLRequest, type GraphQLResponse } from '@leaven-graphql/core';
+import { formatErrors } from '@leaven-graphql/errors';
+import {
+  acceptsEventStream,
+  createEventStreamResponse,
+  formatResultErrors,
+  isRequestError,
+  isSubscriptionIterator,
+} from '@leaven-graphql/sse';
+import { schema } from './schema';
+
+const executor = new LeavenExecutor({ schema });
+
+// Mask unexpected errors; intentional Leaven errors keep their code and path
+const masking = { maskErrors: true };
+
+// Request errors all answer 400 here for brevity; @leaven-graphql/http derives
+// the status from each error's code instead
+const json = (body: GraphQLResponse, status = 400): Response => Response.json(body, { status });
+
+export async function handleGraphQL(request: Request): Promise<Response> {
+  if (!acceptsEventStream(request)) {
+    return new Response('Not Acceptable', { status: 406 });
+  }
+
+  const graphqlRequest = (await request.json()) as GraphQLRequest;
+  const context = { user: request.headers.get('authorization') };
+
+  // executor.parse applies the executor's parser limits; a syntax error throws
+  let operation;
+  try {
+    operation = getOperationAST(
+      await executor.parse(graphqlRequest.query),
+      graphqlRequest.operationName
+    );
+  } catch (error) {
+    return json({ errors: formatErrors([error], masking) });
+  }
+  if (!operation) {
+    return json({ errors: [{ message: 'Unknown operation' }] });
+  }
+
+  // Subscriptions go through subscribe, queries and mutations through execute
+  const source =
+    operation.operation === 'subscription'
+      ? await executor.subscribe(graphqlRequest, context)
+      : (await executor.execute(graphqlRequest, context)).response;
+
+  // Only a result the executor rejected before running anything is answered as
+  // JSON. Check the executor's own object: the mark does not survive a copy.
+  // Everything else is streamed, or the client's retries would run it again.
+  if (!isSubscriptionIterator(source) && isRequestError(source)) {
+    return json(formatResultErrors(source, masking));
+  }
+
+  return createEventStreamResponse(source, {
+    // Closing the connection ends the stream and returns the iterator
+    signal: request.signal,
+    // Mask every result's errors before it is serialised
+    formatResult: (response) => formatResultErrors(response, masking),
+  });
+}`;
 }

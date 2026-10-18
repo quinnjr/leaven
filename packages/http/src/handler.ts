@@ -5,16 +5,24 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import type { GraphQLSchema } from 'graphql';
-import { LeavenExecutor, type ExecutorConfig, type GraphQLRequest } from '@leaven-graphql/core';
-import { createRequestContext, type RequestContextConfig } from '@leaven-graphql/context';
+import { getOperationAST, OperationTypeNode, type GraphQLSchema } from 'graphql';
 import {
-  formatError,
-  fromFormattedError,
-  isLeavenError,
-  type ErrorMaskingOptions,
-} from '@leaven-graphql/errors';
+  LeavenExecutor,
+  type ExecutorConfig,
+  type GraphQLRequest,
+  type GraphQLResponse,
+} from '@leaven-graphql/core';
+import { createRequestContext, type RequestContextConfig } from '@leaven-graphql/context';
+import { formatError, isLeavenError, type ErrorMaskingOptions } from '@leaven-graphql/errors';
 import { renderGraphiQL } from '@leaven-graphql/playground';
+import {
+  acceptsEventStream,
+  createEventStreamResponse,
+  formatResultErrors,
+  isRequestError,
+  isSubscriptionIterator,
+  type EventStreamSource,
+} from '@leaven-graphql/sse';
 
 import { parseBody, parseQuery, validateRequest } from './request';
 import {
@@ -39,6 +47,14 @@ export type ContextFactory<TContext> = (
   request: Request,
   graphqlRequest: GraphQLRequest
 ) => TContext | Promise<TContext>;
+
+/**
+ * GraphQL over SSE options
+ */
+export interface SSEOptions {
+  /** ms between keep-alive comments (default 8000; 0 disables) */
+  keepAliveInterval?: number;
+}
 
 /**
  * Handler configuration
@@ -75,6 +91,11 @@ export interface HandlerConfig<TContext = unknown> {
    * (default: 30_000). Bounds slow-loris style trickled uploads.
    */
   bodyReadTimeoutMs?: number;
+  /**
+   * Serve GraphQL over SSE (graphql-sse distinct connections mode) to
+   * requests that Accept text/event-stream. Default: off.
+   */
+  sse?: boolean | SSEOptions;
 }
 
 /** Default maximum request body size in bytes */
@@ -158,6 +179,67 @@ async function readBodyWithLimit(
 }
 
 /**
+ * Determine the operation type a request would execute.
+ *
+ * Returns `undefined` on a parse failure or an ambiguous operation, so that
+ * execution reports the real error.
+ */
+async function operationTypeOf(
+  executor: LeavenExecutor,
+  request: GraphQLRequest
+): Promise<OperationTypeNode | undefined> {
+  try {
+    const document = await executor.parse(request.query);
+    return getOperationAST(document, request.operationName ?? undefined)?.operation;
+  } catch {
+    // Swallowed on purpose: execution parses the document again and reports
+    // the syntax error to the client with its proper code.
+    return undefined;
+  }
+}
+
+/**
+ * Apply the configured error formatting to a response.
+ *
+ * Delegates to `formatResultErrors`, which rebuilds the executor's
+ * already-formatted errors before formatting them. Without options the
+ * response is returned unchanged, so nothing is masked by default.
+ */
+function formatResponseErrors<TData>(
+  response: GraphQLResponse<TData>,
+  options?: ErrorMaskingOptions
+): GraphQLResponse<TData> {
+  return options ? formatResultErrors(response, options) : response;
+}
+
+/**
+ * Execute a request for the SSE transport and pick the source to stream.
+ *
+ * Subscriptions go through `subscribe`, everything else through `execute`.
+ * Returns the source to stream, or the single response to answer as JSON
+ * when it is a request error (`isRequestError` from `@leaven-graphql/sse`:
+ * no data, and marked by the executor as rejected before execution). The
+ * check runs on the executor's own object, before `formatResponseErrors`
+ * clones it, because the mark is identity-based. The rule applies
+ * to an `execute()` response and to a `subscribe()` result that is not an
+ * iterator alike.
+ */
+async function executeForStream<TContext>(
+  executor: LeavenExecutor,
+  request: GraphQLRequest,
+  context: TContext
+): Promise<{ stream: EventStreamSource } | { json: GraphQLResponse }> {
+  const result =
+    (await operationTypeOf(executor, request)) === OperationTypeNode.SUBSCRIPTION
+      ? await executor.subscribe(request, context)
+      : (await executor.execute(request, context)).response;
+  if (isSubscriptionIterator(result) || !isRequestError(result)) {
+    return { stream: result };
+  }
+  return { json: result };
+}
+
+/**
  * Create a GraphQL HTTP handler for Bun
  */
 export function createHandler<TContext = unknown>(
@@ -175,6 +257,8 @@ export function createHandler<TContext = unknown>(
   const maxBodySize = config.maxBodySize ?? DEFAULT_MAX_BODY_SIZE;
   const bodyReadTimeoutMs =
     config.bodyReadTimeoutMs ?? DEFAULT_BODY_READ_TIMEOUT_MS;
+  const sseOptions: SSEOptions | undefined =
+    config.sse === true ? {} : config.sse || undefined;
   const playgroundHtml = config.playground
     ? renderGraphiQL({ endpoint: config.path ?? '/graphql' })
     : null;
@@ -200,6 +284,11 @@ export function createHandler<TContext = unknown>(
         ...(corsConfig !== undefined ? corsHeaders(request, corsConfig) : {}),
       },
     };
+
+    const wantsStream =
+      sseOptions !== undefined &&
+      (method === 'GET' || method === 'POST') &&
+      acceptsEventStream(request);
 
     try {
       // Parse the request
@@ -297,6 +386,23 @@ export function createHandler<TContext = unknown>(
 
       const graphqlRequest = validation.request!;
 
+      // Mutations are not safe over GET (GraphQL over HTTP spec); reject
+      // before any per-request work such as the context factory runs.
+      if (
+        method === 'GET' &&
+        (await operationTypeOf(executor, graphqlRequest)) === OperationTypeNode.MUTATION
+      ) {
+        return buildErrorResponse(
+          'Mutations can only be sent with POST',
+          405,
+          'BAD_REQUEST',
+          {
+            ...responseOptions,
+            headers: { ...responseOptions.headers, Allow: 'POST' },
+          }
+        );
+      }
+
       // Build context
       let context: TContext | undefined;
       if (config.context) {
@@ -306,22 +412,32 @@ export function createHandler<TContext = unknown>(
         context = createRequestContext(request, config.requestContext) as TContext;
       }
 
+      if (wantsStream) {
+        const outcome = await executeForStream(executor, graphqlRequest, context);
+        if ('json' in outcome) {
+          return buildResponse(
+            formatResponseErrors(outcome.json, config.errorFormatting),
+            responseOptions
+          );
+        }
+        // The original request's signal: it aborts when the client goes away,
+        // which the rebuilt body request's signal never does.
+        return createEventStreamResponse(outcome.stream, {
+          signal: request.signal,
+          keepAliveInterval: sseOptions.keepAliveInterval,
+          formatResult: (r) => formatResponseErrors(r, config.errorFormatting),
+          formatError: (e) => formatError(e, config.errorFormatting ?? { maskErrors: true }),
+          headers: responseOptions.headers,
+        });
+      }
+
       // Execute the query
       const result = await executor.execute(graphqlRequest, context);
 
-      // Format errors if configured. The executor hands back already-formatted
-      // errors, so each one is rebuilt into a GraphQLError first — formatting a
-      // formatted error would stringify it to "[object Object]".
-      if (result.response.errors && config.errorFormatting) {
-        result.response = {
-          ...result.response,
-          errors: result.response.errors.map((e) =>
-            formatError(fromFormattedError(e), config.errorFormatting)
-          ),
-        };
-      }
-
-      return buildResponse(result.response, responseOptions);
+      return buildResponse(
+        formatResponseErrors(result.response, config.errorFormatting),
+        responseOptions
+      );
     } catch (error) {
       // Anything thrown outside execution (notably the context factory) lands
       // here, so it must go through the same masking as execution errors —

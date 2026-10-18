@@ -85,12 +85,41 @@ const server = createServer({
   // Subscriptions: upgrades `Upgrade: websocket` requests on `path`
   websocket: new WebSocketHandler({ schema }),
 
+  // GraphQL over SSE (graphql-sse, distinct connections). Off by default;
+  // answers requests that Accept text/event-stream. `true` or
+  // `{ keepAliveInterval: 8000 }` (ms, 0 disables)
+  sse: true,
+
   // Lifecycle hooks
   onStart: (server) => console.log('Server started'),
   onStop: () => console.log('Server stopped'),
   onError: (error, request) => new Response('Error', { status: 500 }),
 });
 ```
+
+### Server-Sent Events
+
+Set `sse` to serve GraphQL over SSE (graphql-sse, distinct connections mode) to
+requests that `Accept` `text/event-stream`. It is off by default; with `sse`
+unset behaviour is unchanged. Subscriptions stream results, and queries and
+mutations answer with one `next` event then `complete`. Only request errors
+(no `data`, and rejected by the executor before any resolver ran: a syntax,
+validation, complexity, depth, operation-selection or variable-coercion error;
+see `isRequestError` in `@leaven-graphql/sse`) get a plain JSON response.
+Everything else, `data: null` and coded errors raised after execution started
+included, is streamed, because the `graphql-sse` client
+retries non-`200` responses. `LeavenServer` disables Bun's idle timeout while an event
+stream is open and restores it when the stream closes. See
+[`@leaven-graphql/sse`](../sse) for the client and the low-level API.
+
+Errors in a streamed result (from resolvers) follow `errorFormatting`, exactly
+as on the JSON path: without it nothing is masked. An error thrown by the
+subscription iterator itself mid-stream is masked by default, and follows
+`errorFormatting` when it is set. The SSE `Content-Type` and `Cache-Control`
+always win over `response.headers`; other headers, CORS included, are kept.
+
+A mutation sent with `GET` is rejected with `405` and `Allow: POST` on every
+path, whether or not `sse` is enabled.
 
 ### CORS Configuration
 
@@ -210,6 +239,11 @@ interface HandlerConfig<TContext = unknown> {
   introspection?: boolean;
   maxBodySize?: number;
   bodyReadTimeoutMs?: number;
+  sse?: boolean | SSEOptions;
+}
+
+interface SSEOptions {
+  keepAliveInterval?: number; // default 8000, 0 disables
 }
 ```
 

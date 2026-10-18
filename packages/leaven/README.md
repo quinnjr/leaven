@@ -49,6 +49,7 @@ console.log('🚀 Server ready at http://localhost:4000/graphql');
 | `@leaven-graphql/core` | Core execution engine |
 | `@leaven-graphql/http` | HTTP server integration |
 | `@leaven-graphql/ws` | WebSocket subscriptions |
+| `@leaven-graphql/sse` | GraphQL over Server-Sent Events (graphql-sse) |
 | `@leaven-graphql/context` | Request context management |
 | `@leaven-graphql/errors` | Error handling utilities |
 | `@leaven-graphql/schema` | Schema building utilities (**selected** helpers only — see below) |
@@ -183,6 +184,14 @@ pubsub.publish('MESSAGE_ADDED', message);
 const iterator = pubsub.asyncIterator('MESSAGE_ADDED');
 ```
 
+### From Server-Sent Events
+
+```typescript
+import { leaven } from '@leaven-graphql/leaven';
+
+leaven({ schema, sse: true }).start();
+```
+
 ## Documentation
 
 For full documentation, visit the [Leaven Documentation](https://leaven.dev).
@@ -198,6 +207,7 @@ For full documentation, visit the [Leaven Documentation](https://leaven.dev).
 
 - [HTTP Server](/http) - Bun HTTP integration
 - [WebSocket](/websockets) - Real-time subscriptions
+- [Server-Sent Events](/websockets#server-sent-events) - Subscriptions over SSE
 - [NestJS](/nestjs) - NestJS framework integration
 - [Playground](/playground) - GraphQL IDE
 
