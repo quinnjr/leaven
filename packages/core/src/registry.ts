@@ -20,7 +20,14 @@ export interface OperationRegistryConfig {
   compile?: boolean;
   /** Compiler options */
   compilerOptions?: CompilerOptions;
-  /** Allow unregistered operations (default: true) */
+  /**
+   * Policy flag (default: true) that the registry exposes as
+   * {@link OperationRegistry.allowUnregistered} for a transport to enforce.
+   * The registry itself does not enforce it: it has no execute path, so it
+   * never rejects an unregistered operation. No Leaven transport reads it
+   * either; enforce it in your own request handling (for example, look the
+   * operation up before calling `execute`).
+   */
   allowUnregistered?: boolean;
 }
 
@@ -59,6 +66,10 @@ export class OperationRegistry {
   private readonly schema: GraphQLSchema;
   private readonly shouldCompile: boolean;
   private readonly compilerOptions?: CompilerOptions;
+  /**
+   * Policy flag for your own request handling to enforce; neither the
+   * registry nor any Leaven transport does.
+   */
   public readonly allowUnregistered: boolean;
 
   constructor(config: OperationRegistryConfig) {

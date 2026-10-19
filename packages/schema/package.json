@@ -1,6 +1,6 @@
 {
   "name": "@leaven-graphql/schema",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Schema building utilities for Leaven GraphQL",
   "type": "module",
   "main": "./src/index.ts",
@@ -44,13 +44,12 @@
     "url": "https://github.com/quinnjr/leaven.git",
     "directory": "packages/schema"
   },
-  "dependencies": {},
   "devDependencies": {
-    "@types/bun": "^1.3.14",
-    "graphql": "^16.8.0",
-    "typescript": "^6.0.0"
+    "@types/bun": "^1.4.3",
+    "graphql": "^17.0.2",
+    "typescript": "^6.0.3"
   },
   "peerDependencies": {
-    "graphql": "^16.0.0"
+    "graphql": "^16.0.0 || ^17.0.0"
   }
 }

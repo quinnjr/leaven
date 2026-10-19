@@ -5,21 +5,37 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import { HttpException } from '@nestjs/common';
 import { AbstractGraphQLDriver } from '@nestjs/graphql';
 import type { GqlModuleOptions } from '@nestjs/graphql';
 import type { GraphQLError, GraphQLFormattedError } from 'graphql';
 import { LeavenExecutor, type ExecutorConfig } from '@leaven-graphql/core';
 import {
-  ERROR_CODES,
   ErrorCode,
+  maskedErrorFor,
   formatError,
   getErrorCode,
   isLeavenError,
+  LeavenError,
+  statusForResponse,
 } from '@leaven-graphql/errors';
 import { renderGraphiQL } from '@leaven-graphql/playground';
 
+import { filterAsyncIterator } from './decorators';
 import { DEFAULT_MAX_TOKENS } from './driver';
+import { httpExceptionCode, normalizeHttpException } from './http-exception';
+import {
+  csrfBlockedError,
+  DEFAULT_BODY_READ_TIMEOUT_MS,
+  DEFAULT_MAX_BODY_SIZE,
+  isCsrfBlocked,
+  mediaType,
+  readHeader,
+  readBodyText,
+  resolveCsrfRequestHeaders,
+  validateGraphQLBody,
+  type BodySource,
+} from './request-body';
+import type { CSRFPreventionOptions } from './types';
 
 /**
  * Minimal Express-shaped request, as produced by the NestJS HTTP adapter.
@@ -34,8 +50,22 @@ interface AdapterRequest {
   originalUrl?: string;
   body?: unknown;
   headers?: Record<string, string | string[] | undefined>;
-  /** The underlying Fetch `Request`, when the adapter exposes one. */
-  raw?: { json?: () => Promise<unknown> };
+  /**
+   * The underlying Fetch `Request`, when the adapter exposes one. Read through
+   * the bounded body reader, never with an unbounded `json()`. Some adapters
+   * put a Node `IncomingMessage` here instead; see {@link fetchRawOf}.
+   */
+  raw?: BodySource | { headers?: unknown };
+}
+
+/**
+ * `req.raw` when it is Fetch-shaped (a `headers.get` function), otherwise
+ * `undefined`, so a Node `IncomingMessage` (plain-object headers) falls back
+ * to the adapter's header map and parsed body instead of throwing.
+ */
+function fetchRawOf(req: AdapterRequest): BodySource | undefined {
+  const raw = req.raw as { headers?: { get?: unknown } } | undefined;
+  return typeof raw?.headers?.get === 'function' ? (raw as BodySource) : undefined;
 }
 
 /**
@@ -46,15 +76,6 @@ interface AdapterResponse {
   json(body: unknown): unknown;
   send(body?: unknown): unknown;
   setHeader(name: string, value: string): unknown;
-}
-
-/**
- * The GraphQL request payload accepted by the POST handler.
- */
-interface GraphQLRequestBody {
-  query?: string;
-  variables?: Record<string, unknown>;
-  operationName?: string;
 }
 
 /**
@@ -94,25 +115,45 @@ export interface LeavenDriverConfig extends GqlModuleOptions {
    * production masking, since a masked error carries no stack to include.
    */
   includeStacktraceInErrorResponses?: boolean;
+  /**
+   * Maximum size, in bytes, of a body read from the raw Fetch `Request` when
+   * the adapter hands over no parsed body. An honest `Content-Length` over it
+   * is rejected unread, and it is also enforced on the bytes read. Over the
+   * limit the request is answered `413 PAYLOAD_TOO_LARGE`. A body your
+   * framework's body parser already parsed is not re-measured: set the limit
+   * on that parser too.
+   *
+   * @default 1_000_000
+   */
+  maxBodySize?: number;
+  /**
+   * Deadline, in milliseconds, for reading a body from the raw Fetch
+   * `Request`. A read that misses it is cancelled and answered
+   * `400 BAD_REQUEST`. `Infinity` or `0` means no deadline (as does any
+   * non-finite or non-positive value), and a value over 2^31-1 is clamped
+   * to it, the longest delay a timer honours.
+   *
+   * @default 30_000
+   */
+  bodyReadTimeoutMs?: number;
+  /**
+   * CSRF prevention (default: on). A POST whose Content-Type is missing or
+   * CORS-safelisted (`text/plain`, `application/x-www-form-urlencoded`,
+   * `multipart/form-data`) is refused with a 400 `BAD_REQUEST` before the
+   * context is built or any resolver runs, unless it carries a non-empty
+   * preflight-forcing header (default: `x-graphql-csrf`,
+   * `apollo-require-preflight`, `x-apollo-operation-name`). This holds
+   * whatever the adapter's body parser made of the body: NestJS's Express
+   * adapter parses form bodies by default, so a cross-site HTML form POST
+   * would otherwise arrive as an object and run. `false` disables the check.
+   *
+   * Configured header names are trimmed and lowercased; one that is not a
+   * valid header token makes `start()` throw a `TypeError`.
+   *
+   * @default true
+   */
+  csrfPrevention?: boolean | CSRFPreventionOptions;
 }
-
-/**
- * HTTP status to {@link ErrorCode} mapping used when a NestJS `HttpException`
- * — the currency of guards, pipes and filters — escapes a resolver.
- *
- * Without this translation such an exception reaches the client as a bare
- * `INTERNAL_ERROR` with a 500, and is masked outright in production, so an
- * authentication failure would be indistinguishable from a crash.
- */
-const HTTP_STATUS_TO_ERROR_CODE: Readonly<Record<number, ErrorCode>> = {
-  400: ErrorCode.BAD_REQUEST,
-  401: ErrorCode.UNAUTHENTICATED,
-  403: ErrorCode.FORBIDDEN,
-  404: ErrorCode.NOT_FOUND,
-  409: ErrorCode.ALREADY_EXISTS,
-  413: ErrorCode.PAYLOAD_TOO_LARGE,
-  429: ErrorCode.RATE_LIMITED,
-};
 
 /**
  * A `@nestjs/graphql` driver that executes with Leaven.
@@ -150,6 +191,11 @@ const HTTP_STATUS_TO_ERROR_CODE: Readonly<Record<number, ErrorCode>> = {
 export class LeavenGraphQLDriver extends AbstractGraphQLDriver<LeavenDriverConfig> {
   private executor: LeavenExecutor | null = null;
   private options: LeavenDriverConfig | null = null;
+  /**
+   * Header names that satisfy CSRF prevention, or `undefined` when
+   * `csrfPrevention` is `false`. Resolved (and validated) in `start()`.
+   */
+  private csrfRequestHeaders: readonly string[] | undefined;
 
   /**
    * Serve the schema `@nestjs/graphql` has already built.
@@ -165,6 +211,7 @@ export class LeavenGraphQLDriver extends AbstractGraphQLDriver<LeavenDriverConfi
       );
     }
 
+    this.csrfRequestHeaders = resolveCsrfRequestHeaders(options.csrfPrevention);
     this.options = options;
     this.executor = new LeavenExecutor({
       schema: options.schema,
@@ -218,6 +265,39 @@ export class LeavenGraphQLDriver extends AbstractGraphQLDriver<LeavenDriverConfi
   }
 
   /**
+   * Apply the `filter` option of `@nestjs/graphql`'s `@Subscription`.
+   *
+   * `@nestjs/graphql` delegates that option to the driver, and the base
+   * `AbstractGraphQLDriver` implementation discards it, so without this
+   * override every subscriber would receive every event. The filter is called
+   * with the resolver instance as `this` and `(payload, variables, context, info)`,
+   * as on the Apollo and Mercurius drivers. Filtering goes through
+   * `filterAsyncIterator`, which forwards cancellation straight to the source
+   * stream.
+   */
+  public override subscriptionWithFilter(
+    instanceRef: unknown,
+    filterFn: (payload: unknown, variables: unknown, context: unknown) => boolean | Promise<boolean>,
+    createSubscribeContext: () => (...args: unknown[]) => unknown
+  ): (...args: unknown[]) => Promise<AsyncIterableIterator<unknown>> {
+    return async (...args: unknown[]) => {
+      const source = (await createSubscribeContext()(...args)) as AsyncIterable<unknown>;
+      // Hand a non-iterable back untouched so graphql-js reports its usual
+      // "must return Async Iterable" error at subscribe time, not mid-stream.
+      if (!(Symbol.asyncIterator in Object(source))) {
+        return source as never;
+      }
+      return filterAsyncIterator(source, (payload) =>
+        (filterFn as (...a: unknown[]) => boolean | Promise<boolean>).call(
+          instanceRef,
+          payload,
+          ...args.slice(1)
+        )
+      );
+    };
+  }
+
+  /**
    * Execute one GraphQL operation and write the HTTP response.
    */
   private async handleOperation(
@@ -236,10 +316,37 @@ export class LeavenGraphQLDriver extends AbstractGraphQLDriver<LeavenDriverConfi
       return;
     }
 
-    let body: GraphQLRequestBody;
+    // CSRF prevention runs before the body is read or the context is built,
+    // whatever shape the adapter's body parser left `req.body` in.
+    if (
+      this.csrfRequestHeaders !== undefined &&
+      isCsrfBlocked(
+        LeavenGraphQLDriver.contentTypeOf(req),
+        (name) => readHeader(req.headers, name) ?? fetchRawOf(req)?.headers.get(name),
+        this.csrfRequestHeaders
+      )
+    ) {
+      const error = csrfBlockedError();
+      this.respond(res, { errors: [this.formatThrownError(error)] }, error.statusCode);
+      return;
+    }
+
+    let body: unknown;
     try {
-      body = await LeavenGraphQLDriver.readBody(req);
-    } catch {
+      body = await LeavenGraphQLDriver.readBody(
+        req,
+        this.options?.maxBodySize ?? DEFAULT_MAX_BODY_SIZE,
+        this.options?.bodyReadTimeoutMs ?? DEFAULT_BODY_READ_TIMEOUT_MS
+      );
+    } catch (error) {
+      // A 413 or a failed or timed-out read is already a coded LeavenError
+      // with its own status; only a JSON syntax error is "malformed".
+      // Its own statusCode wins: a 415 is coded BAD_REQUEST, which
+      // ERROR_CODES alone would answer with 400.
+      if (isLeavenError(error)) {
+        this.respond(res, { errors: [this.formatThrownError(error)] }, error.statusCode);
+        return;
+      }
       this.respond(res, {
         errors: [
           {
@@ -251,29 +358,18 @@ export class LeavenGraphQLDriver extends AbstractGraphQLDriver<LeavenDriverConfi
       return;
     }
 
-    if (!body.query) {
-      this.respond(res, {
-        errors: [
-          {
-            message: 'Query is required',
-            extensions: { code: ErrorCode.BAD_REQUEST },
-          },
-        ],
-      });
-      return;
-    }
-
-    const context = await this.buildContext(req, res);
-
     try {
-      const result = await this.executor.execute(
-        {
-          query: body.query,
-          variables: body.variables,
-          operationName: body.operationName,
-        },
-        context
-      );
+      // Validated inside the try so the `ValidationError` for a non-object
+      // body (JSON `null`, say), a missing or non-string query, non-object
+      // variables or a non-string operationName reaches the client as a coded
+      // 400 through `formatThrownError`.
+      const operation = validateGraphQLBody(body);
+
+      // A context factory that throws (an `AuthenticationError` for a bad
+      // token, say) must likewise reach the client as a coded error with its
+      // own status, not as an unhandled rejection.
+      const context = await this.buildContext(req, res);
+      const result = await this.executor.execute(operation, context);
 
       const extensions =
         this.options?.metrics && result.metrics
@@ -285,8 +381,17 @@ export class LeavenGraphQLDriver extends AbstractGraphQLDriver<LeavenDriverConfi
         errors: result.response.errors,
         extensions,
       });
-    } catch (error) {
-      this.respond(res, { errors: [this.formatThrownError(error)] });
+    } catch (thrown) {
+      // A LeavenError carries its own status (a 409 BAD_REQUEST, say), which
+      // `ERROR_CODES` cannot recover from the code alone. A NestJS
+      // `HttpException` (from a context factory, say) is normalised first so
+      // it gets its own status too.
+      const error = normalizeHttpException(thrown);
+      this.respond(
+        res,
+        { errors: [this.formatThrownError(error)] },
+        isLeavenError(error) ? error.statusCode : undefined
+      );
     }
   }
 
@@ -334,11 +439,15 @@ export class LeavenGraphQLDriver extends AbstractGraphQLDriver<LeavenDriverConfi
    * Write a GraphQL response with the status the error-handling conventions
    * require.
    *
-   * A response carrying `data` is a spec-conformant partial success and stays
-   * 200 whatever the error codes say — anything else makes clients treat it as
-   * a network failure and discard data they were given. Only a total failure
-   * derives its status from the first error's `ErrorCode`, via the
-   * `ERROR_CODES` registry that `@leaven-graphql/http` uses.
+   * A response with non-null `data` is a spec-conformant partial success and
+   * stays 200 whatever the error codes say — anything else makes clients treat
+   * it as a network failure and discard data they were given. Only a total
+   * failure (`data` absent or `null`) derives its status from the first error's `ErrorCode`, via
+   * `statusForResponse` from `@leaven-graphql/errors` — the same rule
+   * `@leaven-graphql/http` and the `LeavenModule` middleware use.
+   *
+   * `statusOverride` is for a rejection whose status `ERROR_CODES` cannot
+   * express, such as a 415 coded `BAD_REQUEST`.
    */
   private respond(
     res: AdapterResponse,
@@ -346,18 +455,12 @@ export class LeavenGraphQLDriver extends AbstractGraphQLDriver<LeavenDriverConfi
       data?: Record<string, unknown> | null;
       errors?: readonly GraphQLFormattedError[];
       extensions?: Record<string, unknown>;
-    }
+    },
+    statusOverride?: number
   ): void {
     const errors = response.errors?.map((error) => this.finalizeError(error));
     const hasErrors = errors !== undefined && errors.length > 0;
-    const totalFailure = response.data === undefined || response.data === null;
-
-    let status = 200;
-    if (hasErrors && totalFailure) {
-      const code = errors[0]?.extensions?.code;
-      const known = typeof code === 'string' ? getErrorCode(code) : null;
-      status = known ? ERROR_CODES[known].status : 500;
-    }
+    const status = statusOverride ?? statusForResponse({ data: response.data, errors });
 
     const body: Record<string, unknown> = {};
     if (response.data !== undefined) {
@@ -402,10 +505,7 @@ export class LeavenGraphQLDriver extends AbstractGraphQLDriver<LeavenDriverConfi
       !includeStack;
 
     const finalized: GraphQLFormattedError = mask
-      ? {
-          message: 'An unexpected error occurred',
-          extensions: { code: ErrorCode.INTERNAL_ERROR },
-        }
+      ? maskedErrorFor(error)
       : {
           ...error,
           extensions: { ...error.extensions, code: resolved },
@@ -424,20 +524,22 @@ export class LeavenGraphQLDriver extends AbstractGraphQLDriver<LeavenDriverConfi
    * real message from the developer — and `includeStacktraceInErrorResponses`
    * suppresses masking outright, since a masked error carries no stack to
    * include. This matches `LeavenDriver.execute`.
+   *
+   * The user's `formatError` is deliberately not applied here: every caller
+   * hands the result to {@link respond}, whose {@link finalizeError} applies
+   * it, so the hook runs exactly once per error on every path.
    */
-  private formatThrownError(error: unknown): GraphQLFormattedError {
+  private formatThrownError(thrown: unknown): GraphQLFormattedError {
+    // A NestJS `HttpException` keeps its mapped code and message.
+    const error = normalizeHttpException(thrown);
     const includeStack = this.options?.includeStacktraceInErrorResponses ?? false;
-    const formatted = formatError(error, {
+    return formatError(error, {
       maskErrors:
         !isLeavenError(error) &&
         process.env.NODE_ENV === 'production' &&
         !includeStack,
       includeStackTrace: includeStack,
     });
-
-    return this.options?.formatError
-      ? this.options.formatError(formatted)
-      : formatted;
   }
 
   /**
@@ -445,25 +547,73 @@ export class LeavenGraphQLDriver extends AbstractGraphQLDriver<LeavenDriverConfi
    *
    * The adapter may hand over an already-parsed body, a raw string, or nothing
    * at all when no body-parser is installed; the raw Fetch `Request` is the
-   * last resort.
+   * last resort, read bounded by `maxBytes` and `timeoutMs`.
+   *
+   * When the driver parses the body itself (a raw string, or the raw Fetch
+   * `Request`), the `Content-Type` must name `application/json`. An object
+   * the framework's body parser already produced is accepted as-is: by then
+   * `csrfPrevention` has already refused a CORS-simple POST (a form or
+   * `text/plain` body without a preflight-forcing header), whatever the
+   * parser made of it.
+   *
+   * @throws LeavenError from the bounded read (413 or 400), a `BAD_REQUEST`
+   *   with `statusCode` 415 for a missing or non-JSON `Content-Type`, or a
+   *   `SyntaxError` for a body that is not JSON
    */
-  private static async readBody(req: AdapterRequest): Promise<GraphQLRequestBody> {
+  private static async readBody(
+    req: AdapterRequest,
+    maxBytes: number,
+    timeoutMs: number
+  ): Promise<unknown> {
     const raw = req.body;
 
     if (typeof raw === 'string') {
-      return JSON.parse(raw) as GraphQLRequestBody;
+      LeavenGraphQLDriver.assertJsonContentType(req);
+      return JSON.parse(raw) as unknown;
     }
 
     if (raw !== null && typeof raw === 'object' && !(raw instanceof ArrayBuffer)) {
-      return raw as GraphQLRequestBody;
+      return raw;
     }
 
-    const json = req.raw?.json;
-    if (json) {
-      return (await json.call(req.raw)) as GraphQLRequestBody;
+    const fetchRaw = fetchRawOf(req);
+    if (fetchRaw) {
+      LeavenGraphQLDriver.assertJsonContentType(req);
+      return JSON.parse(await readBodyText(fetchRaw, maxBytes, timeoutMs)) as unknown;
     }
 
     return {};
+  }
+
+  /**
+   * Reject a body the driver would parse itself unless its `Content-Type`
+   * names exactly `application/json` (parameters such as `charset` are
+   * ignored), the same 415 `BAD_REQUEST` refusal `LeavenDriver.handleRequest`
+   * gives an unsupported `Content-Type`.
+   *
+   * The type is read from the raw Fetch `Request` first, then from the
+   * adapter's header map.
+   *
+   * @throws LeavenError coded `BAD_REQUEST` with `statusCode` 415
+   */
+  private static assertJsonContentType(req: AdapterRequest): void {
+    if (mediaType(LeavenGraphQLDriver.contentTypeOf(req)) !== 'application/json') {
+      throw new LeavenError(
+        'Unsupported Content-Type: use application/json',
+        ErrorCode.BAD_REQUEST,
+        { statusCode: 415 }
+      );
+    }
+  }
+
+  /**
+   * The request's raw `Content-Type`: from the raw Fetch `Request` first,
+   * then from the adapter's header map.
+   */
+  private static contentTypeOf(req: AdapterRequest): string | null | undefined {
+    return (
+      fetchRawOf(req)?.headers.get('content-type') ?? readHeader(req.headers, 'content-type')
+    );
   }
 
   /**
@@ -483,19 +633,13 @@ export class LeavenGraphQLDriver extends AbstractGraphQLDriver<LeavenDriverConfi
    */
   private static formatExecutionError(error: GraphQLError): GraphQLFormattedError {
     const formatted = error.toJSON();
-    const original = error.originalError;
+    const mapped = httpExceptionCode(error.originalError);
 
-    if (!(original instanceof HttpException)) {
+    if (mapped === undefined) {
       return formatted;
     }
 
-    const status = original.getStatus();
-    const code =
-      HTTP_STATUS_TO_ERROR_CODE[status] ??
-      (status >= 400 && status < 500
-        ? ErrorCode.BAD_REQUEST
-        : ErrorCode.INTERNAL_ERROR);
-
+    const { code, status } = mapped;
     return {
       ...formatted,
       extensions: { ...formatted.extensions, code, statusCode: status },

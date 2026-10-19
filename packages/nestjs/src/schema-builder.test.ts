@@ -251,7 +251,7 @@ describe('SchemaBuilderService with typeDefs', () => {
     expect(result).toBeNull();
   });
 
-  test('builds an executable schema whose resolvers actually run', async () => {
+  test('should build an executable schema whose resolvers actually run', async () => {
     const options: LeavenModuleOptions = {
       typeDefs: 'type Query { hello: String }',
       resolvers: { Query: { hello: () => 'world' } },
@@ -267,7 +267,7 @@ describe('SchemaBuilderService with typeDefs', () => {
     expect(result.data).toEqual({ hello: 'world' });
   });
 
-  test('merges an array of typeDefs into one executable schema', async () => {
+  test('should merge an array of typeDefs into one executable schema', async () => {
     const options: LeavenModuleOptions = {
       typeDefs: [
         `type Query { hello: String }`,
@@ -289,7 +289,7 @@ describe('SchemaBuilderService with typeDefs', () => {
     expect(result.data).toEqual({ hello: 'world', goodbye: 'farewell' });
   });
 
-  test('accepts an array of resolver maps and runs every resolver in it', async () => {
+  test('should accept an array of resolver maps and run every resolver in it', async () => {
     const options: LeavenModuleOptions = {
       typeDefs: `
         type Query {
@@ -311,7 +311,7 @@ describe('SchemaBuilderService with typeDefs', () => {
     expect(result.data).toEqual({ hello: 'world', goodbye: 'farewell' });
   });
 
-  test('hands the executable schema to the driver on module init', async () => {
+  test('should hand the executable schema to the driver on module init', async () => {
     const options: LeavenModuleOptions = {
       typeDefs: 'type Query { hello: String }',
       resolvers: { Query: { hello: () => 'world' } },
@@ -324,7 +324,7 @@ describe('SchemaBuilderService with typeDefs', () => {
     expect(driver.getSchema()).toBe(builder.getSchema());
   });
 
-  test('applies @Description and @Deprecated resolver metadata to schema fields', async () => {
+  test('should apply @Description and @Deprecated resolver metadata to schema fields', async () => {
     class QueryResolvers {
       @Description('Fetch the greeting')
       public hello(): string {
@@ -363,7 +363,7 @@ describe('SchemaBuilderService with autoSchemaFile', () => {
     driver.onModuleDestroy();
   });
 
-  test('throws a clear error because code-first generation is not implemented', async () => {
+  test('should throw a clear error because code-first generation is not implemented', async () => {
     const builder = new SchemaBuilderService({ autoSchemaFile: true }, driver);
 
     await expect(builder.buildSchema()).rejects.toThrow(
@@ -371,7 +371,7 @@ describe('SchemaBuilderService with autoSchemaFile', () => {
     );
   });
 
-  test('fails at bootstrap rather than leaving the driver schemaless', async () => {
+  test('should fail at bootstrap rather than leaving the driver schemaless', async () => {
     const builder = new SchemaBuilderService({ autoSchemaFile: true }, driver);
 
     await expect(builder.onModuleInit()).rejects.toThrow('autoSchemaFile');

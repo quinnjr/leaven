@@ -26,6 +26,9 @@ const handler = createWebSocketHandler({
 Bun.serve({
   port: 4000,
   fetch(request, server) {
+    if (!handler.isOriginAllowed(request)) {
+      return new Response('Forbidden', { status: 403 });
+    }
     // Bun's types require the `data` option, but the handler's `open` replaces
     // socket.data with a fresh WebSocketContext, so nothing needs stashing.
     if (server.upgrade(request, { data: undefined as unknown as WebSocketContext })) {
@@ -141,10 +144,11 @@ const resolvers = {
 
 ### Authentication
 
-Authenticate in `onConnect`. Returning `false` closes the socket with `4403`.
-`onConnect` gets `connectionInitTimeout` (counted from `connection_init`) to
-settle: if it has not, the socket is closed with `4408` and its late result is
-ignored (no ack, no keep-alive; a late rejection is logged). No `subscribe` frame is accepted before a connection is acknowledged
+Authenticate in `onConnect`. Returning `false`, or throwing, closes the socket
+with `4403`. `onConnect` gets `connectionInitTimeout` (counted from
+`connection_init`) to settle: if it has not, the socket is closed with `4408`
+and its late result is ignored (no ack, no keep-alive; a late rejection is
+logged). No `subscribe` frame is accepted before a connection is acknowledged
 (unacknowledged operations are closed with `4401`).
 
 ```typescript
@@ -172,6 +176,50 @@ const handler = createWebSocketHandler({
 The lifecycle hooks may be async; a hook that rejects is logged and never
 takes the connection (or the process) down with it.
 
+### Allowed Origins
+
+Browsers send cookies with a cross-site WebSocket handshake and no CORS
+preflight applies, so a server that accepts any `Origin` is open to
+cross-site WebSocket hijacking. By default only the server's own origin may
+connect: the `Origin` header's host:port must equal the upgrade request's
+`Host` header (case-insensitive, default ports normalised). A request with
+no `Origin` header (a non-browser client) is always allowed.
+
+Behind a reverse proxy that rewrites `Host` (nginx does by default), every
+genuine browser is refused: forward the public Host (`proxy_set_header Host
+$host`) or list the public origin in `allowedOrigins`.
+
+`LeavenServer` checks `isOriginAllowed(request)` before upgrading and answers
+`403 Forbidden` when it fails. Cross-origin browser clients must be listed,
+or allowed with `'*'`:
+
+```typescript
+const handler = createWebSocketHandler({
+  schema,
+  // Added to the server's own origin; '*' allows any origin
+  allowedOrigins: ['https://app.example.com'],
+});
+```
+
+With a standalone `Bun.serve`, call the check yourself before
+`server.upgrade()`:
+
+```typescript
+Bun.serve({
+  fetch(request, server) {
+    if (!handler.isOriginAllowed(request)) {
+      return new Response('Forbidden', { status: 403 });
+    }
+    const data = { connectionId: '', initialized: false, subscriptions: new Set<string>() };
+    if (server.upgrade(request, { data })) {
+      return undefined;
+    }
+    return new Response('Upgrade failed', { status: 400 });
+  },
+  websocket: handler.getWebSocketConfig(),
+});
+```
+
 ### Error Formatting and Masking
 
 `errorFormatting` takes the same `ErrorMaskingOptions` as the HTTP
@@ -179,9 +227,12 @@ transport's option of that name, and is applied the same way:
 
 - An error thrown by `onSubscribe`, the context factory or a source stream is
   sent through `formatError(error, errorFormatting)` from
-  `@leaven-graphql/errors`. A `GraphQLError` or `LeavenError` keeps its
-  message and `extensions.code`; anything else is reported with
-  `INTERNAL_ERROR`, and masked when `maskErrors` is `true`.
+  `@leaven-graphql/errors`. Only a `LeavenError`, or an error with a
+  known code other than `INTERNAL_ERROR`, keeps its message and
+  `extensions.code`; anything else (including an uncoded `GraphQLError`) is
+  masked and reported with `INTERNAL_ERROR`. `maskErrors` defaults to `true`
+  for these, so set `errorFormatting: { maskErrors: false }` to send the raw
+  message.
 - Execution errors the executor already serialised (the `errors` of a `next`
   payload, or of an `error` frame for a rejected operation) are re-formatted
   only when `errorFormatting` is set, as HTTP does.
@@ -192,14 +243,18 @@ import { createWebSocketHandler } from '@leaven-graphql/ws';
 const handler = createWebSocketHandler({
   schema,
   context: async () => ({ db: await getDatabase() }),
-  // A failing getDatabase() is sent as "An unexpected error occurred", not the DSN
-  errorFormatting: { maskErrors: process.env.NODE_ENV === 'production' },
+  // A failing getDatabase() is sent as "An unexpected error occurred", not the DSN.
+  // Thrown errors are masked even without errorFormatting; setting it also
+  // masks errors resolvers raise in `next` payloads.
+  errorFormatting: { maskErrors: true },
 });
+
+// Explicit opt-out: thrown errors reach the client with their raw message
+createWebSocketHandler({ schema, errorFormatting: { maskErrors: false } });
 ```
 
-Without `maskErrors`, a thrown error's message reaches the client verbatim,
-so turn it on in production. Errors with a known Leaven code other than
-`INTERNAL_ERROR` (an `AuthenticationError`, a `FORBIDDEN` `GraphQLError`, the
+Thrown errors are masked unless `maskErrors` is explicitly `false`. Errors
+with a known Leaven code other than `INTERNAL_ERROR` (an `AuthenticationError`, a `FORBIDDEN` `GraphQLError`, the
 `BAD_REQUEST` sent when `maxSubscriptionsPerConnection` is reached) are never
 masked.
 
@@ -288,6 +343,9 @@ class WebSocketHandler<TContext = unknown> {
   ): Promise<void>;
   handleClose(socket: ServerWebSocket<WebSocketContext>): Promise<void>;
 
+  /** Whether an upgrade request's Origin is allowed (see allowedOrigins) */
+  isOriginAllowed(request: Request): boolean;
+
   getWebSocketConfig(): {
     open: (socket: ServerWebSocket<WebSocketContext>) => void;
     message: (
@@ -317,6 +375,11 @@ interface WebSocketHandlerConfig<TContext = unknown> {
   connectionInitTimeout?: number;
   /** Server ping interval; 0 disables keep-alive (default 12000ms) */
   keepAliveInterval?: number;
+  /**
+   * Browser origins allowed to connect, in addition to the server's own
+   * (default: same-origin only). '*' allows any. No Origin is always allowed.
+   */
+  allowedOrigins?: readonly string[] | '*';
   /** Forwarded to the SubscriptionManager (minus `schema`) */
   subscriptionManager?: Omit<SubscriptionManagerConfig, 'schema'>;
   /**
@@ -357,8 +420,12 @@ interface WebSocketContext {
 }
 ```
 
-Close codes follow the protocol: `4400` invalid message, `4401` unauthorized
-(operation before `connection_init`), `4403` rejected by `onConnect`, `4408`
+Close codes follow the protocol: `4400` invalid message (including a `subscribe`
+payload that is not an object with a string `query`, a non-string
+`operationName`, or non-object `variables`/`extensions`, closed with reason
+"Invalid message"), `4401` unauthorized
+(operation before `connection_init`), `4403` rejected by `onConnect` (returned
+`false` or threw), `4408`
 init timeout (no `connection_init`, or an `onConnect` that did not settle in
 time), `4409` duplicate subscription id, `4429` repeated
 `connection_init` (including a second one sent while `onConnect` for the
@@ -484,7 +551,9 @@ interface PubSubConfig {
   /**
    * Payloads an `asyncIterator` buffers while nothing is pulling. When full,
    * the OLDEST payload is dropped so a slow consumer sees the most recent
-   * events instead of an unbounded queue. Unlimited by default.
+   * events instead of an unbounded queue. Unlimited by default. Must be an
+   * integer >= 1 or `Infinity`; anything else (including `0`) makes the
+   * `PubSub` constructor throw a `TypeError`.
    */
   maxQueueSize?: number;
   /** Destination for subscriber callback errors (default `console`) */
@@ -506,7 +575,8 @@ function createConnectionAck(payload?: Record<string, unknown>): ConnectionAckMe
 function createNextMessage(
   id: string,
   data: Record<string, unknown> | null | undefined,
-  errors?: readonly { message: string }[]
+  errors?: readonly { message: string }[],
+  extensions?: Record<string, unknown> // forwarded as payload.extensions when set
 ): NextMessage;
 function createErrorMessage(
   id: string,
@@ -548,7 +618,10 @@ const message = parseMessage(data, { requireId: false });
 `parseMessage` throws on invalid JSON, on JSON that is not an object, on a
 missing or unknown `type`, and — unless `requireId` is `false` — on a missing
 `id`, or on a `subscribe`/`complete` id that does not match
-`OPERATION_ID_PATTERN` (`Invalid message`). The server closes the socket with
+`OPERATION_ID_PATTERN` (`Invalid message`). It also throws `Invalid message`,
+whatever `requireId` is, on a `subscribe` whose payload is not an object with a
+string `query`, or that has a non-string `operationName` or non-object
+`variables`/`extensions` (`null` is accepted for all three). The server closes the socket with
 4400 in every one of those cases. Ids are client-chosen and reach close
 reasons and log lines, so the allow-list keeps control characters and
 oversized strings out of both; UUIDs, counters and `prefix:n` ids all pass.

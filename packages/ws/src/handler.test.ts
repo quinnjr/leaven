@@ -262,6 +262,79 @@ const SUBSCRIBE_SLOW =
   '{"id":"sub-1","type":"subscribe","payload":{"query":"subscription { slow }"}}';
 
 describe('WebSocketHandler', () => {
+  describe('isOriginAllowed', () => {
+    /** An upgrade request to `host` carrying `origin` (if given). */
+    function upgrade(host: string, origin?: string): Request {
+      const headers: Record<string, string> = { host, upgrade: 'websocket' };
+      if (origin !== undefined) {
+        headers.origin = origin;
+      }
+      return new Request(`http://${host}/graphql`, { headers });
+    }
+
+    test('should fall back to the request URL host when there is no Host header', () => {
+      const handler = createHandler();
+      const request = new Request('http://api.example.com/graphql', {
+        headers: { origin: 'http://api.example.com' },
+      });
+      expect(handler.isOriginAllowed(request)).toBe(true);
+    });
+
+    test('should allow a same-origin request by default', () => {
+      const handler = createHandler();
+      expect(handler.isOriginAllowed(upgrade('api.example.com:4000', 'http://api.example.com:4000'))).toBe(true);
+    });
+
+    test('should compare host and origin case-insensitively', () => {
+      const handler = createHandler();
+      expect(handler.isOriginAllowed(upgrade('API.Example.com', 'https://api.EXAMPLE.com'))).toBe(true);
+    });
+
+    test('should refuse a cross-origin request by default', () => {
+      const handler = createHandler();
+      expect(handler.isOriginAllowed(upgrade('api.example.com', 'https://evil.example'))).toBe(false);
+    });
+
+    test('should refuse an origin that differs only in port', () => {
+      const handler = createHandler();
+      expect(handler.isOriginAllowed(upgrade('api.example.com:4000', 'http://api.example.com:5000'))).toBe(false);
+    });
+
+    test('should allow a request with no Origin header', () => {
+      const handler = createHandler();
+      expect(handler.isOriginAllowed(upgrade('api.example.com'))).toBe(true);
+    });
+
+    test('should refuse an opaque null origin by default', () => {
+      const handler = createHandler();
+      expect(handler.isOriginAllowed(upgrade('api.example.com', 'null'))).toBe(false);
+    });
+
+    test('should allow listed origins in addition to the server origin', () => {
+      const handler = createHandler({ allowedOrigins: ['https://App.Example.com:443'] });
+      expect(handler.isOriginAllowed(upgrade('api.example.com', 'https://app.example.com'))).toBe(true);
+      expect(handler.isOriginAllowed(upgrade('api.example.com', 'https://api.example.com'))).toBe(true);
+      expect(handler.isOriginAllowed(upgrade('api.example.com', 'https://other.example.com'))).toBe(false);
+      // Scheme is part of a listed origin.
+      expect(handler.isOriginAllowed(upgrade('api.example.com', 'http://app.example.com'))).toBe(false);
+    });
+
+    test("should allow any origin with '*'", () => {
+      const handler = createHandler({ allowedOrigins: '*' });
+      expect(handler.isOriginAllowed(upgrade('api.example.com', 'https://evil.example'))).toBe(true);
+      expect(handler.isOriginAllowed(upgrade('api.example.com', 'null'))).toBe(true);
+    });
+
+    test('should normalise default ports on the Host header and the origin', () => {
+      const handler = createHandler();
+      expect(handler.isOriginAllowed(upgrade('api.example.com:443', 'https://api.example.com'))).toBe(true);
+      expect(handler.isOriginAllowed(upgrade('api.example.com', 'https://api.example.com:443'))).toBe(true);
+      expect(handler.isOriginAllowed(upgrade('api.example.com:80', 'http://api.example.com'))).toBe(true);
+      // 443 is not the default port for http.
+      expect(handler.isOriginAllowed(upgrade('api.example.com:443', 'http://api.example.com'))).toBe(false);
+    });
+  });
+
   describe('handleOpen', () => {
     test('should initialize socket data with a UUID connection id', async () => {
       const handler = createHandler();
@@ -629,6 +702,7 @@ describe('WebSocketHandler', () => {
 
     test('should send an Error message instead of closing when onSubscribe throws', async () => {
       const handler = createHandler({
+        errorFormatting: { maskErrors: false },
         onSubscribe: () => {
           throw new Error('Rejected by hook');
         },
@@ -1501,8 +1575,27 @@ describe('error formatting', () => {
     await handler.handleClose(socket);
   });
 
-  test('should send a context factory failure with INTERNAL_ERROR when not masking', async () => {
+  test('should mask a context factory failure when errorFormatting is unset', async () => {
     const handler = createHandler({
+      context: () => {
+        throw new Error('postgres://u:p@h/db refused');
+      },
+    });
+    const socket = createFakeSocket();
+
+    await openAndInit(handler, socket);
+    await handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+
+    const errorFrame = frames(socket).find((f) => f.type === 'error');
+    expect(errorFrame?.payload?.[0]?.message).toBe(MASKED);
+    expect(socket.sent.join('')).not.toContain('postgres://');
+
+    await handler.handleClose(socket);
+  });
+
+  test('should send a context factory failure with INTERNAL_ERROR when maskErrors is false', async () => {
+    const handler = createHandler({
+      errorFormatting: { maskErrors: false },
       context: () => {
         throw new Error('postgres://u:p@h/db refused');
       },
@@ -1768,5 +1861,117 @@ describe('createWebSocketHandler', () => {
   test('should create a WebSocketHandler instance', () => {
     const handler = createWebSocketHandler({ schema: createTestSchema() });
     expect(handler).toBeInstanceOf(WebSocketHandler);
+  });
+});
+
+describe('subscribe payload validation and onConnect failures', () => {
+  test('should close 4400 with a fixed reason for a subscribe without payload', async () => {
+    const handler = createHandler();
+    const socket = createFakeSocket();
+    await openAndInit(handler, socket);
+
+    await handler.handleMessage(socket, '{"type":"subscribe","id":"1"}');
+
+    expect(socket.closed).toEqual({ code: 4400, reason: 'Invalid message' });
+    expect(socket.data.subscriptions.size).toBe(0);
+    await handler.handleClose(socket);
+  });
+
+  test('should close 4400 for a non-string query and register nothing', async () => {
+    const handler = createHandler();
+    const socket = createFakeSocket();
+    await openAndInit(handler, socket);
+
+    await handler.handleMessage(
+      socket,
+      '{"type":"subscribe","id":"1","payload":{"query":42}}'
+    );
+
+    expect(socket.closed).toEqual({ code: 4400, reason: 'Invalid message' });
+    expect(socket.data.subscriptions.has('1')).toBe(false);
+    await handler.handleClose(socket);
+  });
+
+  test('should close 4403 with a fixed reason and log when onConnect throws', async () => {
+    const errors: unknown[][] = [];
+    const handler = createHandler({
+      logger: { error: (...args: unknown[]) => errors.push(args) },
+      onConnect: () => {
+        throw new Error('postgres://secret@host');
+      },
+    });
+    const socket = createFakeSocket();
+
+    await openAndInit(handler, socket);
+
+    expect(socket.closed).toEqual({ code: 4403, reason: 'Forbidden' });
+    expect(socket.data.initialized).toBe(false);
+    expect(errors.length).toBe(1);
+    expect(String(errors[0]![0])).toContain('onConnect');
+  });
+
+  describe('onComplete firing', () => {
+    const complete = '{"id":"sub-1","type":"complete"}';
+
+    test('should fire once for a live subscription and not for a duplicate complete', async () => {
+      const completed: string[] = [];
+      const handler = createHandler({ onComplete: (_s, id) => void completed.push(id) });
+      const socket = createFakeSocket();
+      await openAndInit(handler, socket);
+      await handler.handleMessage(socket, SUBSCRIBE_FOREVER);
+
+      await handler.handleMessage(socket, complete);
+      await handler.handleMessage(socket, complete);
+
+      expect(completed).toEqual(['sub-1']);
+      await handler.handleClose(socket);
+    });
+
+    test('should not fire for an unknown id', async () => {
+      const completed: string[] = [];
+      const handler = createHandler({ onComplete: (_s, id) => void completed.push(id) });
+      const socket = createFakeSocket();
+      await openAndInit(handler, socket);
+
+      await handler.handleMessage(socket, '{"id":"nope","type":"complete"}');
+
+      expect(completed).toEqual([]);
+      await handler.handleClose(socket);
+    });
+
+    test('should not fire again for a complete after the server already completed', async () => {
+      const completed: string[] = [];
+      const handler = createHandler({ onComplete: (_s, id) => void completed.push(id) });
+      const socket = createFakeSocket();
+      await openAndInit(handler, socket);
+      await handler.handleMessage(socket, SUBSCRIBE_COUNT);
+      await waitFor(() => completed.length === 1);
+
+      await handler.handleMessage(socket, complete);
+
+      expect(completed).toEqual(['sub-1']);
+      await handler.handleClose(socket);
+    });
+  });
+
+  test('should forward result extensions on next frames', async () => {
+    const handler = createHandler();
+    spyOn(managerOf(handler), 'execute').mockResolvedValue({
+      data: { hello: 'world' },
+      extensions: { trace: 'abc' },
+    });
+    const socket = createFakeSocket();
+    await openAndInit(handler, socket);
+
+    await handler.handleMessage(
+      socket,
+      '{"id":"q1","type":"subscribe","payload":{"query":"{ hello }"}}'
+    );
+
+    const next = socket.sent
+      .map((raw) => JSON.parse(raw) as { type: string; payload?: { extensions?: unknown } })
+      .find((f) => f.type === 'next');
+    expect(next?.payload?.extensions).toEqual({ trace: 'abc' });
+    await handler.handleClose(socket);
   });
 });

@@ -149,8 +149,11 @@ jobs:
       - name: Check built packages
         run: pnpm check:dist
 
+  # Informational only: the benchmark asserts nothing, it just prints timings
+  # for reviewers, so it must never fail or gate a PR.
   benchmark:
-    name: Benchmark
+    name: Benchmark (informational)
+    continue-on-error: true
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:

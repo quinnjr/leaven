@@ -131,3 +131,32 @@ export function getErrorCode(code: string): ErrorCode | null {
 export function getErrorMessage(code: ErrorCode): string {
   return ERROR_CODES[code]?.message ?? 'An error occurred';
 }
+
+/**
+ * Derive the HTTP status for a GraphQL response, per the GraphQL-over-HTTP
+ * status rule (see `statusForResponse` in the package README).
+ *
+ * - No errors: 200.
+ * - `data` present and non-null (a spec-conformant partial success): 200,
+ *   whatever the error codes say.
+ * - Total failure (`data` undefined or null): the status registered in
+ *   {@link ERROR_CODES} for the first error's `extensions.code` when it is a
+ *   known code, otherwise 500.
+ *
+ * @param response - The GraphQL response (or any object with `data`/`errors`)
+ * @returns The HTTP status code
+ */
+export function statusForResponse(response: {
+  data?: unknown;
+  errors?: readonly { extensions?: Record<string, unknown> }[];
+}): number {
+  if (!response.errors || response.errors.length === 0) {
+    return 200;
+  }
+  if (response.data !== undefined && response.data !== null) {
+    return 200;
+  }
+  const code = response.errors[0]?.extensions?.['code'];
+  const known = typeof code === 'string' ? getErrorCode(code) : null;
+  return known ? ERROR_CODES[known].status : 500;
+}

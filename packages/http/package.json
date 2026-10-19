@@ -1,6 +1,6 @@
 {
   "name": "@leaven-graphql/http",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Bun HTTP server integration for Leaven GraphQL",
   "type": "module",
   "main": "./src/index.ts",
@@ -46,20 +46,20 @@
     "directory": "packages/http"
   },
   "dependencies": {
-    "@leaven-graphql/core": "workspace:*",
     "@leaven-graphql/context": "workspace:*",
+    "@leaven-graphql/core": "workspace:*",
     "@leaven-graphql/errors": "workspace:*",
     "@leaven-graphql/playground": "workspace:*",
     "@leaven-graphql/sse": "workspace:*",
     "@leaven-graphql/ws": "workspace:*"
   },
   "devDependencies": {
-    "@types/bun": "^1.3.14",
-    "graphql": "^16.8.0",
+    "@types/bun": "^1.4.3",
+    "graphql": "^17.0.2",
     "graphql-sse": "2.6.3",
-    "typescript": "^6.0.0"
+    "typescript": "^6.0.3"
   },
   "peerDependencies": {
-    "graphql": "^16.0.0"
+    "graphql": "^16.0.0 || ^17.0.0"
   }
 }

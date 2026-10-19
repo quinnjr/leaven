@@ -16,6 +16,7 @@ import {
   countFields,
   getOperationNames,
   MAX_ANALYSIS_VISITS,
+  createVisitBudget,
 } from './parser';
 import { buildSchema, getIntrospectionQuery, GraphQLError } from 'graphql';
 import { DepthLimitError, ErrorCode, LeavenError } from '@leaven-graphql/errors';
@@ -622,5 +623,15 @@ describe('getOperationNames', () => {
     const document = parseDocument('{ hello }');
     const names = getOperationNames(document);
     expect(names.length).toBe(0);
+  });
+});
+
+describe('createVisitBudget', () => {
+  test('should allow up to MAX_ANALYSIS_VISITS visits and throw past the limit', () => {
+    const countVisit = createVisitBudget();
+    for (let i = 0; i < MAX_ANALYSIS_VISITS; i++) {
+      countVisit();
+    }
+    expect(() => countVisit()).toThrow(/exceeded the maximum/);
   });
 });

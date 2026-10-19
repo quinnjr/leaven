@@ -5,7 +5,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { ContextStore, createContextStore } from './store';
 import type { BaseContext } from './types';
 
@@ -228,15 +228,180 @@ describe('ContextStore', () => {
   });
 
   describe('dispose', () => {
-    test('should clear all contexts and timers', () => {
+    test('should clear all contexts and stop the cleanup timer', async () => {
+      const clearIntervalSpy = spyOn(globalThis, 'clearInterval');
       const cleanupStore = new ContextStore<TestContext>({
         autoCleanup: true,
         cleanupInterval: 100,
       });
+      let finish!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const run = cleanupStore.runAsync(
+        { requestId: 'hung', startTime: Date.now() } as TestContext,
+        () => gate
+      );
+      expect(cleanupStore.activeCount).toBe(1);
 
-      cleanupStore.dispose();
-      expect(cleanupStore.activeCount).toBe(0);
+      try {
+        cleanupStore.dispose();
+        expect(cleanupStore.activeCount).toBe(0);
+        expect(clearIntervalSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        clearIntervalSpy.mockRestore();
+        finish();
+        await run;
+      }
     });
+  });
+});
+
+describe('ContextStore duplicate request IDs', () => {
+  test('should keep the outer entry after a nested run with the same ID', () => {
+    const store = new ContextStore<TestContext>();
+    const ctx = (): TestContext => ({ requestId: 'dup', startTime: Date.now() }) as TestContext;
+    const outerCtx = ctx();
+    store.run(outerCtx, () => {
+      store.run(ctx(), () => {});
+      expect(store.getByRequestId('dup')).toBe(outerCtx);
+    });
+    expect(store.getByRequestId('dup')).toBeUndefined();
+    store.dispose();
+  });
+});
+
+describe('ContextStore overlapping runs with the same requestId', () => {
+  test('should fall back to the still-active run when a later run finishes first', async () => {
+    const store = new ContextStore<TestContext>();
+    const ctxA = { requestId: 'dup', startTime: 1 } as TestContext;
+    const ctxB = { requestId: 'dup', startTime: 2 } as TestContext;
+    let finishA!: () => void;
+    const gateA = new Promise<void>((r) => {
+      finishA = r;
+    });
+    const runA = store.runAsync(ctxA, () => gateA);
+    await store.runAsync(ctxB, async () => {
+      expect(store.getByRequestId('dup')).toBe(ctxB);
+    });
+    expect(store.getByRequestId('dup')).toBe(ctxA);
+    expect(store.activeCount).toBe(1);
+    finishA();
+    await runA;
+    expect(store.getByRequestId('dup')).toBeUndefined();
+    expect(store.activeCount).toBe(0);
+    store.dispose();
+  });
+});
+
+describe('ContextStore cleanup of hung runs', () => {
+  const ctx = (): TestContext => ({ requestId: 'dup', startTime: Date.now() }) as TestContext;
+
+  test('should reap a hung run entry after maxAge and make its later release a no-op', async () => {
+    const store = new ContextStore<TestContext>();
+    let finishA!: () => void;
+    const gateA = new Promise<void>((resolve) => {
+      finishA = resolve;
+    });
+    const runA = store.runAsync(ctx(), () => gateA);
+    expect(store.cleanup(300000)).toBe(0);
+    expect(store.cleanup(-1)).toBe(1);
+    expect(store.getByRequestId('dup')).toBeUndefined();
+    expect(store.activeCount).toBe(0);
+
+    finishA();
+    await runA;
+    expect(store.activeCount).toBe(0);
+    store.dispose();
+  });
+
+  test('should not let a reaped run release a later run entry', async () => {
+    const store = new ContextStore<TestContext>();
+    let finishA!: () => void;
+    const gateA = new Promise<void>((resolve) => {
+      finishA = resolve;
+    });
+    let finishB!: () => void;
+    const gateB = new Promise<void>((resolve) => {
+      finishB = resolve;
+    });
+    const runA = store.runAsync(ctx(), () => gateA);
+    expect(store.cleanup(-1)).toBe(1);
+
+    const ctxB = ctx();
+    const runB = store.runAsync(ctxB, () => gateB);
+    finishA();
+    await runA;
+    expect(store.getByRequestId('dup')).toBe(ctxB);
+
+    finishB();
+    await runB;
+    expect(store.getByRequestId('dup')).toBeUndefined();
+    store.dispose();
+  });
+
+  test('should reap only the older entry when a request ID has overlapping runs of different ages', async () => {
+    const store = new ContextStore<TestContext>();
+    let finishA!: () => void;
+    const gateA = new Promise<void>((resolve) => {
+      finishA = resolve;
+    });
+    let finishB!: () => void;
+    const gateB = new Promise<void>((resolve) => {
+      finishB = resolve;
+    });
+    const realNow = Date.now;
+    let now = realNow();
+    Date.now = () => now;
+    try {
+      const runA = store.runAsync(ctx(), () => gateA);
+      now += 30;
+      const ctxB = ctx();
+      const runB = store.runAsync(ctxB, () => gateB);
+
+      expect(store.cleanup(15)).toBe(1);
+      expect(store.getByRequestId('dup')).toBe(ctxB);
+      expect(store.activeCount).toBe(1);
+
+      finishA();
+      await runA;
+      finishB();
+      await runB;
+      expect(store.activeCount).toBe(0);
+      expect(store.getByRequestId('dup')).toBeUndefined();
+    } finally {
+      Date.now = realNow;
+      store.dispose();
+    }
+  });
+
+  test('should reap a hung run through the autoCleanup timer', async () => {
+    const store = new ContextStore<TestContext>({ autoCleanup: true, cleanupInterval: 5 });
+    let finish!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const run = store.runAsync(ctx(), () => gate);
+    expect(store.activeCount).toBe(1);
+
+    // The timer reaps entries older than the default 5 minute maxAge, so age
+    // the entry by moving the clock forward instead of waiting.
+    const realNow = Date.now;
+    Date.now = () => realNow() + 301000;
+    try {
+      const deadline = realNow() + 1000;
+      while (store.activeCount > 0 && realNow() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(store.activeCount).toBe(0);
+    } finally {
+      Date.now = realNow;
+      store.dispose();
+    }
+
+    finish();
+    await run;
+    expect(store.activeCount).toBe(0);
   });
 });
 

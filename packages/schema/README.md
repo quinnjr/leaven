@@ -230,6 +230,18 @@ const schema = mergeSchemasFromStrings([
 ]);
 ```
 
+Schema-level directives (`schema @link(...) { ... }`, `extend schema @tag`)
+survive both functions. A non-repeatable directive is kept once, with the first
+source winning. A repeatable directive keeps every distinct occurrence and
+drops only exact duplicates. `mergeSchemas` rebuilds from `printSchema`, which
+never prints schema-level directives, so it reads them from each source's
+`astNode` and `extensionASTNodes`. graphql-js sets those only on schemas built
+from SDL. A schema built in code (`new GraphQLSchema({ ... })`, `SchemaBuilder`)
+has none. If you need schema directives preserved reliably, merge from SDL with
+`mergeSchemasFromStrings` or the loaders instead. The schema description is
+kept by both functions, with the first source that has one winning, whether a
+source was built from SDL or in code.
+
 `onTypeConflict` decides who wins when two sources define the same thing:
 
 | Value | `mergeSchemas` (per field) | `mergeSchemasFromStrings` (per definition) |
@@ -243,7 +255,30 @@ const schema = mergeSchemasFromStrings([
 is the resolvers map and the **third** is the options bag. Passing
 `{ onTypeConflict: 'last' }` as the second argument sets no options — it is
 read as a resolvers map, and any name in it that is not a type in the merged
-schema throws.
+schema (other than a root type folded into another) throws.
+
+Custom root type names survive both functions: `schema { query: RootQuery }`
+definitions and `extend schema` extensions are combined into one schema
+definition. A source with its own `schema { ... }` definition is authoritative
+for its roots, as in graphql-js. In a source without one (or with only
+`extend schema`), a default-named `Query`, `Mutation` or `Subscription` object
+type is the root of any operation it does not name, even when another source
+has a `schema { ... }` block.
+
+When two sources name different root types for the same operation (say
+`schema { query: RootQuery }` in one and a plain `type Query` in another),
+`onTypeConflict` picks the name — the first under `'first'` and `'error'`, the
+last under `'last'` — and the losing root type's fields are merged into the
+winner, so every source's root fields stay reachable. A field both root types
+define follows `onTypeConflict` like any other field, so `'error'` throws only
+on such a shared field, not on the differing names. The losing type is dropped
+unless another type still references it, in which case it is kept as an
+ordinary type. Resolvers keyed by the losing root's name (in a source or in
+the `resolvers` argument) are applied to the winning root, and also to the
+losing type when it is kept; only a field missing on the winner throws. As
+with
+`SchemaBuilder.applyResolvers`, a bare function in the resolvers map under the
+subscription root type is applied as the field's `subscribe` function.
 
 ### Resolvers
 
@@ -303,7 +338,8 @@ const version = constantResolver('1.0.0'); // () => '1.0.0'
 
 Load schemas from `.graphql` files. Directory and glob loaders read files in
 sorted path order and merge them, so `extend type` definitions spread across
-files are combined.
+files are combined, and a `schema { query: RootQuery }` block in one file
+applies to root types defined in another.
 
 ```typescript
 import {
@@ -320,7 +356,8 @@ const schema1 = await loadSchemaFromFile('./schema.graphql');
 // Load all files in a directory
 const schema2 = await loadSchemaFromDirectory('./schemas', { recursive: true });
 
-// Load files matching a glob pattern
+// Load files matching a glob pattern. The pattern alone selects files:
+// `extensions` and `recursive` are ignored by the glob loaders.
 const schema3 = await loadSchemaFromGlob('**/*.graphql', { cwd: './modules' });
 
 // Read the SDL without building, to merge it with resolvers yourself
@@ -367,6 +404,12 @@ const schema2 = addDirectives(baseSchema, [authDirective, cacheControlDirective]
 const fields = schema.getQueryType()!.toConfig().fields;
 const args = getDirectiveValues(fields.secret!, 'auth'); // { requires: 'ADMIN' } | null
 ```
+
+`getDirectiveValues` converts the raw SDL arguments only. It does not apply the
+directive definition's `defaultValue`s (an omitted argument is absent from the
+result, so `@auth` alone yields `{}`, not `{ requires: 'USER' }`) and does not
+coerce values against the declared argument types. Use graphql-js
+`getDirectiveValues(directive, node)` when you need defaults and coercion.
 
 `authDirective`, `cacheControlDirective` and `specDeprecatedDirective` are
 exported ready-made. `specDeprecatedDirective` is a replica of the spec
@@ -564,17 +607,22 @@ function loadTypeDefsFromGlob(
 ): Promise<string[]>;
 
 interface LoaderOptions {
-  /** File extensions to load (default: ['.graphql', '.gql']) */
+  /** File extensions to load (default: ['.graphql', '.gql']). Directory loaders only. */
   extensions?: string[];
   /** @deprecated Ignored — files are always read as UTF-8. Removed in 0.3.0. */
   encoding?: BufferEncoding;
-  /** Whether to recursively search directories */
+  /** Whether to recursively search directories. Directory loaders only. */
   recursive?: boolean;
 }
 ```
 
 `loadSchemaFromFile` ignores its options bag entirely; it accepts one only so
 it keeps the same call signature as the directory and glob loaders.
+
+`loadSchemaFromGlob` and `loadTypeDefsFromGlob` ignore `extensions` and
+`recursive`: the pattern alone decides which files match, so use `**` in the
+pattern to search subdirectories. Only `cwd` (and, for `loadSchemaFromGlob`,
+the merge options) take effect.
 
 ### Directives
 

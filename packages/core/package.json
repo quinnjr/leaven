@@ -1,6 +1,6 @@
 {
   "name": "@leaven-graphql/core",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Core GraphQL execution engine for Leaven",
   "type": "module",
   "main": "./src/index.ts",
@@ -48,11 +48,11 @@
     "@leaven-graphql/errors": "workspace:*"
   },
   "devDependencies": {
-    "@types/bun": "^1.3.14",
-    "graphql": "^16.8.0",
-    "typescript": "^6.0.0"
+    "@types/bun": "^1.4.3",
+    "graphql": "^17.0.2",
+    "typescript": "^6.0.3"
   },
   "peerDependencies": {
-    "graphql": "^16.0.0"
+    "graphql": "^16.0.0 || ^17.0.0"
   }
 }

@@ -6,7 +6,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { ErrorCode, ERROR_CODES, getErrorCode, getErrorMessage } from './codes';
+import { ErrorCode, ERROR_CODES, getErrorCode, getErrorMessage, statusForResponse } from './codes';
 
 describe('ErrorCode', () => {
   test('should have all expected error codes', () => {
@@ -83,5 +83,32 @@ describe('getErrorMessage', () => {
     // TypeScript would normally prevent this, but testing runtime behavior
     const result = getErrorMessage('UNKNOWN' as ErrorCode);
     expect(result).toBe('An error occurred');
+  });
+});
+
+describe('statusForResponse', () => {
+  const err = (code?: string) => ({ extensions: code ? { code } : undefined });
+
+  test('should return 200 when there are no errors', () => {
+    expect(statusForResponse({ data: { a: 1 } })).toBe(200);
+    expect(statusForResponse({ errors: [] })).toBe(200);
+  });
+
+  test('should return 200 for a partial success even with coded errors', () => {
+    expect(statusForResponse({ data: { a: null }, errors: [err('NOT_FOUND')] })).toBe(200);
+  });
+
+  test('should map the first error code on total failure (data undefined)', () => {
+    expect(statusForResponse({ errors: [err('NOT_FOUND')] })).toBe(404);
+  });
+
+  test('should treat null data as total failure', () => {
+    expect(statusForResponse({ data: null, errors: [err('UNAUTHENTICATED')] })).toBe(401);
+  });
+
+  test('should fall back to 500 for unknown or missing codes', () => {
+    expect(statusForResponse({ errors: [err('NOPE')] })).toBe(500);
+    expect(statusForResponse({ errors: [err()] })).toBe(500);
+    expect(statusForResponse({ errors: [{ extensions: { code: 42 } }] })).toBe(500);
   });
 });

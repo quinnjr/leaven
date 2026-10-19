@@ -35,6 +35,10 @@
   - changed-files:
       - any-glob-to-any-file: packages/playground/**
 
+'pkg: leaven':
+  - changed-files:
+      - any-glob-to-any-file: packages/leaven/**
+
 'pkg: nestjs':
   - changed-files:
       - any-glob-to-any-file: packages/nestjs/**

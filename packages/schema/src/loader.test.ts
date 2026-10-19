@@ -23,12 +23,14 @@ let root: string | undefined;
 let schemasDir: string;
 let orderedDir: string;
 let emptyDir: string;
+let customRootDir: string;
 
 beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), 'leaven-loader-'));
   schemasDir = join(root, 'schemas');
   orderedDir = join(root, 'ordered');
   emptyDir = join(root, 'empty');
+  customRootDir = join(root, 'custom-root');
 
   await Bun.write(join(root, 'single.graphql'), 'type Query { hello: String }');
 
@@ -48,6 +50,15 @@ beforeAll(async () => {
   await Bun.write(join(orderedDir, 'aa.graphql'), 'type Aa { x: String }');
 
   await mkdir(emptyDir, { recursive: true });
+
+  await Bun.write(
+    join(customRootDir, 'a-schema.graphql'),
+    'schema { query: RootQuery }'
+  );
+  await Bun.write(
+    join(customRootDir, 'b-root.graphql'),
+    'type RootQuery { a: String }'
+  );
 });
 
 afterAll(async () => {
@@ -171,5 +182,21 @@ describe('loadTypeDefsFromGlob', () => {
     await expect(
       loadTypeDefsFromGlob('*.nope', { cwd: emptyDir })
     ).rejects.toThrow('No files found matching pattern');
+  });
+});
+
+describe('custom root operation types', () => {
+  test('should keep a schema definition from another file (loadSchemaFromDirectory)', async () => {
+    const schema = await loadSchemaFromDirectory(customRootDir);
+
+    expect(schema.getQueryType()?.name).toBe('RootQuery');
+    expect(schema.getQueryType()?.getFields().a).toBeDefined();
+  });
+
+  test('should keep a schema definition from another file (loadSchemaFromGlob)', async () => {
+    const schema = await loadSchemaFromGlob('*.graphql', { cwd: customRootDir });
+
+    expect(schema.getQueryType()?.name).toBe('RootQuery');
+    expect(schema.getQueryType()?.getFields().a).toBeDefined();
   });
 });

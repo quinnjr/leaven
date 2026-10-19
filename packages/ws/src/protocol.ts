@@ -8,6 +8,7 @@
  */
 
 import { escapeLog } from '@leaven-graphql/core';
+import { isPlainObject } from '@leaven-graphql/errors';
 
 /**
  * Message types as defined by graphql-ws protocol
@@ -150,6 +151,32 @@ export function isValidOperationId(id: unknown): id is string {
 }
 
 /**
+ * Whether a parsed subscribe frame carries a well-formed payload: an object
+ * with a string `query`, an optional (or null) string `operationName` and
+ * optional (or null) object `variables` / `extensions`.
+ */
+function isValidSubscribePayload(message: unknown): boolean {
+  const payload = (message as { payload?: unknown }).payload;
+  if (!isPlainObject(payload)) {
+    return false;
+  }
+  if (typeof payload.query !== 'string') {
+    return false;
+  }
+  const { operationName, variables, extensions } = payload;
+  if (operationName !== undefined && operationName !== null && typeof operationName !== 'string') {
+    return false;
+  }
+  if (variables !== undefined && variables !== null && !isPlainObject(variables)) {
+    return false;
+  }
+  if (extensions !== undefined && extensions !== null && !isPlainObject(extensions)) {
+    return false;
+  }
+  return true;
+}
+
+/**
  * Options for {@link parseMessage}
  */
 export interface ParseMessageOptions {
@@ -178,6 +205,11 @@ export interface ParseMessageOptions {
  * By default this is strict about the `id` field (see
  * {@link ParseMessageOptions.requireId}); pass `{ requireId: false }` to
  * restore the lenient behaviour for peer frames that may omit it.
+ *
+ * Whatever `requireId` is, a `subscribe` frame is also rejected (`Invalid
+ * message`) when its payload is not an object with a string `query`, or has a
+ * non-string `operationName` or non-object `variables`/`extensions` (`null` is
+ * accepted for those three).
  */
 export function parseMessage(
   data: string | Buffer,
@@ -225,6 +257,10 @@ export function parseMessage(
       throw new Error('Invalid message');
     }
 
+    if (message.type === MessageType.Subscribe && !isValidSubscribePayload(parsed)) {
+      throw new Error('Invalid message');
+    }
+
     return message as Message;
   } catch (error) {
     if (error instanceof SyntaxError) {
@@ -259,15 +295,13 @@ export function createConnectionAck(
 export function createNextMessage(
   id: string,
   data: Record<string, unknown> | null | undefined,
-  errors?: readonly { message: string }[]
+  errors?: readonly { message: string }[],
+  extensions?: Record<string, unknown>
 ): NextMessage {
   return {
     id,
     type: MessageType.Next,
-    payload: {
-      data,
-      errors,
-    },
+    payload: extensions === undefined ? { data, errors } : { data, errors, extensions },
   };
 }
 

@@ -358,6 +358,19 @@ export class PermissionsGuard implements CanActivate {
  * is then nothing to enforce, and the driver does not compute
  * `_queryComplexity` at all, so the guard admits every request instead of
  * rejecting them all for a measurement nobody asked for.
+ *
+ * **`LeavenModule` only.** Both the `LEAVEN_MAX_COMPLEXITY` token and the
+ * `_queryComplexity` value come from `LeavenModule` and its `LeavenDriver`. Under
+ * `LeavenGraphQLDriver` (`GraphQLModule.forRoot({ driver: LeavenGraphQLDriver })`)
+ * neither exists: the guard either fails dependency injection or, with the
+ * token provided by hand, rejects every request because `_queryComplexity` is
+ * never set. On that path configure the driver's `maxComplexity` option instead,
+ * which the executor enforces before any resolver runs.
+ *
+ * NestJS enhancers do not fire for `LeavenModule`'s resolvers either, so Nest
+ * never runs this guard for you on either path. Invoke it yourself (in a
+ * custom pipeline or a unit test), or rely on the `maxComplexity` option, which
+ * applies automatically.
  */
 @Injectable()
 export class ComplexityGuard implements CanActivate {
@@ -405,6 +418,19 @@ export class ComplexityGuard implements CanActivate {
  * is then nothing to enforce, and the driver does not compute `_queryDepth` at
  * all, so the guard admits every request instead of rejecting them all for a
  * measurement nobody asked for.
+ *
+ * **`LeavenModule` only.** Both the `LEAVEN_MAX_DEPTH` token and the
+ * `_queryDepth` value come from `LeavenModule` and its `LeavenDriver`. Under
+ * `LeavenGraphQLDriver` (`GraphQLModule.forRoot({ driver: LeavenGraphQLDriver })`)
+ * neither exists: the guard either fails dependency injection or, with the
+ * token provided by hand, rejects every request because `_queryDepth` is
+ * never set. On that path configure the driver's `maxDepth` option instead,
+ * which the executor enforces before any resolver runs.
+ *
+ * NestJS enhancers do not fire for `LeavenModule`'s resolvers either, so Nest
+ * never runs this guard for you on either path. Invoke it yourself (in a
+ * custom pipeline or a unit test), or rely on the `maxDepth` option, which
+ * applies automatically.
  */
 @Injectable()
 export class DepthGuard implements CanActivate {

@@ -40,6 +40,15 @@ export const GQL_RESOLVER_ARGS = {
  *
  * Provides easy access to GraphQL resolver arguments from NestJS execution context.
  *
+ * Despite the shared name, this is **not** `@nestjs/graphql`'s
+ * `GqlExecutionContext` and is not itself an `ExecutionContext` or
+ * `ArgumentsHost`: it cannot be passed where Nest expects one, and has no
+ * `switchToHttp()` / `switchToRpc()` / `switchToWs()` / `getArgByIndex()`. It
+ * is a read-only helper over the positional resolver arguments (see
+ * {@link GQL_RESOLVER_ARGS}) — `getRoot()`, `getArgs()`, `getContext()`,
+ * `getInfo()` and a few conveniences — with `getHost()` returning the
+ * original context for anything else.
+ *
  * @example
  * ```typescript
  * @Injectable()

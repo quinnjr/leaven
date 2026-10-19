@@ -12,10 +12,17 @@ import { join } from 'node:path';
 import { mergeSchemasFromStrings, type MergeOptions } from './merge';
 
 /**
- * Options for schema loading
+ * Options for schema loading.
+ *
+ * `extensions` and `recursive` are honoured only by the directory loaders.
+ * The glob loaders ignore both: the pattern alone decides which files match
+ * and whether subdirectories are searched.
  */
 export interface LoaderOptions {
-  /** File extensions to load (default: ['.graphql', '.gql']) */
+  /**
+   * File extensions to load (default: ['.graphql', '.gql']). Directory
+   * loaders only; ignored by the glob loaders.
+   */
   extensions?: string[];
   /**
    * Has no effect — files are always read as UTF-8.
@@ -24,7 +31,10 @@ export interface LoaderOptions {
    * is ignored until then.
    */
   encoding?: BufferEncoding;
-  /** Whether to recursively search directories */
+  /**
+   * Whether to recursively search directories. Directory loaders only;
+   * ignored by the glob loaders — use `**` in the pattern instead.
+   */
   recursive?: boolean;
 }
 
@@ -133,6 +143,10 @@ export async function loadTypeDefsFromDirectory(
  * {@link mergeSchemasFromStrings}, so `extend type` definitions spread across
  * files are combined and duplicate type definitions follow the
  * {@link MergeOptions.onTypeConflict} policy.
+ *
+ * Of the {@link LoaderOptions}, `extensions` and `recursive` are ignored: the
+ * pattern alone decides which files match. Only `cwd` and the merge options
+ * take effect.
  */
 export async function loadSchemaFromGlob(
   pattern: string,
@@ -147,6 +161,9 @@ export async function loadSchemaFromGlob(
  *
  * Returns file contents in sorted path order so results are reproducible
  * across filesystems.
+ *
+ * Of the {@link LoaderOptions}, `extensions` and `recursive` are ignored: the
+ * pattern alone decides which files match. Only `cwd` takes effect.
  */
 export async function loadTypeDefsFromGlob(
   pattern: string,

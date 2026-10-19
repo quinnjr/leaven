@@ -16,9 +16,12 @@ import {
   formatError,
   formatErrors,
   maskError,
+  maskedErrorFor,
+  withMaskingDefault,
   isLeavenError,
   errorToGraphQL,
   fromFormattedError,
+  MASKED_ERROR_MESSAGE,
 } from './formatter';
 import {
   LeavenError,
@@ -399,5 +402,119 @@ describe('fromFormattedError', () => {
 
   test('should omit locations when the formatted error has none', () => {
     expect(fromFormattedError({ message: 'x', locations: [] }).locations).toBeUndefined();
+  });
+});
+
+describe('MASKED_ERROR_MESSAGE', () => {
+  test('should be the default masked message', () => {
+    expect(MASKED_ERROR_MESSAGE).toBe('An unexpected error occurred');
+    expect(maskError(new Error('secret'), { maskErrors: true }).message).toBe(MASKED_ERROR_MESSAGE);
+  });
+});
+
+describe('maskedErrorFor', () => {
+  test('should drop a path containing a non-primitive element', () => {
+    const masked = maskedErrorFor({
+      path: ['user', { dsn: 'postgres://u:p@h/db' }],
+    } as never);
+    expect('path' in masked).toBe(false);
+  });
+
+  test('should drop a path that is a string rather than an array', () => {
+    const masked = maskedErrorFor({ path: 'postgres://u:p@h/db' } as never);
+    expect('path' in masked).toBe(false);
+  });
+
+  test('should drop a path containing a non-finite number', () => {
+    const masked = maskedErrorFor({ path: ['a', NaN] } as never);
+    expect('path' in masked).toBe(false);
+  });
+
+  test('should not leak a string path or malformed locations from ENOENT-style errors', () => {
+    const enoent = Object.assign(new Error('ENOENT'), {
+      path: '/etc/secret',
+      locations: [{ line: 'x' }],
+    });
+    expect(maskedErrorFor(enoent as never)).toEqual({
+      message: 'An unexpected error occurred',
+      extensions: { code: 'INTERNAL_ERROR' },
+    });
+  });
+
+  test('should build the generic masked error with INTERNAL_ERROR', () => {
+    expect(maskedErrorFor({})).toEqual({
+      message: 'An unexpected error occurred',
+      extensions: { code: 'INTERNAL_ERROR' },
+    });
+  });
+
+  test('should carry locations and path when present', () => {
+    const error = new GraphQLError('secret', { path: ['a', 0] });
+    const masked = maskedErrorFor({
+      path: error.path,
+      locations: [{ line: 1, column: 3 }],
+    });
+    expect(masked).toEqual({
+      message: 'An unexpected error occurred',
+      locations: [{ line: 1, column: 3 }],
+      path: ['a', 0],
+      extensions: { code: 'INTERNAL_ERROR' },
+    });
+  });
+});
+
+describe('maskedErrorFor hardening and overrides', () => {
+  test('should strip extra properties from locations', () => {
+    const masked = maskedErrorFor({
+      locations: [{ line: 1, column: 2, secret: 'x' } as never],
+    });
+    expect(masked.locations).toEqual([{ line: 1, column: 2 }]);
+    expect(Object.keys(masked.locations?.[0] ?? {}).sort()).toEqual(['column', 'line']);
+  });
+
+  test('should omit an empty path and empty locations', () => {
+    const masked = maskedErrorFor({ path: [], locations: [] });
+    expect(masked).toEqual({
+      message: 'An unexpected error occurred',
+      extensions: { code: 'INTERNAL_ERROR' },
+    });
+    expect('path' in masked).toBe(false);
+    expect('locations' in masked).toBe(false);
+  });
+
+  test('should use the message override', () => {
+    expect(maskedErrorFor({}, 'Custom').message).toBe('Custom');
+  });
+
+  test('should use maskedMessage through maskError', () => {
+    const masked = maskError(new GraphQLError('secret'), {
+      maskErrors: true,
+      maskedMessage: 'Oops',
+    });
+    expect(masked.message).toBe('Oops');
+    expect(masked.extensions).toEqual({ code: 'INTERNAL_ERROR' });
+  });
+});
+
+describe('withMaskingDefault', () => {
+  test('should mask when no options are given', () => {
+    expect(withMaskingDefault()).toEqual({ maskErrors: true });
+  });
+
+  test('should mask when maskErrors is undefined', () => {
+    expect(withMaskingDefault({ maskErrors: undefined }).maskErrors).toBe(true);
+  });
+
+  test('should respect an explicit maskErrors false', () => {
+    expect(withMaskingDefault({ maskErrors: false }).maskErrors).toBe(false);
+  });
+
+  test('should keep the other options', () => {
+    const formatter = () => ({ message: 'x' });
+    expect(withMaskingDefault({ maskedMessage: 'Oops', formatter })).toEqual({
+      maskErrors: true,
+      maskedMessage: 'Oops',
+      formatter,
+    });
   });
 });

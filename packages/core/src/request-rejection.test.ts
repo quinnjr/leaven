@@ -13,6 +13,7 @@ import {
   GraphQLObjectType,
   GraphQLSchema,
   GraphQLString,
+  versionInfo,
 } from 'graphql';
 import { ValidationError } from '@leaven-graphql/errors';
 import { LeavenExecutor, isRequestRejection, type ExecutorConfig } from './index';
@@ -156,29 +157,51 @@ describe('isRequestRejection', () => {
       expect(isRequestRejection(response)).toBe(true);
     });
 
-    test('should mark a synchronous document cache read failure', async () => {
-      const response = await executeResponse('{ hello }', {
-        cache: failingCache(() => {
-          throw new Error('redis down');
-        }),
-      });
-      expect(response.errors?.length).toBe(1);
-      expect(isRequestRejection(response)).toBe(true);
-    });
-
-    test('should mark an asynchronous document cache read failure', async () => {
-      const response = await executeResponse('{ hello }', {
-        cache: failingCache(() => Promise.reject(new Error('redis down'))),
-      });
-      expect(response.errors?.length).toBe(1);
-      expect(isRequestRejection(response)).toBe(true);
-    });
-
     test('should still run the request when a document cache write fails', async () => {
       const response = await executeResponse('{ hello }', {
         cache: failingCache(() => null, () => {
           throw new Error('redis down');
         }),
+      });
+      expect(response.data).toEqual({ hello: 'world' });
+      expect(isRequestRejection(response)).toBe(false);
+    });
+  });
+
+  describe('operation type the schema does not support', () => {
+    // graphql 17 rejects it during validation (VALIDATION_ERROR); on graphql 16
+    // validation passes and the executor's own check answers BAD_REQUEST
+    const expectedCode = versionInfo.major >= 17 ? 'VALIDATION_ERROR' : 'BAD_REQUEST';
+    const queryOnly = new GraphQLSchema({
+      query: new GraphQLObjectType({
+        name: 'Query',
+        fields: { hello: { type: GraphQLString, resolve: () => 'world' } },
+      }),
+    });
+
+    test('should reject a mutation with a coded rejection', async () => {
+      const { response } = await new LeavenExecutor({ schema: queryOnly }).execute({
+        query: 'mutation { record }',
+      });
+      expect(response.data).toBeUndefined();
+      expect(response.errors?.length).toBe(1);
+      expect(response.errors?.[0]?.extensions?.code).toBe(expectedCode);
+      expect(isRequestRejection(response)).toBe(true);
+    });
+
+    test('should reject a subscription with a coded rejection', async () => {
+      const response = await new LeavenExecutor({ schema: queryOnly }).subscribe({
+        query: 'subscription { ticks }',
+      });
+      expect('errors' in response).toBe(true);
+      const errors = (response as { errors?: Array<{ extensions?: { code?: string } }> }).errors;
+      expect(errors?.[0]?.extensions?.code).toBe(expectedCode);
+      expect(isRequestRejection(response)).toBe(true);
+    });
+
+    test('should leave queries unaffected', async () => {
+      const { response } = await new LeavenExecutor({ schema: queryOnly }).execute({
+        query: '{ hello }',
       });
       expect(response.data).toEqual({ hello: 'world' });
       expect(isRequestRejection(response)).toBe(false);
@@ -220,6 +243,27 @@ describe('isRequestRejection', () => {
         },
       });
       expect(response.errors?.length).toBe(1);
+      expect(isRequestRejection(response)).toBe(false);
+    });
+
+    test('should treat a cache read failure as a miss, not a failure', async () => {
+      const response = await executeResponse('{ hello }', {
+        cache: {
+          get: () => undefined,
+          getWithValidation: () => {
+            throw new Error('redis down');
+          },
+          set: () => {},
+          setValidation: () => {},
+          setWithValidation: () => {},
+          has: () => false,
+          delete: () => false,
+          clear: () => {},
+          size: () => 0,
+        } as unknown as ExecutorConfig['cache'],
+      });
+      expect(response.errors).toBeUndefined();
+      expect(response.data).toEqual({ hello: 'world' });
       expect(isRequestRejection(response)).toBe(false);
     });
 
@@ -268,12 +312,16 @@ describe('isRequestRejection', () => {
       }
     );
 
-    test('should mark a document cache read failure', async () => {
+    test('should treat a document cache read failure as a miss and subscribe', async () => {
+      const cacheErrors: Error[] = [];
       const result = await executor({
         cache: failingCache(() => Promise.reject(new Error('redis down'))),
+        hooks: { onCacheError: (error) => void cacheErrors.push(error) },
       }).subscribe({ query: 'subscription { ticks(from: 1) }' });
-      expect(Symbol.asyncIterator in result).toBe(false);
-      expect(isRequestRejection(result)).toBe(true);
+      expect(Symbol.asyncIterator in result).toBe(true);
+      expect(isRequestRejection(result)).toBe(false);
+      expect(cacheErrors[0]?.message).toBe('redis down');
+      await (result as AsyncIterableIterator<unknown>).return?.();
     });
 
     test('should not mark a subscribe resolver that throws a coded error', async () => {

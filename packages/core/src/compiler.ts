@@ -29,6 +29,20 @@ export interface CompilerOptions {
 }
 
 /**
+ * Add `key` as an own enumerable property of `target`. `Object.defineProperty`
+ * never invokes the `__proto__` accessor, so a client-chosen GraphQL name such
+ * as `__proto__` is stored as an ordinary key.
+ */
+function defineOwn(target: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(target, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
+/**
  * A compiled GraphQL query: the static analysis of a single operation
  * (operation metadata, field tree, variable requirements, and an optional
  * complexity score). Execution itself is performed by the executor via
@@ -219,11 +233,13 @@ export class CompiledQuery<_TData = Record<string, unknown>> {
    * Extract arguments from a field
    */
   private extractArguments(field: FieldNode): Record<string, unknown> {
-    const args: Record<string, unknown> = {};
+    // Null prototype: a GraphQL name may be `__proto__`, which on a plain
+    // object would replace its prototype instead of adding a key
+    const args = Object.create(null) as Record<string, unknown>;
 
     if (field.arguments) {
       for (const arg of field.arguments) {
-        args[arg.name.value] = this.extractValue(arg.value);
+        defineOwn(args, arg.name.value, this.extractValue(arg.value));
       }
     }
 
@@ -250,9 +266,9 @@ export class CompiledQuery<_TData = Record<string, unknown>> {
       case Kind.LIST:
         return (node.values ?? []).map((v) => this.extractValue(v as { kind: string; value?: unknown; values?: readonly unknown[] }));
       case Kind.OBJECT: {
-        const obj: Record<string, unknown> = {};
+        const obj = Object.create(null) as Record<string, unknown>;
         for (const field of node.fields ?? []) {
-          obj[field.name.value] = this.extractValue(field.value as { kind: string; value?: unknown; values?: unknown[] });
+          defineOwn(obj, field.name.value, this.extractValue(field.value as { kind: string; value?: unknown; values?: unknown[] }));
         }
         return obj;
       }

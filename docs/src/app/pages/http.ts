@@ -71,6 +71,37 @@ import { SeoService } from '../services/seo.service';
         <h2 class="text-2xl font-semibold text-white mb-4">CORS Configuration</h2>
         <p class="text-zinc-400 mb-4">Configure Cross-Origin Resource Sharing:</p>
         <app-code-block [code]="corsCode" title="cors.ts" />
+        <p class="text-zinc-400 mt-4">
+          Without <code class="text-blue-400">allowedHeaders</code>, the default
+          <code class="text-blue-400">Access-Control-Allow-Headers</code> includes the
+          <code class="text-blue-400">csrfPrevention</code> header names. An explicit
+          <code class="text-blue-400">allowedHeaders</code> replaces that default, so it must include
+          the CSRF header names (e.g. <code class="text-blue-400">x-graphql-csrf</code>) for
+          cross-origin form or multipart clients.
+        </p>
+      </section>
+
+      <!-- CSRF Prevention -->
+      <section class="mb-12">
+        <h2 class="text-2xl font-semibold text-white mb-4">CSRF Prevention</h2>
+        <p class="text-zinc-400 mb-4">
+          On by default. Browsers send a "simple" cross-site <code class="text-blue-400">POST</code>
+          without a CORS preflight, so Leaven refuses a <code class="text-blue-400">POST</code> whose
+          Content-Type is missing or CORS-safelisted (<code class="text-blue-400">text/plain</code>,
+          <code class="text-blue-400">application/x-www-form-urlencoded</code>,
+          <code class="text-blue-400">multipart/form-data</code>) unless it carries a non-empty
+          <code class="text-blue-400">x-graphql-csrf</code>, <code class="text-blue-400">apollo-require-preflight</code>
+          or <code class="text-blue-400">x-apollo-operation-name</code> header. The request gets a
+          400 <code class="text-blue-400">BAD_REQUEST</code> before the body is read or the context factory runs.
+        </p>
+        <p class="text-zinc-400 mb-4">
+          <code class="text-blue-400">application/json</code> and <code class="text-blue-400">application/graphql</code>
+          need no header, and <code class="text-blue-400">GET</code> is not checked (mutations are refused on
+          non-POST methods). Multipart file-upload clients must send one of the headers, e.g.
+          <code class="text-blue-400">x-graphql-csrf: 1</code>. Such requests (a missing or <code class="text-blue-400">text/plain</code> Content-Type) get a 400 from CSRF prevention;
+          they get a 415 only when a preflight header is present or <code class="text-blue-400">csrfPrevention</code> is false.
+        </p>
+        <app-code-block [code]="csrfCode" title="csrf.ts" />
       </section>
 
       <!-- Custom Context -->
@@ -213,6 +244,7 @@ const server = createServer({
   playground: true,              // Serve GraphiQL on GET requests
   introspection: true,           // Enable introspection
   cors: true,                    // Enable CORS
+  csrfPrevention: true,          // Default: true
 
   // Caching & Performance (forwarded to the executor)
   executor: {
@@ -223,6 +255,8 @@ const server = createServer({
   },
 
   // Error handling
+  // Errors thrown outside execution (e.g. by the context factory) are masked
+  // unless \`errorFormatting.maskErrors\` is explicitly \`false\`
   errorFormatting: {
     maskErrors: true,
     includeStackTrace: false,
@@ -244,6 +278,17 @@ const server = createServer({
   },
 });`;
 
+  csrfCode = `import { createServer } from '@leaven-graphql/http';
+
+// Replace the accepted header list
+const server = createServer({
+  schema,
+  csrfPrevention: { requestHeaders: ['x-my-csrf'] },
+});
+
+// Or turn the check off (only behind another CSRF defence)
+const unprotected = createServer({ schema, csrfPrevention: false });`;
+
   corsCode = `import { createServer } from '@leaven-graphql/http';
 
 const server = createServer({
@@ -257,13 +302,15 @@ const server = createServer({
     // Allowed methods
     methods: ['GET', 'POST', 'OPTIONS'],
 
-    // Allowed headers
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    // Allowed headers. An explicit list replaces the default, so include
+    // the CSRF header for cross-origin form or multipart clients.
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-graphql-csrf'],
 
     // Exposed headers
     exposedHeaders: ['X-Request-Id'],
 
-    // Allow credentials
+    // Allow credentials. Needs an explicit origin: with a wildcard or unset
+    // origin, neither Access-Control-Allow-Origin nor -Credentials is sent
     credentials: true,
 
     // Preflight cache duration
