@@ -457,6 +457,20 @@ describe('CompiledQuery', () => {
 
       expect(compiled.fields[0]?.arguments.first).toBe(10);
     });
+
+    test('should store __proto__ argument and object-field names as own keys', () => {
+      // Parsed only, not validated: the names are legal GraphQL names
+      const document = parse('{ user(__proto__: { __proto__: "x" }) { id } }');
+      const compiled = new CompiledQuery(schema, document);
+
+      const args = compiled.fields[0]!.arguments;
+      expect(Object.getPrototypeOf(args)).toBeNull();
+      expect(Object.hasOwn(args, '__proto__')).toBe(true);
+      const inner = args['__proto__'] as Record<string, unknown>;
+      expect(Object.getPrototypeOf(inner)).toBeNull();
+      expect(Object.hasOwn(inner, '__proto__')).toBe(true);
+      expect(inner['__proto__']).toBe('x');
+    });
   });
 });
 

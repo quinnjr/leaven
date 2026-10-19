@@ -219,7 +219,9 @@ export class CompiledQuery<_TData = Record<string, unknown>> {
    * Extract arguments from a field
    */
   private extractArguments(field: FieldNode): Record<string, unknown> {
-    const args: Record<string, unknown> = {};
+    // Null prototype: a GraphQL name may be `__proto__`, which on a plain
+    // object would replace its prototype instead of adding a key
+    const args = Object.create(null) as Record<string, unknown>;
 
     if (field.arguments) {
       for (const arg of field.arguments) {
@@ -250,7 +252,7 @@ export class CompiledQuery<_TData = Record<string, unknown>> {
       case Kind.LIST:
         return (node.values ?? []).map((v) => this.extractValue(v as { kind: string; value?: unknown; values?: readonly unknown[] }));
       case Kind.OBJECT: {
-        const obj: Record<string, unknown> = {};
+        const obj = Object.create(null) as Record<string, unknown>;
         for (const field of node.fields ?? []) {
           obj[field.name.value] = this.extractValue(field.value as { kind: string; value?: unknown; values?: unknown[] });
         }
