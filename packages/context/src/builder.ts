@@ -52,20 +52,30 @@ export class ContextBuilder<TInput, TContext extends BaseContext> {
   }
 
   /**
-   * Build a context from input
+   * Build a context from input.
+   *
+   * Every extension receives the same (single, mutable) context object, which
+   * is also the returned value, so an extension must not keep a reference to
+   * it beyond its own call.
    */
   public async build(input: TInput): Promise<TContext> {
-    let context = await this.factory(input);
+    const base = await this.factory(input);
+
+    if (this.extensions.length === 0) {
+      return base;
+    }
+
+    // Copy once, preserving the context's prototype so class-based contexts
+    // (e.g. RequestContext) keep their methods, then fold every extension
+    // result into that single copy. Each extension still sees the results of
+    // the ones before it.
+    const context = Object.assign(
+      Object.create(Object.getPrototypeOf(base) as object) as TContext,
+      base
+    );
 
     for (const extension of this.extensions) {
-      const ext = await extension(context);
-      // Preserve the context's prototype so class-based contexts (e.g.
-      // RequestContext) keep their methods when extensions are applied.
-      context = Object.assign(
-        Object.create(Object.getPrototypeOf(context) as object) as TContext,
-        context,
-        ext
-      );
+      Object.assign(context, await extension(context));
     }
 
     return context;

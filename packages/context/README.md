@@ -223,13 +223,13 @@ class ContextStore<TContext extends BaseContext> {
   get activeCount(): number;
   getActiveRequestIds(): string[];
 
-  /** Safety net; run/runAsync already clean up on completion and on error */
+  /** Removes entries older than maxAge (default 300000 ms), including in-flight runs; returns the count */
   cleanup(maxAge?: number): number;
   dispose(): void;
 }
 
 interface ContextStoreConfig {
-  /** Periodic safety-net cleanup timer (default: off) */
+  /** Periodic cleanup (default: off); every cleanupInterval, reaps runs older than 5 minutes, including in-flight ones */
   autoCleanup?: boolean;
   /** Cleanup interval in ms (default: 60000) */
   cleanupInterval?: number;
@@ -278,9 +278,11 @@ context.db;
 There is no fluent `withRequest` / `withUser` / `withDatabase` / `withLogger`
 / `withTracing`. The whole surface is `extend`, `build` and `withInput`.
 
-Extensions are applied in order, and each result is merged onto a copy that
+Extensions are applied in order to a single copy of the factory result, which
 keeps the prototype of the context the factory produced — so a class-based
-context such as `RequestContext` keeps its methods:
+context such as `RequestContext` keeps its methods. Every extension receives
+that same object, so it must not keep a reference to it after its own call.
+With no extensions the factory result is returned as-is:
 
 ```typescript
 import {

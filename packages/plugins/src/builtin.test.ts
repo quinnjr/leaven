@@ -1377,3 +1377,173 @@ describe('createComplexityPlugin', () => {
     expect(error!.extensions['maxNodesVisited']).toBe(100_000);
   });
 });
+
+describe('operation-aware caching, complexity and logging', () => {
+  test('should not cache or replay mutations in the caching plugin', async () => {
+    const manager = new PluginManager({ schema });
+    await manager.register(createCachingPlugin({ allowSharedCache: true }));
+    const query = 'mutation M { hello }';
+    const document = parse(query);
+
+    for (let i = 0; i < 3; i++) {
+      const context = manager.createContext(
+        { query, operationName: 'M' },
+        {}
+      );
+      const short = await manager.beforeExecute(document, context);
+      expect(short).toBeUndefined();
+      expect(context.state.get('cacheSkip')).toBe(true);
+      expect(context.state.get('cacheHit')).toBeUndefined();
+      const response = await manager.afterExecute(
+        { data: { hello: `x${i}` } },
+        context
+      );
+      // The fresh response passes through; nothing is replayed from a cache
+      expect(response).toEqual({ data: { hello: `x${i}` } });
+    }
+  });
+
+  test('should not store a response when an earlier plugin short-circuited the caching plugin', async () => {
+    const manager = new PluginManager({ schema });
+    await manager.register({
+      metadata: { name: 'mutation-short-circuit' },
+      beforeExecute: (document) =>
+        document.definitions.some(
+          (d) => d.kind === 'OperationDefinition' && d.operation === 'mutation'
+        )
+          ? { data: { hello: 'short' } }
+          : undefined,
+    });
+    await manager.register(createCachingPlugin({ allowSharedCache: true, maxSize: 1 }));
+
+    const query = 'query Q { hello }';
+    const queryDoc = parse(query);
+    const first = manager.createContext({ query }, {});
+    await manager.beforeExecute(queryDoc, first);
+    await manager.afterExecute({ data: { hello: 'Q' } }, first);
+
+    const mutation = 'mutation M { hello }';
+    const mutationContext = manager.createContext({ query: mutation }, {});
+    const short = await manager.beforeExecute(parse(mutation), mutationContext);
+    expect(short).toEqual({ data: { hello: 'short' } });
+    await manager.afterExecute(short!, mutationContext);
+
+    // The query entry survived: the mutation never took the only slot
+    const second = manager.createContext({ query }, {});
+    expect(await manager.beforeExecute(queryDoc, second)).toEqual({ data: { hello: 'Q' } });
+  });
+
+  test('should not cache a subscription in the caching plugin', async () => {
+    const manager = new PluginManager({ schema });
+    await manager.register(createCachingPlugin({ allowSharedCache: true }));
+    const query = 'subscription S { hello }';
+    const document = parse(query);
+
+    for (let i = 0; i < 2; i++) {
+      const context = manager.createContext(
+        { query, operationName: 'S' },
+        {}
+      );
+      expect(await manager.beforeExecute(document, context)).toBeUndefined();
+      expect(context.state.get('cacheSkip')).toBe(true);
+      await manager.afterExecute({ data: { hello: 'x' } }, context);
+    }
+  });
+
+  test('should cache a single anonymous query without operationName in the caching plugin', async () => {
+    const manager = new PluginManager({ schema });
+    await manager.register(createCachingPlugin({ allowSharedCache: true }));
+    const query = '{ hello }';
+    const document = parse(query);
+
+    const first = manager.createContext({ query }, {});
+    expect(await manager.beforeExecute(document, first)).toBeUndefined();
+    expect(first.state.get('cacheSkip')).toBeUndefined();
+    await manager.afterExecute({ data: { hello: 'x' } }, first);
+
+    const second = manager.createContext({ query }, {});
+    expect(await manager.beforeExecute(document, second)).toEqual({
+      data: { hello: 'x' },
+    });
+  });
+
+  test('should still cache the selected query in a mixed document in the caching plugin', async () => {
+    const manager = new PluginManager({ schema });
+    await manager.register(createCachingPlugin({ allowSharedCache: true }));
+    const query = 'query Q { hello } mutation M { hello }';
+    const document = parse(query);
+
+    const first = manager.createContext({ query, operationName: 'Q' }, {});
+    await manager.beforeExecute(document, first);
+    await manager.afterExecute({ data: { hello: 'x' } }, first);
+
+    const second = manager.createContext({ query, operationName: 'Q' }, {});
+    expect(await manager.beforeExecute(document, second)).toEqual({
+      data: { hello: 'x' },
+    });
+  });
+
+  test('should score only the selected operation in the complexity plugin', async () => {
+    const manager = new PluginManager({ schema });
+    await manager.register(createComplexityPlugin({ maxComplexity: 3 }));
+    const query = 'query Small { hello } query Big { users(first: 50) { id name } }';
+    const document = parse(query);
+
+    const ok = manager.createContext({ query, operationName: 'Small' }, {});
+    await manager.afterParse(document, ok);
+    expect(ok.state.get('complexity')).toBe(1);
+
+    const big = manager.createContext({ query, operationName: 'Big' }, {});
+    await expect(manager.afterParse(document, big)).rejects.toThrow(
+      ComplexityError
+    );
+
+    // No selection: falls back to the max across operations
+    const none = manager.createContext({ query }, {});
+    await expect(manager.afterParse(document, none)).rejects.toThrow(
+      ComplexityError
+    );
+  });
+
+  test('should take the max, not the sum, across unselected operations in the complexity plugin', async () => {
+    const manager = new PluginManager({ schema });
+    await manager.register(createComplexityPlugin({ maxComplexity: 3 }));
+    const query = 'query A { a: hello b: hello } query B { c: hello d: hello }';
+    const document = parse(query);
+
+    const context = manager.createContext({ query }, {});
+    await manager.afterParse(document, context);
+    expect(context.state.get('complexity')).toBe(2);
+  });
+
+  test.each([
+    'query A { c: hello } query A { a: hello b: hello }',
+    'query A { a: hello b: hello } query A { c: hello }',
+  ])('should fall back to the max when operationName matches several operations in the complexity plugin (%s)', async (query) => {
+    const manager = new PluginManager({ schema });
+    await manager.register(createComplexityPlugin({ maxComplexity: 3 }));
+    const document = parse(query);
+
+    const context = manager.createContext({ query, operationName: 'A' }, {});
+    await manager.afterParse(document, context);
+    expect(context.state.get('complexity')).toBe(2);
+  });
+
+  test('should report unknown duration in the logging plugin when beforeExecute did not run', async () => {
+    const logs: Array<{ msg: string; data?: unknown }> = [];
+    const log = (msg: string, data?: unknown): number =>
+      logs.push({ msg, data });
+    const manager = new PluginManager({ schema });
+    await manager.register(
+      createLoggingPlugin({
+        logger: { debug: log, info: log, warn: log, error: log },
+      })
+    );
+    const context = manager.createContext({ query: '{ hello }' }, {});
+    await manager.afterExecute({ data: { hello: 'x' } }, context);
+
+    const text = JSON.stringify(logs);
+    expect(text).not.toContain('NaN');
+    expect(text).toContain('unknown');
+  });
+});

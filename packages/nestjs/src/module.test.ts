@@ -68,7 +68,7 @@ async function invokeMiddleware(
   };
 
   await middleware.use(
-    { method: 'POST', path, body: { query }, headers: {} } as MiddlewareRequest,
+    { method: 'POST', path, body: { query }, headers: { 'content-type': 'application/json' } } as MiddlewareRequest,
     res as unknown as MiddlewareResponse,
     () => {
       nextCalled = true;
@@ -265,7 +265,7 @@ describe('LeavenModule', () => {
   });
 
   describe('configure', () => {
-    test('applies GraphQLMiddleware at the default /graphql path', () => {
+    test('should apply GraphQLMiddleware at the default /graphql path', () => {
       const leavenModule = new LeavenModule({});
       const { consumer, applied, routes } = createConsumerSpy();
 
@@ -275,7 +275,7 @@ describe('LeavenModule', () => {
       expect(routes).toContain('/graphql');
     });
 
-    test('applies GraphQLMiddleware at a custom path', () => {
+    test('should apply GraphQLMiddleware at a custom path', () => {
       const leavenModule = new LeavenModule({ path: '/api/graphql' });
       const { consumer, applied, routes } = createConsumerSpy();
 
@@ -285,7 +285,7 @@ describe('LeavenModule', () => {
       expect(routes).toContain('/api/graphql');
     });
 
-    test('does nothing when the module was imported without forRoot()', () => {
+    test('should do nothing when the module was imported without forRoot()', () => {
       const leavenModule = new LeavenModule();
       const { consumer, applied, routes } = createConsumerSpy();
 
@@ -297,7 +297,7 @@ describe('LeavenModule', () => {
   });
 
   describe('integration (NestJS testing module)', () => {
-    test('boots with a pre-built schema, wires it through the schema builder into the driver, and serves queries via the middleware', async () => {
+    test('should boot with a pre-built schema, wire it through the schema builder into the driver, and serve queries via the middleware', async () => {
       const schema = createSchema();
       const moduleRef = await Test.createTestingModule({
         imports: [LeavenModule.forRoot({ schema })],
@@ -326,7 +326,7 @@ describe('LeavenModule', () => {
       }
     });
 
-    test('injects a working PubSub into providers via @InjectPubSub()', async () => {
+    test('should inject a working PubSub into providers via @InjectPubSub()', async () => {
       @Injectable()
       class FeedService {
         constructor(@InjectPubSub() public readonly pubSub: PubSub) {}
@@ -354,7 +354,7 @@ describe('LeavenModule', () => {
       }
     });
 
-    test('uses a caller-supplied PubSub instance when one is configured', async () => {
+    test('should use a caller-supplied PubSub instance when one is configured', async () => {
       const pubSub = createPubSub();
 
       const moduleRef = await Test.createTestingModule({
@@ -369,7 +369,7 @@ describe('LeavenModule', () => {
       }
     });
 
-    test('boots via forRootAsync with useFactory and builds the schema', async () => {
+    test('should boot via forRootAsync with useFactory and build the schema', async () => {
       const schema = createSchema();
       const moduleRef = await Test.createTestingModule({
         imports: [LeavenModule.forRootAsync({ useFactory: () => ({ schema }) })],
@@ -388,7 +388,7 @@ describe('LeavenModule', () => {
       }
     });
 
-    test('boots with typeDefs/resolvers and keeps the schema builder and driver in sync', async () => {
+    test('should boot with typeDefs/resolvers and keep the schema builder and driver in sync', async () => {
       const moduleRef = await Test.createTestingModule({
         imports: [
           LeavenModule.forRoot({
@@ -412,7 +412,7 @@ describe('LeavenModule', () => {
       }
     });
 
-    test('builds an executable schema from typeDefs/resolvers and serves queries', async () => {
+    test('should build an executable schema from typeDefs/resolvers and serve queries', async () => {
       const moduleRef = await Test.createTestingModule({
         imports: [
           LeavenModule.forRoot({
@@ -437,7 +437,7 @@ describe('LeavenModule', () => {
       }
     });
 
-    test('injects module options into LeavenModule for middleware configuration', async () => {
+    test('should inject module options into LeavenModule for middleware configuration', async () => {
       const schema = createSchema();
       const moduleRef = await Test.createTestingModule({
         imports: [LeavenModule.forRoot({ schema, path: '/api/graphql' })],

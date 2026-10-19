@@ -68,10 +68,12 @@ export { LEAVEN_MODULE_OPTIONS, LEAVEN_DRIVER, LEAVEN_PUBSUB };
  *   `resolvers` (or baked into a pre-built `schema`) are plain functions
  *   invoked by graphql-js, not Nest handlers, so `@UseGuards`,
  *   `@UseInterceptors`, and parameter decorators such as `@Args()` never fire
- *   for them. That requires a `@nestjs/graphql` `AbstractGraphQLDriver` bridge,
- *   which this package does not ship. `maxComplexity` is unaffected — the
- *   executor enforces it directly — but `maxDepth`, which is only surfaced for
- *   {@link DepthGuard}, is not enforced on this path.
+ *   for them. To get that pipeline, use `LeavenGraphQLDriver` (`graphql-driver.ts`) — the
+ *   `@nestjs/graphql` `AbstractGraphQLDriver` bridge this package ships — with
+ *   `GraphQLModule.forRoot({ driver: LeavenGraphQLDriver })` instead of this
+ *   module. Query limits are unaffected: the executor enforces both
+ *   `maxComplexity` and `maxDepth` directly on either path. See the note on
+ *   {@link ComplexityGuard} for why the guards do not apply.
  *
  * @example
  * ```typescript

@@ -13,6 +13,7 @@ import {
   estimateDocumentBytes,
   AST_BYTES_PER_QUERY_CHAR,
   DEFAULT_CACHE_MAX_BYTES,
+  sha256Hex,
 } from './cache';
 
 describe('DocumentCache', () => {
@@ -570,5 +571,16 @@ describe('DocumentCache', () => {
       const cache = createDocumentCache({ maxSize: 100 });
       expect(cache).toBeInstanceOf(DocumentCache);
     });
+  });
+});
+
+describe('sha256Hex', () => {
+  test('should return the known SHA-256 hex digest', () => {
+    expect(sha256Hex('abc')).toBe(
+      'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+    );
+    expect(sha256Hex('')).toBe(
+      'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    );
   });
 });

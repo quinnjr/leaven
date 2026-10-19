@@ -33,6 +33,11 @@ export interface ServerConfig<TContext = unknown> extends HandlerConfig<TContext
    * plain HTTP, set `sse` instead (or as well): requests that Accept
    * `text/event-stream` are streamed as server-sent events, with Bun's idle
    * timeout disabled while the stream is open and restored when it closes.
+   *
+   * Before upgrading, the server calls `websocket.isOriginAllowed(request)`
+   * and answers 403 `Forbidden` when it returns false, so by default only
+   * same-origin browsers (and clients that send no `Origin`) may connect.
+   * Widen it with the handler's `allowedOrigins` option.
    */
   websocket?: WebSocketHandler;
   /** Called when server starts */
@@ -100,6 +105,11 @@ export class LeavenServer {
           this.server &&
           request.headers.get('upgrade')?.toLowerCase() === 'websocket'
         ) {
+          // Refuse cross-site handshakes before upgrading: browsers send
+          // cookies with them and no CORS preflight applies (CSWSH).
+          if (!this.config.websocket.isOriginAllowed(request)) {
+            return new Response('Forbidden', { status: 403 });
+          }
           const data: WebSocketContext = {
             connectionId: '',
             initialized: false,
@@ -256,10 +266,17 @@ export class LeavenServer {
 
   /**
    * Stop the server
+   *
+   * By default the stop is graceful: the listener closes, but connections
+   * that are already open (notably an in-flight GraphQL over SSE stream or a
+   * WebSocket) are left to finish on their own and are NOT closed. Pass
+   * `closeActiveConnections: true` to terminate them immediately.
+   *
+   * @param closeActiveConnections - Also close open connections (default false)
    */
-  public stop(): void {
+  public stop(closeActiveConnections: boolean = false): void {
     if (this.server) {
-      this.server.stop();
+      this.server.stop(closeActiveConnections);
       this.server = null;
       this.config.onStop?.();
     }

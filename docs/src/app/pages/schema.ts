@@ -301,7 +301,8 @@ const schema1 = await loadSchemaFromFile('./schema.graphql');
 // Load all files in a directory
 const schema2 = await loadSchemaFromDirectory('./schemas');
 
-// Load files matching a glob pattern
+// Load files matching a glob pattern. The pattern alone selects files:
+// the glob loaders ignore the extensions and recursive options.
 const schema3 = await loadSchemaFromGlob('./modules/**/*.graphql');`;
 
   directivesCode = `import { DirectiveLocation } from 'graphql';
@@ -333,7 +334,9 @@ const schema = applyDirectives(baseSchema, {
 // Installing several at once rebuilds the schema only once
 const schema2 = addDirectives(baseSchema, [authDirective, cacheControlDirective]);
 
-// Read the arguments a directive was applied with
+// Read the arguments a directive was applied with. Only arguments written in
+// the SDL are returned: declared defaultValues are not applied and values are
+// not coerced, so a bare @auth yields {} rather than { requires: 'USER' }.
 const fields = schema.getQueryType()!.toConfig().fields;
 const args = getDirectiveValues(fields.secret!, 'auth'); // { requires: 'ADMIN' } | null`;
 }

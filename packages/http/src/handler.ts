@@ -13,7 +13,13 @@ import {
   type GraphQLResponse,
 } from '@leaven-graphql/core';
 import { createRequestContext, type RequestContextConfig } from '@leaven-graphql/context';
-import { formatError, isLeavenError, type ErrorMaskingOptions } from '@leaven-graphql/errors';
+import {
+  formatError,
+  isLeavenError,
+  statusForResponse,
+  withMaskingDefault,
+  type ErrorMaskingOptions,
+} from '@leaven-graphql/errors';
 import { renderGraphiQL } from '@leaven-graphql/playground';
 import {
   acceptsEventStream,
@@ -24,7 +30,13 @@ import {
   type EventStreamSource,
 } from '@leaven-graphql/sse';
 
-import { parseBody, parseQuery, validateRequest } from './request';
+import {
+  mediaType,
+  parseBody,
+  parseQuery,
+  UnsupportedMediaTypeError,
+  validateRequest,
+} from './request';
 import {
   buildResponse,
   buildErrorResponse,
@@ -57,6 +69,21 @@ export interface SSEOptions {
 }
 
 /**
+ * CSRF prevention options
+ *
+ * Twin of `CSRFPreventionOptions` in `packages/nestjs/src/types.ts`: the two
+ * must stay in step.
+ */
+export interface CSRFPreventionOptions {
+  /**
+   * Headers whose presence (with a non-empty value) proves the request was
+   * preflighted. Replaces the default list
+   * (`x-graphql-csrf`, `apollo-require-preflight`, `x-apollo-operation-name`).
+   */
+  requestHeaders?: string[];
+}
+
+/**
  * Handler configuration
  */
 export interface HandlerConfig<TContext = unknown> {
@@ -74,7 +101,13 @@ export interface HandlerConfig<TContext = unknown> {
   playground?: boolean;
   /** Path for the GraphQL endpoint (used as the playground's endpoint; default: '/graphql') */
   path?: string;
-  /** Error formatting options */
+  /**
+   * Error formatting options.
+   *
+   * On the thrown-error path (e.g. a failing context factory) and the SSE
+   * error path, masking is on by default and stays on when other options
+   * are set; only an explicit `maskErrors: false` disables it.
+   */
   errorFormatting?: ErrorMaskingOptions;
   /** Request context configuration */
   requestContext?: RequestContextConfig;
@@ -88,7 +121,8 @@ export interface HandlerConfig<TContext = unknown> {
   maxBodySize?: number;
   /**
    * Maximum time to spend reading a request body, in milliseconds
-   * (default: 30_000). Bounds slow-loris style trickled uploads.
+   * (default: 30_000). Bounds slow-loris style trickled uploads. `Infinity`
+   * (or `0`) disables the deadline; values above 2^31-1 are clamped.
    */
   bodyReadTimeoutMs?: number;
   /**
@@ -96,13 +130,94 @@ export interface HandlerConfig<TContext = unknown> {
    * requests that Accept text/event-stream. Default: off.
    */
   sse?: boolean | SSEOptions;
+  /**
+   * CSRF prevention (default: on). A POST whose Content-Type is missing or
+   * CORS-safelisted (`text/plain`, `application/x-www-form-urlencoded`,
+   * `multipart/form-data`) is refused with 400 unless it carries a
+   * non-empty preflight-forcing header (default: `x-graphql-csrf`,
+   * `apollo-require-preflight`, `x-apollo-operation-name`). Such requests
+   * are "simple" and a browser sends them cross-site without a CORS
+   * preflight. `false` disables the check.
+   */
+  csrfPrevention?: boolean | CSRFPreventionOptions;
 }
 
-/** Default maximum request body size in bytes */
+/**
+ * RFC 9110 header field-name token. Twin of `HEADER_TOKEN` in
+ * `packages/nestjs/src/request-body.ts`.
+ */
+const HEADER_TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
+/**
+ * Default headers that satisfy CSRF prevention. Twin of
+ * `DEFAULT_CSRF_REQUEST_HEADERS` in `packages/nestjs/src/request-body.ts`.
+ */
+const DEFAULT_CSRF_REQUEST_HEADERS: readonly string[] = [
+  'x-graphql-csrf',
+  'apollo-require-preflight',
+  'x-apollo-operation-name',
+];
+
+/**
+ * Media types a browser may POST cross-site without a CORS preflight. The
+ * empty string stands for a missing Content-Type. Twin of
+ * `CORS_SAFELISTED_MEDIA_TYPES` in `packages/nestjs/src/request-body.ts`.
+ */
+const CORS_SAFELISTED_MEDIA_TYPES: ReadonlySet<string> = new Set([
+  '',
+  'text/plain',
+  'application/x-www-form-urlencoded',
+  'multipart/form-data',
+]);
+
+/**
+ * Message returned when CSRF prevention blocks a request. Twin of
+ * `CSRF_BLOCKED_MESSAGE` in `packages/nestjs/src/request-body.ts`.
+ */
+const CSRF_BLOCKED_MESSAGE =
+  'This request is blocked by CSRF prevention: send a non-simple Content-Type ' +
+  '(application/json) or an x-graphql-csrf header';
+
+/**
+ * Whether a POST could have been sent cross-site without a preflight and
+ * carries none of the preflight-forcing headers.
+ *
+ * Twin of `isCsrfBlocked` in `packages/nestjs/src/request-body.ts`: the
+ * defaults, the safelist and the semantics must stay in step with it.
+ */
+function isCsrfBlocked(request: Request, requestHeaders: readonly string[]): boolean {
+  if (!CORS_SAFELISTED_MEDIA_TYPES.has(mediaType(request.headers.get('content-type')))) {
+    return false;
+  }
+  return !requestHeaders.some(
+    (name) => (request.headers.get(name) ?? '').trim() !== ''
+  );
+}
+
+/**
+ * Default maximum request body size in bytes.
+ *
+ * Twin of `DEFAULT_MAX_BODY_SIZE` and `readBodyText` in
+ * `packages/nestjs/src/request-body.ts`. The defaults and the size-limit
+ * semantics (Content-Length fast path, limit enforced on the bytes read, 413
+ * `PAYLOAD_TOO_LARGE`) must stay in step. Here the Content-Length fast path
+ * lives in `createHandler`'s POST branch rather than in `readBodyWithLimit`,
+ * and a consumed or locked body is mapped to a 400 by that caller; nestjs
+ * `readBodyText` does both itself.
+ */
 const DEFAULT_MAX_BODY_SIZE = 1_000_000;
 
-/** Default deadline for reading a request body, in milliseconds */
+/**
+ * Default deadline for reading a request body, in milliseconds.
+ *
+ * Part of the same twin pair as `DEFAULT_MAX_BODY_SIZE`: keep it in step with
+ * the nestjs read deadline (`DEFAULT_BODY_READ_TIMEOUT_MS` in
+ * `packages/nestjs/src/request-body.ts`).
+ */
 const DEFAULT_BODY_READ_TIMEOUT_MS = 30_000;
+
+/** Raised when reading a request body exceeds its deadline */
+class BodyReadTimeoutError extends Error {}
 
 /**
  * Read a request body while enforcing a maximum size.
@@ -113,6 +228,10 @@ const DEFAULT_BODY_READ_TIMEOUT_MS = 30_000;
  *
  * The read is bounded by `timeoutMs` so a client that trickles bytes cannot
  * pin a request slot indefinitely.
+ *
+ * Twin of `readBodyText` in `packages/nestjs/src/request-body.ts`: the defaults and
+ * the size-limit and deadline semantics (a non-finite or non-positive timeout
+ * disables the deadline) must stay in step between the two.
  *
  * Returns a new Request carrying the buffered body (headers preserved so
  * content-type/boundary survive), or `null` when the limit was exceeded.
@@ -137,10 +256,18 @@ async function readBodyWithLimit(
   // cancelled once the read finishes, otherwise every completed POST leaves a
   // live timer, listener and reject closure pinned for the full timeout.
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  // Armed only for a finite positive value: Infinity, 0, NaN or a negative
+  // number mean "no deadline" (setTimeout would otherwise fire them after ~1ms).
+  // Larger values are clamped to the 32-bit maximum setTimeout accepts.
   const deadline = new Promise<never>((_resolve, reject) => {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      return;
+    }
     deadlineTimer = setTimeout(() => {
-      reject(new Error(`Timed out reading request body after ${timeoutMs}ms`));
-    }, timeoutMs);
+      reject(
+        new BodyReadTimeoutError(`Timed out reading request body after ${timeoutMs}ms`)
+      );
+    }, Math.min(timeoutMs, 2 ** 31 - 1));
   });
 
   try {
@@ -227,16 +354,52 @@ function formatResponseErrors<TData>(
 async function executeForStream<TContext>(
   executor: LeavenExecutor,
   request: GraphQLRequest,
-  context: TContext
+  context: TContext,
+  operationType: OperationTypeNode | undefined
 ): Promise<{ stream: EventStreamSource } | { json: GraphQLResponse }> {
   const result =
-    (await operationTypeOf(executor, request)) === OperationTypeNode.SUBSCRIPTION
+    operationType === OperationTypeNode.SUBSCRIPTION
       ? await executor.subscribe(request, context)
       : (await executor.execute(request, context)).response;
   if (isSubscriptionIterator(result) || !isRequestError(result)) {
     return { stream: result };
   }
   return { json: result };
+}
+
+/**
+ * Merge user-configured response headers with CORS headers. CORS wins on
+ * conflicts, except `Vary`, whose values are combined (deduplicated
+ * case-insensitively) so a user `Vary: Accept-Encoding` is not lost. The user
+ * key may use any casing.
+ */
+function mergeResponseHeaders(
+  userHeaders: Record<string, string> | undefined,
+  cors: Record<string, string>
+): Record<string, string> {
+  const byLower = new Map<string, [string, string]>();
+  const varyValues: string[] = [];
+  const addVary = (value: string): void => {
+    for (const part of value.split(',')) {
+      const token = part.trim();
+      if (token !== '' && !varyValues.some((v) => v.toLowerCase() === token.toLowerCase())) {
+        varyValues.push(token);
+      }
+    }
+  };
+  // Header names are case-insensitive: key by lowercase name so a later
+  // (CORS) entry overwrites an earlier (user) one whatever its casing.
+  for (const source of [userHeaders ?? {}, cors]) {
+    for (const [key, value] of Object.entries(source)) {
+      const lower = key.toLowerCase();
+      if (lower === 'vary') addVary(value);
+      else byLower.set(lower, [key, value]);
+    }
+  }
+  const merged: Record<string, string> = {};
+  for (const [key, value] of byLower.values()) merged[key] = value;
+  if (varyValues.length > 0) merged['Vary'] = varyValues.join(', ');
+  return merged;
 }
 
 /**
@@ -253,12 +416,45 @@ export function createHandler<TContext = unknown>(
   });
 
   const allowedMethods = config.allowedMethods ?? ['GET', 'POST', 'OPTIONS'];
-  const corsConfig = config.cors === true ? {} : config.cors || undefined;
+  const baseCorsConfig = config.cors === true ? {} : config.cors || undefined;
   const maxBodySize = config.maxBodySize ?? DEFAULT_MAX_BODY_SIZE;
   const bodyReadTimeoutMs =
     config.bodyReadTimeoutMs ?? DEFAULT_BODY_READ_TIMEOUT_MS;
+  const rawCsrfHeaders: readonly string[] | undefined =
+    config.csrfPrevention === false
+      ? undefined
+      : typeof config.csrfPrevention === 'object'
+        ? (config.csrfPrevention.requestHeaders ?? DEFAULT_CSRF_REQUEST_HEADERS)
+        : DEFAULT_CSRF_REQUEST_HEADERS;
+  const csrfRequestHeaders: readonly string[] | undefined = rawCsrfHeaders?.map(
+    (name) => {
+      // Twin of `resolveCsrfRequestHeaders` in packages/nestjs/src/request-body.ts:
+      // the two must stay in step. Guards non-strings (e.g. from untyped JS config).
+      const normalized = typeof name === 'string' ? name.trim().toLowerCase() : '';
+      if (!HEADER_TOKEN.test(normalized)) {
+        throw new TypeError(
+          `csrfPrevention.requestHeaders: ${JSON.stringify(name)} is not a valid header name`
+        );
+      }
+      return normalized;
+    }
+  );
+  // Cross-origin clients must be allowed to send the CSRF header, so unless
+  // the user chose allowedHeaders explicitly, add the CSRF names to the default.
+  // Twin of nestjs defaultAllowedHeaders() in packages/nestjs/src/middleware.ts.
+  const corsConfig =
+    baseCorsConfig !== undefined &&
+    baseCorsConfig.allowedHeaders === undefined &&
+    csrfRequestHeaders !== undefined
+      ? {
+          ...baseCorsConfig,
+          allowedHeaders: ['Content-Type', 'Authorization', ...csrfRequestHeaders],
+        }
+      : baseCorsConfig;
   const sseOptions: SSEOptions | undefined =
     config.sse === true ? {} : config.sse || undefined;
+  // An explicit `maskErrors: undefined` must not override the secure default.
+  const maskingOptions: ErrorMaskingOptions = withMaskingDefault(config.errorFormatting);
   const playgroundHtml = config.playground
     ? renderGraphiQL({ endpoint: config.path ?? '/graphql' })
     : null;
@@ -276,13 +472,22 @@ export function createHandler<TContext = unknown>(
       return methodNotAllowed(allowedMethods);
     }
 
+    // Without CORS there is no preflight to answer; still treat OPTIONS as a
+    // method-discovery request rather than a malformed GraphQL operation.
+    if (method === 'OPTIONS') {
+      return new Response(null, {
+        status: 204,
+        headers: { Allow: allowedMethods.join(', ') },
+      });
+    }
+
     // Add CORS headers to response options
     const responseOptions: ResponseOptions = {
       ...config.response,
-      headers: {
-        ...config.response?.headers,
-        ...(corsConfig !== undefined ? corsHeaders(request, corsConfig) : {}),
-      },
+      headers: mergeResponseHeaders(
+        config.response?.headers,
+        corsConfig !== undefined ? corsHeaders(request, corsConfig) : {}
+      ),
     };
 
     const wantsStream =
@@ -311,10 +516,51 @@ export function createHandler<TContext = unknown>(
         });
       }
 
-      const queryParams = parseQuery(url);
+      let queryParams: ReturnType<typeof parseQuery> = {};
+      // Decode URL parameters strictly. Over POST the body supplies the
+      // parameters, so a URL field is decoded only when the body lacks it.
+      const readQueryParams = (
+        omit: readonly string[] = []
+      ): Response | undefined => {
+        const target = new URL(url);
+        for (const name of omit) {
+          target.searchParams.delete(name);
+        }
+        try {
+          queryParams = parseQuery(target);
+        } catch (queryError) {
+          return buildErrorResponse(
+            queryError instanceof Error ? queryError.message : 'Invalid query string',
+            400,
+            'BAD_REQUEST',
+            responseOptions
+          );
+        }
+        return undefined;
+      };
+      if (method !== 'POST') {
+        const rejected = readQueryParams();
+        if (rejected !== undefined) {
+          return rejected;
+        }
+      }
 
       let body: Awaited<ReturnType<typeof parseBody>> = {};
       if (method === 'POST') {
+        // CSRF prevention runs before the body is read or the context
+        // factory runs. Only POST needs it: other methods cannot mutate.
+        if (
+          csrfRequestHeaders !== undefined &&
+          isCsrfBlocked(request, csrfRequestHeaders)
+        ) {
+          return buildErrorResponse(
+            CSRF_BLOCKED_MESSAGE,
+            400,
+            'BAD_REQUEST',
+            responseOptions
+          );
+        }
+
         // Enforce maximum body size.
         //
         // Fast path: an honest Content-Length that exceeds the limit is
@@ -345,7 +591,7 @@ export function createHandler<TContext = unknown>(
           // A client abort, stream error, or read deadline is a bad request,
           // not an internal failure — and its raw text is not ours to leak.
           const message =
-            readError instanceof Error
+            readError instanceof BodyReadTimeoutError
               ? readError.message
               : 'Failed to read request body';
           return buildErrorResponse(message, 400, 'BAD_REQUEST', responseOptions);
@@ -369,7 +615,21 @@ export function createHandler<TContext = unknown>(
             parseError instanceof Error
               ? parseError.message
               : 'Failed to parse request body';
-          return buildErrorResponse(message, 400, 'BAD_REQUEST', responseOptions);
+          // Unsupported media type is 415; ErrorCode has no dedicated code,
+          // so it carries BAD_REQUEST, like the 405 mutation rejection.
+          const status = parseError instanceof UnsupportedMediaTypeError ? 415 : 400;
+          return buildErrorResponse(message, status, 'BAD_REQUEST', responseOptions);
+        }
+      }
+
+      if (method === 'POST') {
+        const rejected = readQueryParams(
+          ['variables', 'extensions'].filter(
+            (name) => (body as Record<string, unknown>)[name] != null
+          )
+        );
+        if (rejected !== undefined) {
+          return rejected;
         }
       }
 
@@ -386,19 +646,31 @@ export function createHandler<TContext = unknown>(
 
       const graphqlRequest = validation.request!;
 
-      // Mutations are not safe over GET (GraphQL over HTTP spec); reject
+      // The operation type is computed at most once per request and shared by
+      // the GET-mutation guard and SSE routing.
+      let operationType: Promise<OperationTypeNode | undefined> | undefined;
+      const getOperationType = (): Promise<OperationTypeNode | undefined> =>
+        (operationType ??= operationTypeOf(executor, graphqlRequest));
+
+      // Mutations are only allowed over POST, not GET or HEAD (GraphQL over HTTP spec); reject
       // before any per-request work such as the context factory runs.
       if (
-        method === 'GET' &&
-        (await operationTypeOf(executor, graphqlRequest)) === OperationTypeNode.MUTATION
+        method !== 'POST' &&
+        (await getOperationType()) === OperationTypeNode.MUTATION
       ) {
+        // The computed Allow wins: drop any user key of any casing first.
+        const userHeaders = Object.fromEntries(
+          Object.entries(responseOptions.headers ?? {}).filter(
+            ([key]) => !/^allow$/i.test(key)
+          )
+        );
         return buildErrorResponse(
           'Mutations can only be sent with POST',
           405,
           'BAD_REQUEST',
           {
             ...responseOptions,
-            headers: { ...responseOptions.headers, Allow: 'POST' },
+            headers: { ...userHeaders, Allow: 'POST' },
           }
         );
       }
@@ -413,7 +685,12 @@ export function createHandler<TContext = unknown>(
       }
 
       if (wantsStream) {
-        const outcome = await executeForStream(executor, graphqlRequest, context);
+        const outcome = await executeForStream(
+          executor,
+          graphqlRequest,
+          context,
+          await getOperationType()
+        );
         if ('json' in outcome) {
           return buildResponse(
             formatResponseErrors(outcome.json, config.errorFormatting),
@@ -426,7 +703,7 @@ export function createHandler<TContext = unknown>(
           signal: request.signal,
           keepAliveInterval: sseOptions.keepAliveInterval,
           formatResult: (r) => formatResponseErrors(r, config.errorFormatting),
-          formatError: (e) => formatError(e, config.errorFormatting ?? { maskErrors: true }),
+          formatError: (e) => formatError(e, maskingOptions),
           headers: responseOptions.headers,
         });
       }
@@ -444,9 +721,13 @@ export function createHandler<TContext = unknown>(
       // otherwise raw internal text (DSN strings, connection failures) is
       // returned verbatim to unauthenticated callers. formatError preserves
       // LeavenError messages and masks the rest.
-      const formatted = formatError(error, config.errorFormatting);
-      // LeavenError carries its documented HTTP status; everything else is a 500.
-      const status = isLeavenError(error) ? error.statusCode : 500;
+      const formatted = formatError(error, maskingOptions);
+      // LeavenError carries its documented HTTP status; anything else is mapped
+      // from its (possibly masked) code, so a GraphQLError coded UNAUTHENTICATED
+      // gets 401 and an unknown error stays a 500.
+      const status = isLeavenError(error)
+        ? error.statusCode
+        : statusForResponse({ errors: [formatted] });
       const code =
         (formatted.extensions?.code as string | undefined) ??
         (isLeavenError(error) ? error.code : 'INTERNAL_ERROR');

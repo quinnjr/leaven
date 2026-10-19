@@ -364,7 +364,7 @@ server.start();
     {
       icon: faFire,
       title: 'Blazing Hot Performance',
-      description: 'Fresh from the Bun oven! Native APIs, document caching, and query compilation for the crispiest execution.',
+      description: 'Fresh from the Bun oven! Native APIs, document caching, and query analysis and complexity scoring for the crispiest execution.',
     },
     {
       icon: faShieldHalved,
@@ -423,7 +423,7 @@ server.start();
     },
     {
       question: 'What makes Leaven so fast?',
-      answer: 'We\'ve optimized for Bun\'s oven with native APIs, LRU document caching, compiled queries, and zero bloat. Your API will rise faster than ever!'
+      answer: 'We\'ve optimized for Bun\'s oven with native APIs, LRU document caching, cached query plans, and zero bloat. Your API will rise faster than ever!'
     },
     {
       question: 'Is Leaven ready for production?',

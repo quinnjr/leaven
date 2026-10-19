@@ -10,7 +10,9 @@ import { of, throwError } from 'rxjs';
 import { Reflector } from '@nestjs/core';
 import type { ExecutionContext, CallHandler } from '@nestjs/common';
 import { GraphQLError, Source } from 'graphql';
+import { withNodeEnv } from './test-utils/env';
 import { ValidationError } from '@leaven-graphql/errors';
+import { InternalServerErrorException, UnauthorizedException } from '@nestjs/common';
 import {
   LoggingInterceptor,
   ErrorFormattingInterceptor,
@@ -164,6 +166,34 @@ describe('ErrorFormattingInterceptor', () => {
     });
   });
 
+  test('should map an HttpException to its code and keep its message in production', async () => {
+    await withNodeEnv('production', async () => {
+      const result$ = interceptor.intercept(
+        createMockContext(),
+        createErrorCallHandler(new UnauthorizedException('Token expired'))
+      );
+      const err = await new Promise<GraphQLError>((resolve) => {
+        result$.subscribe({ error: (e) => resolve(e) });
+      });
+      expect(err.extensions?.code).toBe('UNAUTHENTICATED');
+      expect(err.message).toBe('Token expired');
+    });
+  });
+
+  test('should still mask a 5xx HttpException in production', async () => {
+    await withNodeEnv('production', async () => {
+      const result$ = interceptor.intercept(
+        createMockContext(),
+        createErrorCallHandler(new InternalServerErrorException('db password leaked'))
+      );
+      const err = await new Promise<GraphQLError>((resolve) => {
+        result$.subscribe({ error: (e) => resolve(e) });
+      });
+      expect(err.message).not.toContain('db password leaked');
+      expect(err.extensions?.code).toBe('INTERNAL_ERROR');
+    });
+  });
+
   test('should preserve the source locations of the caught error', async () => {
     const context = createMockContext();
     // `locations` is derived from source + positions, so a formatter that
@@ -191,10 +221,7 @@ describe('ErrorFormattingInterceptor', () => {
   });
 
   test('should keep code and message for Leaven errors, even in production', async () => {
-    const previousEnv = process.env.NODE_ENV;
-    process.env.NODE_ENV = 'production';
-
-    try {
+    await withNodeEnv('production', async () => {
       const context = createMockContext();
       const error = new ValidationError('Invalid email address');
       const handler = createErrorCallHandler(error);
@@ -211,20 +238,11 @@ describe('ErrorFormattingInterceptor', () => {
           },
         });
       });
-    } finally {
-      if (previousEnv === undefined) {
-        delete process.env.NODE_ENV;
-      } else {
-        process.env.NODE_ENV = previousEnv;
-      }
-    }
+    });
   });
 
   test('should mask unexpected errors in production without mutating the original', async () => {
-    const previousEnv = process.env.NODE_ENV;
-    process.env.NODE_ENV = 'production';
-
-    try {
+    await withNodeEnv('production', async () => {
       const context = createMockContext();
       const error = new Error('connection refused: db password hunter2');
       const originalStack = error.stack;
@@ -247,20 +265,11 @@ describe('ErrorFormattingInterceptor', () => {
           },
         });
       });
-    } finally {
-      if (previousEnv === undefined) {
-        delete process.env.NODE_ENV;
-      } else {
-        process.env.NODE_ENV = previousEnv;
-      }
-    }
+    });
   });
 
-  test('should not leak source locations from a masked error', async () => {
-    const previousEnv = process.env.NODE_ENV;
-    process.env.NODE_ENV = 'production';
-
-    try {
+  test('should keep the locations but not the message of a masked error', async () => {
+    await withNodeEnv('production', async () => {
       const context = createMockContext();
       const error = new GraphQLError('table "users_pii" is missing', {
         source: new Source('{ nope }'),
@@ -274,18 +283,13 @@ describe('ErrorFormattingInterceptor', () => {
         result$.subscribe({
           error: (err) => {
             expect(err.message).toBe('An unexpected error occurred');
-            expect(err.locations).toBeUndefined();
+            expect(err.locations).toEqual([{ line: 1, column: 3 }]);
+            expect(JSON.stringify(err)).not.toContain('users_pii');
             resolve();
           },
         });
       });
-    } finally {
-      if (previousEnv === undefined) {
-        delete process.env.NODE_ENV;
-      } else {
-        process.env.NODE_ENV = previousEnv;
-      }
-    }
+    });
   });
 
   test('should handle non-Error objects', async () => {
@@ -340,6 +344,91 @@ describe('ComplexityInterceptor', () => {
       });
     });
   });
+
+  test('should call a complexity estimator with the field info and args and add its number', async () => {
+    const received: unknown[] = [];
+    const estimator = (options: {
+      field: unknown;
+      args: Record<string, unknown>;
+      childComplexity: number;
+    }): number => {
+      received.push(options);
+      return (options.args.limit as number) * 2;
+    };
+    reflector.get = (() => estimator) as unknown as Reflector['get'];
+
+    const info = { fieldName: 'users' };
+    const gqlContext: Record<string, unknown> = { _resolvedFieldComplexity: 3 };
+    const context = {
+      ...createMockContext(),
+      getArgs: () => [{}, { limit: 5 }, gqlContext, info],
+    } as ExecutionContext;
+
+    const result$ = interceptor.intercept(context, createMockCallHandler());
+
+    await new Promise<void>((resolve) => {
+      result$.subscribe({
+        complete: () => {
+          expect(received).toEqual([{ field: info, args: { limit: 5 }, childComplexity: 0 }]);
+          expect(gqlContext._resolvedFieldComplexity).toBe(13);
+          resolve();
+        },
+      });
+    });
+  });
+
+  test('should not fail the field when a complexity estimator throws', async () => {
+    reflector.get = (() => () => {
+      throw new Error('estimator exploded');
+    }) as unknown as Reflector['get'];
+    const errorSpy = mock(() => {});
+    const originalError = console.error;
+    console.error = errorSpy;
+
+    const gqlContext: Record<string, unknown> = { _resolvedFieldComplexity: 4 };
+    const context = {
+      ...createMockContext(),
+      getArgs: () => [{}, {}, gqlContext, {}],
+    } as ExecutionContext;
+
+    const values: unknown[] = [];
+    try {
+      await new Promise<void>((resolve, reject) => {
+        interceptor.intercept(context, createMockCallHandler('field-value')).subscribe({
+          next: (value) => values.push(value),
+          error: reject,
+          complete: resolve,
+        });
+      });
+    } finally {
+      console.error = originalError;
+    }
+
+    expect(values).toEqual(['field-value']);
+    expect(gqlContext._resolvedFieldComplexity).toBe(4);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([[Number.NaN], [Number.POSITIVE_INFINITY], ['7']])(
+    'should ignore a non-finite or non-number estimator result (%p)',
+    async (estimate) => {
+      reflector.get = (() => () => estimate) as unknown as Reflector['get'];
+
+      const gqlContext: Record<string, unknown> = { _resolvedFieldComplexity: 4 };
+      const context = {
+        ...createMockContext(),
+        getArgs: () => [{}, {}, gqlContext, {}],
+      } as ExecutionContext;
+
+      await new Promise<void>((resolve) => {
+        interceptor.intercept(context, createMockCallHandler()).subscribe({
+          complete: resolve,
+        });
+      });
+
+      expect(gqlContext._resolvedFieldComplexity).toBe(4);
+    }
+  );
 
   test('should sum complexity across multiple fields instead of overwriting', async () => {
     const complexities = [10, 5];
@@ -473,7 +562,7 @@ describe('CachingInterceptor', () => {
     });
   });
 
-  test('is a no-op for the info Leaven actually supplies', async () => {
+  test('should be a no-op for the info Leaven actually supplies', async () => {
     // The GraphQLResolveInfo Leaven passes carries no `cacheControl`, so a
     // decorated resolver observes nothing at all: the hint is dropped and the
     // value passes straight through.

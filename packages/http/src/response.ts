@@ -6,7 +6,7 @@
  */
 
 import type { GraphQLResponse } from '@leaven-graphql/core';
-import { ERROR_CODES, getErrorCode } from '@leaven-graphql/errors';
+import { statusForResponse } from '@leaven-graphql/errors';
 
 /**
  * CORS configuration
@@ -63,6 +63,25 @@ export function corsHeaders(
     }
   }
 
+  // NOTE: the CORS rules below (Vary: Origin unless '*', credentials only with
+  // an explicit origin) are mirrored in packages/nestjs/src/middleware.ts:
+  // `applyCorsHeaders` emits Vary and credentials, and `resolveAllowedOrigin`
+  // picks the origin. They must stay in step (nestjs does not depend on http).
+  // A credentialed response cannot use the '*' wildcard, and echoing the
+  // request Origin in its place would let ANY site make credentialed reads.
+  // Only an origin that passed an explicit string, array or predicate check
+  // may be paired with credentials, so a wildcard drops both headers.
+  if (config.credentials && headers['Access-Control-Allow-Origin'] === '*') {
+    delete headers['Access-Control-Allow-Origin'];
+  }
+  const credentialsAllowed =
+    config.credentials === true && headers['Access-Control-Allow-Origin'] !== undefined;
+
+  // The emitted origin depends on the request unless it is the literal '*'.
+  if (headers['Access-Control-Allow-Origin'] !== '*') {
+    headers['Vary'] = 'Origin';
+  }
+
   // Access-Control-Allow-Methods
   if (config.methods) {
     headers['Access-Control-Allow-Methods'] = config.methods.join(', ');
@@ -83,7 +102,7 @@ export function corsHeaders(
   }
 
   // Access-Control-Allow-Credentials
-  if (config.credentials) {
+  if (credentialsAllowed) {
     headers['Access-Control-Allow-Credentials'] = 'true';
   }
 
@@ -102,27 +121,14 @@ export function buildResponse(
   response: GraphQLResponse,
   options: ResponseOptions = {}
 ): Response {
-  const hasErrors = response.errors && response.errors.length > 0;
-
-  // Determine status code
-  let status = options.status ?? 200;
-
-  // Only a total failure changes the status. When `data` is present the
-  // response is a spec-conformant partial success and MUST stay 200 — for
-  // coded errors too — or clients treat it as a network error and discard the
-  // data they were given.
-  const totalFailure = response.data === undefined || response.data === null;
-
-  if (hasErrors && status === 200 && totalFailure) {
-    // Map the first error's code to its documented HTTP status using the
-    // ERROR_CODES registry (the single source of truth). An uncoded error
-    // falls back to the documented 500 default.
-    const firstError = response.errors![0];
-    const code = firstError?.extensions?.code as string | undefined;
-    const knownCode = code ? getErrorCode(code) : null;
-
-    status = knownCode ? ERROR_CODES[knownCode].status : 500;
-  }
+  // An explicit non-200 status wins; 200 (or unset) defers to
+  // statusForResponse. Otherwise only a total failure (`data` absent or
+  // `null`) changes it: a response with non-null `data` is a spec-conformant
+  // partial success and MUST stay 200, or clients treat it as a network error and discard the
+  // data they were given. statusForResponse maps the first error's code via
+  // the ERROR_CODES registry (the single source of truth), falling back to 500.
+  const requested = options.status ?? 200;
+  const status = requested === 200 ? statusForResponse(response) : requested;
 
   // Build response body
   const body = options.pretty
@@ -130,10 +136,12 @@ export function buildResponse(
     : JSON.stringify(response);
 
   // Build headers
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json; charset=utf-8',
-    ...options.headers,
-  };
+  // `.set` replaces case-insensitively, so a user `content-type` overrides the
+  // default instead of being combined with it.
+  const headers = new Headers({ 'Content-Type': 'application/json; charset=utf-8' });
+  for (const [key, value] of Object.entries(options.headers ?? {})) {
+    headers.set(key, value);
+  }
 
   return new Response(body, { status, headers });
 }

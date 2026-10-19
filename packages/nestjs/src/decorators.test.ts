@@ -30,6 +30,7 @@ import {
   infoExtractor,
   rootExtractor,
   argsExtractor,
+  filterAsyncIterator,
 } from './decorators';
 
 function createMockExecutionContext(overrides: {
@@ -67,7 +68,7 @@ describe('Param decorators', () => {
       expect(typeof Context()).toBe('function');
     });
 
-    test('extractor should return the full GraphQL context when no key is given', () => {
+    test('should return the full GraphQL context when no key is given', () => {
       const ctx = createMockExecutionContext({
         context: { user: { id: 'user1' }, req: {}, res: {} },
       });
@@ -77,7 +78,7 @@ describe('Param decorators', () => {
       expect(result.user).toEqual({ id: 'user1' });
     });
 
-    test('extractor should return a single context property for the keyed form', () => {
+    test('should return a single context property for the keyed form', () => {
       const ctx = createMockExecutionContext({
         context: { db: { connected: true }, req: {}, res: {} },
       });
@@ -85,7 +86,7 @@ describe('Param decorators', () => {
       expect(contextExtractor('db', ctx)).toEqual({ connected: true });
     });
 
-    test('extractor should return undefined for a missing context key', () => {
+    test('should return undefined for a missing context key', () => {
       const ctx = createMockExecutionContext({
         context: { req: {}, res: {} },
       });
@@ -100,7 +101,7 @@ describe('Param decorators', () => {
       expect(typeof Info()).toBe('function');
     });
 
-    test('extractor should return the GraphQL resolve info (4th resolver argument)', () => {
+    test('should return the GraphQL resolve info (4th resolver argument)', () => {
       const info = { fieldName: 'users' };
       const ctx = createMockExecutionContext({ info });
 
@@ -114,11 +115,11 @@ describe('Param decorators', () => {
       expect(typeof Root()).toBe('function');
     });
 
-    test('Parent should be an alias for Root', () => {
+    test('should alias Parent to Root', () => {
       expect(Parent).toBe(Root);
     });
 
-    test('extractor should return the root value (1st resolver argument)', () => {
+    test('should return the root value (1st resolver argument)', () => {
       const root = { id: '42', firstName: 'Ada' };
       const ctx = createMockExecutionContext({ root });
 
@@ -132,26 +133,26 @@ describe('Param decorators', () => {
       expect(typeof Args()).toBe('function');
     });
 
-    test('extractor should return all resolver arguments when no key is given', () => {
+    test('should return all resolver arguments when no key is given', () => {
       const args = { id: '123', filter: { active: true } };
       const ctx = createMockExecutionContext({ args });
 
       expect(argsExtractor(undefined, ctx)).toBe(args);
     });
 
-    test('extractor should return a single argument for the keyed form', () => {
+    test('should return a single argument for the keyed form', () => {
       const ctx = createMockExecutionContext({ args: { id: '123', name: 'test' } });
 
       expect(argsExtractor('id', ctx)).toBe('123');
     });
 
-    test('extractor should return undefined for a missing argument key', () => {
+    test('should return undefined for a missing argument key', () => {
       const ctx = createMockExecutionContext({ args: {} });
 
       expect(argsExtractor('missing', ctx)).toBeUndefined();
     });
 
-    test('extractor should tolerate undefined resolver arguments', () => {
+    test('should tolerate undefined resolver arguments', () => {
       const ctx = createMockExecutionContext({ args: undefined });
 
       expect(argsExtractor(undefined, ctx)).toBeUndefined();
@@ -426,6 +427,49 @@ describe('Decorators', () => {
       expect(cleanedUp).toBe(true);
     });
 
+    test('should forward return() to an idle source immediately', async () => {
+      // A pub/sub-style source parked between events: `next()` settles only
+      // once the source itself is returned.
+      let returnCalls = 0;
+      let release: ((step: IteratorResult<{ n: number }>) => void) | undefined;
+      const source: AsyncIterableIterator<{ n: number }> = {
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+        next: () =>
+          new Promise<IteratorResult<{ n: number }>>((resolve) => {
+            release = resolve;
+          }),
+        return: async () => {
+          returnCalls += 1;
+          release?.({ value: undefined, done: true });
+          return { value: undefined, done: true };
+        },
+      };
+
+      class TestClass {
+        @SubscriptionFilter(() => true)
+        public events(): AsyncIterableIterator<{ n: number }> {
+          return source;
+        }
+      }
+
+      const iterator = new TestClass().events(undefined, {});
+      const pending = iterator.next();
+      // Let the filter reach the source's pending next().
+      await Promise.resolve();
+
+      await iterator.return?.(undefined);
+
+      expect(returnCalls).toBe(1);
+      expect(await pending).toEqual({ value: undefined, done: true });
+
+      // Already cancelled: neither next() nor a second return() touches the source.
+      expect(await iterator.next()).toEqual({ value: undefined, done: true });
+      await iterator.return?.(undefined);
+      expect(returnCalls).toBe(1);
+    });
+
     test('should await asynchronous filters', async () => {
       class TestClass {
         @SubscriptionFilter(async (payload: unknown) => {
@@ -513,5 +557,130 @@ describe('Decorators', () => {
     test('should have correct subscription filter key', () => {
       expect(SUBSCRIPTION_FILTER_KEY).toBe('leaven:subscription:filter');
     });
+  });
+});
+
+describe('filterAsyncIterator', () => {
+  /** A hand-rolled source that counts calls to its optional methods. */
+  function createSource(
+    values: number[],
+    methods: { throw?: boolean; return?: boolean } = {}
+  ): { iterable: AsyncIterable<number>; calls: { throw: number; return: number } } {
+    const calls = { throw: 0, return: 0 };
+    let index = 0;
+    const iterator: AsyncIterator<number> = {
+      next: async (): Promise<IteratorResult<number>> =>
+        index < values.length
+          ? { value: values[index++] as number, done: false }
+          : { value: undefined, done: true },
+    };
+    if (methods.throw) {
+      iterator.throw = async (): Promise<IteratorResult<number>> => {
+        calls.throw++;
+        return { value: undefined, done: true };
+      };
+    }
+    if (methods.return) {
+      iterator.return = async (): Promise<IteratorResult<number>> => {
+        calls.return++;
+        return { value: undefined, done: true };
+      };
+    }
+    return { iterable: { [Symbol.asyncIterator]: () => iterator }, calls };
+  }
+
+  test('should finish when the source next() rejects, without closing or pulling it again', async () => {
+    let returns = 0;
+    let nexts = 0;
+    const failure = new Error('source failed');
+    const iterable: AsyncIterable<number> = {
+      [Symbol.asyncIterator]: () => ({
+        next: async (): Promise<IteratorResult<number>> => {
+          nexts++;
+          throw failure;
+        },
+        return: async (): Promise<IteratorResult<number>> => {
+          returns++;
+          return { value: undefined, done: true };
+        },
+      }),
+    };
+    const filtered = filterAsyncIterator(iterable, () => true);
+
+    await expect(filtered.next()).rejects.toBe(failure);
+    await filtered.return!();
+    expect(returns).toBe(0);
+    expect(await filtered.next()).toEqual({ value: undefined, done: true });
+    expect(nexts).toBe(1);
+  });
+
+  test('should forward throw() to a source that has throw exactly once and resolve done', async () => {
+    const { iterable, calls } = createSource([1, 2], { throw: true, return: true });
+    const filtered = filterAsyncIterator(iterable, () => true);
+
+    await expect(filtered.throw!(new Error('cancel'))).resolves.toEqual({
+      value: undefined,
+      done: true,
+    });
+    expect(calls.throw).toBe(1);
+    expect(calls.return).toBe(0);
+    // Finished: no further events.
+    expect(await filtered.next()).toEqual({ value: undefined, done: true });
+  });
+
+  test('should close a source that catches the thrown error and yields instead of finishing', async () => {
+    let finallyRan = false;
+    async function* source(): AsyncGenerator<number> {
+      try {
+        yield 1;
+      } catch {
+        yield 2;
+      } finally {
+        finallyRan = true;
+      }
+    }
+    const filtered = filterAsyncIterator(source(), () => true);
+    expect(await filtered.next()).toEqual({ value: 1, done: false });
+
+    await expect(filtered.throw!(new Error('cancel'))).resolves.toEqual({
+      value: undefined,
+      done: true,
+    });
+    expect(finallyRan).toBe(true);
+    expect(await filtered.next()).toEqual({ value: undefined, done: true });
+  });
+
+  test('should call return() once and reject with the error when throw() hits a source without throw', async () => {
+    const { iterable, calls } = createSource([1, 2], { return: true });
+    const filtered = filterAsyncIterator(iterable, () => true);
+    const error = new Error('cancel');
+
+    await expect(filtered.throw!(error)).rejects.toBe(error);
+    expect(calls.return).toBe(1);
+  });
+
+  test('should rethrow without touching the source when throw() is called after the iterator is done', async () => {
+    const { iterable, calls } = createSource([], { throw: true, return: true });
+    const filtered = filterAsyncIterator(iterable, () => true);
+    expect(await filtered.next()).toEqual({ value: undefined, done: true });
+
+    const error = new Error('late');
+    await expect(filtered.throw!(error)).rejects.toBe(error);
+    expect(calls.throw).toBe(0);
+    expect(calls.return).toBe(0);
+  });
+
+  test('should not call source.return when return() follows natural source completion', async () => {
+    const { iterable, calls } = createSource([1, 2, 3], { return: true });
+    const filtered = filterAsyncIterator(iterable, (n) => n % 2 === 1);
+
+    const seen: number[] = [];
+    for (let step = await filtered.next(); !step.done; step = await filtered.next()) {
+      seen.push(step.value);
+    }
+    expect(seen).toEqual([1, 3]);
+
+    expect(await filtered.return!()).toEqual({ value: undefined, done: true });
+    expect(calls.return).toBe(0);
   });
 });

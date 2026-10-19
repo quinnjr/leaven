@@ -178,7 +178,11 @@ export interface ExecutionHooks<TContext = unknown> {
   onParse?: (query: string) => void | Promise<void>;
   /** Called after parsing */
   onParsed?: (document: DocumentNode) => void | Promise<void>;
-  /** Called before validation */
+  /**
+   * Called before validation. Skipped when the validation result comes from
+   * the cache (a validation cache hit); {@link ExecutionHooks.onValidated}
+   * still fires in that case.
+   */
   onValidate?: (document: DocumentNode) => void | Promise<void>;
   /** Called after validation */
   onValidated?: (result: { valid: boolean; errors?: readonly GraphQLError[] }) => void | Promise<void>;
@@ -197,8 +201,9 @@ export interface ExecutionHooks<TContext = unknown> {
    */
   onError?: (error: Error) => void | Promise<void>;
   /**
-   * Called when a background cache write fails.
-   * Cache failures never fail the request; this hook provides observability.
+   * Called when a cache read or a background cache write fails. A failed read
+   * is treated as a cache miss. Cache failures never fail the request; this
+   * hook provides observability.
    */
   onCacheError?: (error: Error) => void | Promise<void>;
 }

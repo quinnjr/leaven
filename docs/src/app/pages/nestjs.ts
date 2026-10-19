@@ -199,14 +199,50 @@ import { SeoService } from '../services/seo.service';
                 <td class="py-3 pr-4"><code class="text-pink-400">(error) =&gt; error</code></td>
                 <td class="py-3">Final transformation applied to every response error</td>
               </tr>
-              <tr>
+              <tr class="border-b border-zinc-800/50">
                 <td class="py-3 pr-4"><code class="text-pink-400">includeStacktraceInErrorResponses</code></td>
                 <td class="py-3 pr-4"><code class="text-pink-400">boolean</code></td>
                 <td class="py-3">Include stack traces; also disables production masking</td>
               </tr>
+              <tr class="border-b border-zinc-800/50">
+                <td class="py-3 pr-4"><code class="text-pink-400">maxBodySize</code></td>
+                <td class="py-3 pr-4"><code class="text-pink-400">number</code></td>
+                <td class="py-3">Maximum size in bytes (default <code class="text-pink-400">1000000</code>) of a body read from the raw <code class="text-pink-400">Request</code>; over it the request gets <code class="text-pink-400">413 PAYLOAD_TOO_LARGE</code>. A body your framework already parsed is not re-measured</td>
+              </tr>
+              <tr class="border-b border-zinc-800/50">
+                <td class="py-3 pr-4"><code class="text-pink-400">bodyReadTimeoutMs</code></td>
+                <td class="py-3 pr-4"><code class="text-pink-400">number</code></td>
+                <td class="py-3">Deadline in ms (default <code class="text-pink-400">30000</code>) for reading that raw body; a missed or failed read gets <code class="text-pink-400">400 BAD_REQUEST</code>. <code class="text-pink-400">Infinity</code> or <code class="text-pink-400">0</code> means no deadline, and values over 2^31-1 are clamped</td>
+              </tr>
+              <tr>
+                <td class="py-3 pr-4"><code class="text-pink-400">csrfPrevention</code></td>
+                <td class="py-3 pr-4"><code class="text-pink-400">boolean | &#123; requestHeaders?: string[] &#125;</code></td>
+                <td class="py-3">CSRF prevention (default on). <code class="text-pink-400">false</code> disables it</td>
+              </tr>
             </tbody>
           </table>
         </div>
+
+        <h3 class="text-lg font-semibold text-white mt-6 mb-3">CSRF prevention</h3>
+        <p class="text-zinc-400">
+          On by default on the <code class="text-pink-400">LeavenModule</code> middleware,
+          <code class="text-pink-400">LeavenDriver.handleRequest</code> and
+          <code class="text-pink-400">LeavenGraphQLDriver</code>, as in
+          <code class="text-pink-400">&#64;leaven-graphql/http</code>. A POST whose
+          <code class="text-pink-400">Content-Type</code> is missing or CORS-safelisted
+          (<code class="text-pink-400">text/plain</code>,
+          <code class="text-pink-400">application/x-www-form-urlencoded</code>,
+          <code class="text-pink-400">multipart/form-data</code>) is a request a browser sends cross-site,
+          with cookies, without a preflight — and NestJS's Express adapter parses form bodies by default.
+          Such a POST is refused with <code class="text-pink-400">400 BAD_REQUEST</code> before the context
+          factory or any resolver runs, unless it carries a non-empty
+          <code class="text-pink-400">x-graphql-csrf</code>,
+          <code class="text-pink-400">apollo-require-preflight</code> or
+          <code class="text-pink-400">x-apollo-operation-name</code> header. JSON clients are unaffected;
+          form and multipart clients must now send one of these headers. Replace the list with
+          <code class="text-pink-400">csrfPrevention: &#123; requestHeaders: [...] &#125;</code> or disable the
+          check with <code class="text-pink-400">csrfPrevention: false</code>.
+        </p>
 
         <h3 class="text-lg font-semibold text-white mt-6 mb-3">Errors and HTTP status</h3>
         <p class="text-zinc-400">
@@ -219,6 +255,10 @@ import { SeoService } from '../services/seo.service';
           are translated to the equivalent Leaven error, so
           <code class="text-pink-400">UnauthorizedException</code> reaches the client as
           <code class="text-pink-400">401 UNAUTHENTICATED</code> rather than as a masked 500.
+          A masked production error keeps its <code class="text-pink-400">path</code> and
+          <code class="text-pink-400">locations</code>. The <code class="text-pink-400">LeavenModule</code>
+          middleware applies the same status rule, so a total failure there now carries its
+          <code class="text-pink-400">ERROR_CODES</code> status instead of 200.
         </p>
       </section>
 
@@ -230,10 +270,11 @@ import { SeoService } from '../services/seo.service';
           want the NestJS pipeline: it serves a schema built from plain resolver functions. Guards,
           interceptors and parameter decorators <strong class="text-white">do not run</strong> on this path —
           put authorization in the resolver or in the <code class="text-pink-400">context</code> factory.
-          One limit does not depend on the path: <code class="text-pink-400">maxComplexity</code> is enforced
-          by the executor itself, before any resolver runs. <code class="text-pink-400">maxDepth</code> under
-          <code class="text-pink-400">LeavenModule</code> is only recorded on the context for
-          <code class="text-pink-400">DepthGuard</code>, so there it needs the driver like every other guard.
+          The limits do not depend on the path: <code class="text-pink-400">maxComplexity</code> and
+          <code class="text-pink-400">maxDepth</code> are both enforced by the executor itself, before any
+          resolver runs. <code class="text-pink-400">ComplexityGuard</code> and
+          <code class="text-pink-400">DepthGuard</code> are never run by Nest; see the
+          note in the package README.
         </p>
         <app-code-block [code]="moduleCode" title="app.module.ts" />
       </section>
@@ -294,12 +335,53 @@ import { SeoService } from '../services/seo.service';
         </p>
         <app-code-block [code]="subscriptionsTransportCode" title="main.ts" />
 
+        <h3 class="text-lg font-semibold text-white mt-6 mb-3">Same-origin sockets by default</h3>
+        <p class="text-zinc-400 mb-4">
+          A browser sends the user's cookies with a cross-site WebSocket upgrade and WebSockets are
+          not covered by CORS, so the manager accepts only the server's own origin by default: the
+          <code class="text-pink-400">Origin</code> header's host and port must equal the upgrade
+          request's <code class="text-pink-400">Host</code>. A request with no
+          <code class="text-pink-400">Origin</code> (a non-browser client) is always allowed.
+          <code class="text-pink-400">subscriptions.allowedOrigins</code> lists further origins (matched by scheme, host and port), and
+          <code class="text-pink-400">'*'</code> allows every origin. Origins compare
+          case-insensitively with default ports normalised.
+        </p>
+        <p class="text-zinc-400 mb-4">
+          Call <code class="text-pink-400">isOriginAllowed(request)</code> in the upgrade route, as
+          above. <code class="text-pink-400">handleOpen(socket, request)</code> and
+          <code class="text-pink-400">handleConnection(socket, request)</code> also enforce it when
+          given the upgrade request, closing a disallowed socket with
+          <code class="text-pink-400">4403 Forbidden</code>.
+        </p>
+        <div class="card p-4 mb-4 border-amber-500/20 bg-amber-500/5">
+          <p class="text-zinc-300 text-sm">
+            <strong class="text-amber-400">Behaviour change:</strong> a browser client served from
+            another origin than the socket endpoint must now be listed in
+            <code class="text-amber-400">allowedOrigins</code> (or use
+            <code class="text-amber-400">'*'</code>).
+          </p>
+        </div>
+        <p class="text-zinc-400 mb-4">
+          Behind a reverse proxy that rewrites <code class="text-pink-400">Host</code> (nginx's
+          default <code class="text-pink-400">$proxy_host</code>, say), every genuine browser would be
+          refused: forward the public host (<code class="text-pink-400">proxy_set_header Host $host;</code>)
+          or list the public origin in <code class="text-pink-400">allowedOrigins</code>.
+        </p>
+
         <h3 class="text-lg font-semibold text-white mt-6 mb-3">Resolvers and PubSub</h3>
         <p class="text-zinc-400 mb-4">
           Inject the module's shared <code class="text-pink-400">PubSub</code> with
           <code class="text-pink-400">&#64;InjectPubSub()</code> (the
           <code class="text-pink-400">LEAVEN_PUBSUB</code> provider), so a publisher and a subscriber in
-          different providers share the same topics:
+          different providers share the same topics.
+        </p>
+        <p class="text-zinc-400 mb-4">
+          Leaven's own <code class="text-pink-400">&#64;Subscription</code> only records metadata; it does
+          not define a schema field. On the <code class="text-pink-400">LeavenGraphQLDriver</code> path use
+          <code class="text-pink-400">&#64;nestjs/graphql</code>'s <code class="text-pink-400">&#64;Subscription</code>,
+          as below; on <code class="text-pink-400">LeavenModule</code> define the field in your SDL with a plain
+          <code class="text-pink-400">subscribe</code> resolver in the resolver map. A filter receives the
+          published payload, so it reads <code class="text-pink-400">payload.messageAdded.roomId</code>.
         </p>
         <app-code-block [code]="subscriptionsResolverCode" title="message.resolver.ts" />
       </section>
@@ -307,7 +389,12 @@ import { SeoService } from '../services/seo.service';
       <!-- GqlExecutionContext -->
       <section class="mb-12">
         <h2 class="text-2xl font-semibold text-white mb-4">GqlExecutionContext</h2>
-        <p class="text-zinc-400 mb-4">Access GraphQL-specific context in guards and interceptors:</p>
+        <p class="text-zinc-400 mb-4">
+          Access GraphQL-specific context in guards and interceptors. Despite the shared name, this is a
+          read-only helper over the resolver arguments, not <code class="text-pink-400">&#64;nestjs/graphql</code>'s
+          class and not an <code class="text-pink-400">ExecutionContext</code>: it cannot be passed where Nest
+          expects one. <code class="text-pink-400">getHost()</code> returns the original context.
+        </p>
         <app-code-block [code]="contextCode" title="custom.guard.ts" />
       </section>
 
@@ -361,7 +448,7 @@ import { SeoService } from '../services/seo.service';
               </tr>
               <tr class="border-b border-zinc-800/50">
                 <td class="py-3 pr-4"><code class="text-pink-400">GqlExecutionContext</code></td>
-                <td class="py-3">Access GraphQL context in guards</td>
+                <td class="py-3">Read-only helper over resolver arguments (not an ExecutionContext)</td>
               </tr>
               <tr class="border-b border-zinc-800/50">
                 <td class="py-3 pr-4"><code class="text-pink-400">SubscriptionManager</code></td>
@@ -440,7 +527,7 @@ export class NestjsComponent implements OnInit {
   }
 
   // doc-check: skip - shell command, not TypeScript
-  installCode = `bun add @leaven-graphql/nestjs @leaven-graphql/core @leaven-graphql/context @leaven-graphql/errors @lexmata/nestjs-platform-bun graphql`;
+  installCode = `bun add @leaven-graphql/nestjs @leaven-graphql/core @leaven-graphql/errors @lexmata/nestjs-platform-bun graphql`;
 
   bootstrapCode = `import { NestFactory } from '@nestjs/core';
 import { BunAdapter } from '@lexmata/nestjs-platform-bun';
@@ -699,9 +786,13 @@ import { schema } from './schema';
         path: '/graphql',                    // Default: options.path, then '/graphql'
         keepAlive: 12000,                    // Default: 12000ms
         connectionInitWaitTimeout: 3000,     // Default: 3000ms
-        maxSubscriptionsPerConnection: 100,  // Default: 100
+        // Default: 100. In-flight queries and mutations count too; reusing the
+        // id of any in-flight operation closes the socket with 4409.
+        maxSubscriptionsPerConnection: 100,
+        allowedOrigins: ['https://app.example.com'], // Default: same-origin only; '*' allows any
 
-        // Returning false rejects the connection
+        // Returning false rejects the connection: it closes with 4403
+        // Forbidden. (4401 is for a subscribe sent before the ack.)
         onConnect: (ctx) => Boolean(ctx.connectionParams?.token),
         onDisconnect: (ctx) => console.log('Client disconnected'),
       },
@@ -735,6 +826,10 @@ async function bootstrap() {
         pathname === subscriptions.getPath() &&
         request.headers.get('upgrade')?.toLowerCase() === 'websocket'
       ) {
+        // Refuse cross-site WebSocket hijacking before upgrading.
+        if (!subscriptions.isOriginAllowed(request)) {
+          return new Response('Forbidden', { status: 403 });
+        }
         // Bun requires the \`data\` option whenever the socket's data type is
         // not \`undefined\`; nothing is stashed here.
         return server.upgrade(request, { data: undefined })
@@ -767,35 +862,47 @@ bootstrap();
 //
 //   await subscriptions.handleConnection(socket, request);`;
 
-  subscriptionsResolverCode = `import { Resolver, Query, Mutation } from '@nestjs/graphql';
-import { Args, InjectPubSub, Subscription, SubscriptionFilter } from '@leaven-graphql/nestjs';
+  subscriptionsResolverCode = `import { Inject } from '@nestjs/common';
+import { Args, Mutation, Resolver, Subscription } from '@nestjs/graphql';
 import type { PubSub } from '@leaven-graphql/ws';
+
+// LeavenGraphQLDriver provides neither @InjectPubSub() nor a WebSocket
+// transport (both come from LeavenModule). Register your own PubSub:
+//   providers: [{ provide: PUB_SUB, useValue: createPubSub() }, MessageResolver]
+// and serve subscriptions over driver.getExecutor().subscribe().
+export const PUB_SUB = Symbol('PUB_SUB');
 
 @Resolver()
 export class MessageResolver {
   constructor(
-    @InjectPubSub() private readonly pubSub: PubSub,
+    @Inject(PUB_SUB) private readonly pubSub: PubSub,
     private readonly messages: MessageService,
   ) {}
 
-  // The filter option narrows the streamed events
+  // LeavenGraphQLDriver path: @nestjs/graphql's @Subscription defines the
+  // field. The payload is what was published ({ messageAdded: message }), so
+  // the filter reads payload.messageAdded.roomId.
   @Subscription(() => Message, {
-    filter: (payload, variables) =>
-      (payload as { roomId: string }).roomId === (variables as { roomId: string }).roomId,
+    filter: (
+      payload: { messageAdded: { roomId: string } },
+      variables: { roomId: string },
+    ) => payload.messageAdded.roomId === variables.roomId,
   })
-  messageAdded() {
+  messageAdded(@Args('roomId') _roomId: string) {
     return this.pubSub.asyncIterator('MESSAGE_ADDED');
   }
 
-  // @SubscriptionFilter is the standalone equivalent, and preserves the
-  // method's return kind — a method returning an async iterable still does,
-  // so "for await (const e of resolver.commentAdded())" works in tests.
-  @Subscription(() => Comment)
-  @SubscriptionFilter(
-    (payload, variables) =>
-      (payload as { postId: string }).postId === (variables as { postId: string }).postId,
-  )
-  commentAdded() {
+  // Each argument the filter reads must be declared with @Args so the
+  // code-first schema has it. (Leaven's @SubscriptionFilter reads the raw
+  // resolver arguments, so it cannot be combined with @Args: use the
+  // filter option on this path.)
+  @Subscription(() => Comment, {
+    filter: (
+      payload: { commentAdded: { postId: string } },
+      variables: { postId: string },
+    ) => payload.commentAdded.postId === variables.postId,
+  })
+  commentAdded(@Args('postId') _postId: string) {
     return this.pubSub.asyncIterator('COMMENT_ADDED');
   }
 
@@ -807,10 +914,26 @@ export class MessageResolver {
   }
 }
 
-// @Subscription only RECORDS metadata: code-first schema construction is not
-// implemented, so a decorated method still needs a matching subscribe field in
-// the schema you hand to LeavenModule. The filter is the part that always
-// takes effect, because it wraps the method itself.
+// LeavenModule path: Leaven's own @Subscription only RECORDS metadata and
+// defines no field. Declare the field in your SDL and give it a plain
+// subscribe resolver in the resolver map instead. Scope the topic per room
+// (publish to \`MESSAGE_ADDED.\${roomId}\`) rather than filtering inside an
+// async function*: a generator's return() waits behind its pending next(), so
+// a cancel on a quiet topic would leak the PubSub subscription. The room id
+// becomes part of the topic name, so validate it first (and check the caller
+// may read that room): on a wildcard-enabled PubSub, "*" or "#" would match
+// every room.
+//
+//   Subscription: {
+//     messageAdded: {
+//       subscribe: (_root, args) => {
+//         if (!/^[A-Za-z0-9_-]+$/.test(args.roomId)) {
+//           throw new InputError('Invalid roomId');
+//         }
+//         return pubSub.asyncIterator(\`MESSAGE_ADDED.\${args.roomId}\`);
+//       },
+//     },
+//   },
 
 // Server-side, topic-keyed delivery driven by an external engine is available
 // on the manager directly:

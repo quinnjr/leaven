@@ -15,8 +15,14 @@ import { Observable, tap, catchError, throwError } from 'rxjs';
 import { Reflector } from '@nestjs/core';
 import { GraphQLError } from 'graphql';
 import { errorToGraphQL, maskError } from '@leaven-graphql/errors';
-import { COMPLEXITY_KEY, CACHE_KEY, type CacheHintOptions } from './decorators';
-import { getGqlContext, getGqlInfo } from './execution-context';
+import {
+  COMPLEXITY_KEY,
+  CACHE_KEY,
+  type CacheHintOptions,
+  type ComplexityEstimator,
+} from './decorators';
+import { normalizeHttpException } from './http-exception';
+import { getGqlArgs, getGqlContext, getGqlInfo } from './execution-context';
 
 /**
  * Logging interceptor for GraphQL operations
@@ -44,6 +50,7 @@ export class LoggingInterceptor implements NestInterceptor {
     return next.handle().pipe(
       tap(() => {
         const duration = (performance.now() - start).toFixed(2);
+        // eslint-disable-next-line no-console -- the documented output channel of this interceptor
         console.log(`[GraphQL] ${className}.${methodName} - ${duration}ms`);
       }),
       catchError((error) => {
@@ -96,12 +103,13 @@ export class ErrorFormattingInterceptor implements NestInterceptor {
    * `source`/`positions`, handed to its constructor — never from a `locations`
    * field — so those are carried over from the converted error. Without them a
    * client would lose the source position that the driver's own formatting
-   * path (`formatError`) preserves. A masked error reports no locations, and
-   * must not leak them here either.
+   * path (`formatError`) preserves. A masked error keeps only the sanitised
+   * locations `maskError` returned; when it returned none, none are rebuilt
+   * here.
    */
   private formatError(error: unknown): GraphQLError {
     const isProduction = process.env.NODE_ENV === 'production';
-    const source = errorToGraphQL(error);
+    const source = errorToGraphQL(normalizeHttpException(error));
     const formatted = maskError(source, {
       maskErrors: isProduction,
       includeStackTrace: !isProduction,
@@ -122,7 +130,8 @@ export class ErrorFormattingInterceptor implements NestInterceptor {
  * Complexity tracking interceptor
  *
  * Tracks query complexity for monitoring. Field complexity declared via
- * `@Complexity()` is accumulated onto the request context's
+ * `@Complexity()` — a fixed number, or an estimator called with
+ * `{ field: info, args, childComplexity: 0 }` — is accumulated onto the request context's
  * `_resolvedFieldComplexity` key, so multiple fields resolved in one request
  * sum rather than overwrite each other.
  *
@@ -153,16 +162,24 @@ export class ComplexityInterceptor implements NestInterceptor {
   constructor(private readonly reflector: Reflector) {}
 
   public intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
-    const complexity = this.reflector.get<number | undefined>(
+    const declared = this.reflector.get<number | ComplexityEstimator | undefined>(
       COMPLEXITY_KEY,
       context.getHandler()
     );
 
-    if (complexity !== undefined) {
+    if (declared !== undefined) {
+      // `@Complexity()` accepts either a fixed cost or an estimator. An
+      // estimator is evaluated against this field's resolve info and args;
+      // `childComplexity` is 0 because the interceptor runs before the
+      // children resolve and so cannot know their cost.
+      const complexity = this.resolveComplexity(declared, context);
+
       // Accumulate on the interceptor's own key — never the driver's
-      // `_queryComplexity`, which `ComplexityGuard` enforces.
+      // `_queryComplexity`, which `ComplexityGuard` enforces. A non-finite
+      // cost (NaN, Infinity, or a non-number from an estimator) would corrupt
+      // the running total, so it is skipped.
       const gqlContext = getGqlContext<Record<string, unknown> | undefined>(context);
-      if (gqlContext) {
+      if (gqlContext && complexity !== undefined) {
         const current =
           typeof gqlContext._resolvedFieldComplexity === 'number'
             ? gqlContext._resolvedFieldComplexity
@@ -172,6 +189,37 @@ export class ComplexityInterceptor implements NestInterceptor {
     }
 
     return next.handle();
+  }
+
+  /**
+   * Evaluate a declared `@Complexity()` cost.
+   *
+   * An estimator that throws must not break the resolver it annotates, so its
+   * error is logged and the field contributes nothing. Only a finite number is
+   * returned; anything else yields `undefined`.
+   */
+  private resolveComplexity(
+    declared: number | ComplexityEstimator,
+    context: ExecutionContext
+  ): number | undefined {
+    let complexity: unknown = declared;
+
+    if (typeof declared === 'function') {
+      try {
+        complexity = declared({
+          field: getGqlInfo(context),
+          args: getGqlArgs<Record<string, unknown> | undefined>(context) ?? {},
+          childComplexity: 0,
+        });
+      } catch (error) {
+        console.error('[leaven] @Complexity estimator threw; skipping field cost', error);
+        return undefined;
+      }
+    }
+
+    return typeof complexity === 'number' && Number.isFinite(complexity)
+      ? complexity
+      : undefined;
   }
 }
 

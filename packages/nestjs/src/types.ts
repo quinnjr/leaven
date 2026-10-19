@@ -119,12 +119,16 @@ export interface LeavenModuleOptions {
   cache?: DocumentCacheConfig | boolean;
 
   /**
-   * Maximum query complexity allowed
+   * Maximum query complexity allowed. Enforced by the executor, which rejects
+   * an over-budget document before any resolver runs. See the note on
+   * `ComplexityGuard` for why the guard does not apply.
    */
   maxComplexity?: number;
 
   /**
-   * Maximum query depth allowed
+   * Maximum query depth allowed. Enforced by the executor, which rejects an
+   * over-deep document at parse time. See the note on `DepthGuard` for why the
+   * guard does not apply.
    */
   maxDepth?: number;
 
@@ -191,9 +195,10 @@ export interface LeavenModuleOptions {
    * Canonical origin (scheme + authority, e.g. `https://api.example.com`)
    * used to build `request.url` for the context factory.
    *
-   * The `Host` header is client-controlled, so it is not trusted to form that
-   * URL. When this is unset, a syntactically valid `Host` is used and anything
-   * else falls back to the default.
+   * The `Host` header is client-controlled. When this is unset, a
+   * syntactically valid `Host` is used and anything else falls back to the
+   * default, so set this when a factory resolves tenancy or issues redirects
+   * from `request.url`.
    *
    * @default 'http://localhost'
    */
@@ -225,6 +230,73 @@ export interface LeavenModuleOptions {
    * @default false
    */
   includeStacktraceInErrorResponses?: boolean;
+
+  /**
+   * Maximum POST body size, in bytes, accepted by `LeavenDriver.handleRequest`.
+   *
+   * An honest `Content-Length` over the limit is rejected before the body is
+   * read, and the limit is also enforced while reading, since the header may
+   * be absent or wrong. A body over the limit is rejected with a `LeavenError`
+   * coded `PAYLOAD_TOO_LARGE` (413). The `LeavenModule` middleware reads the
+   * body your framework's body parser already parsed, so configure the limit
+   * there for that path. `LeavenGraphQLDriver` takes its own `maxBodySize`
+   * and `bodyReadTimeoutMs` on `LeavenDriverConfig`, with the same defaults,
+   * for the requests it reads from the raw Fetch `Request`.
+   *
+   * @default 1_000_000
+   */
+  maxBodySize?: number;
+
+  /**
+   * Deadline, in milliseconds, for reading a whole POST body in
+   * `LeavenDriver.handleRequest`, so a client trickling its body cannot hold
+   * a request open. Timed by an owned timer that is cleared once the read
+   * finishes. A read that misses it is cancelled and rejected with a
+   * `LeavenError` coded `BAD_REQUEST` (400). Like `maxBodySize`, it does not
+   * apply to the `LeavenModule` middleware, which reads an already-parsed
+   * body: configure your framework's body parser for that path.
+   *
+   * `Infinity` or `0` means no deadline (as does any non-finite or
+   * non-positive value), and a value over 2^31-1 is clamped to it, the
+   * longest delay a timer honours.
+   *
+   * @default 30_000
+   */
+  bodyReadTimeoutMs?: number;
+
+  /**
+   * CSRF prevention for the `LeavenModule` middleware and
+   * `LeavenDriver.handleRequest` (default: on). A POST whose Content-Type is
+   * missing or CORS-safelisted (`text/plain`,
+   * `application/x-www-form-urlencoded`, `multipart/form-data`) is refused
+   * with a 400 `BAD_REQUEST` before the context factory or any resolver
+   * runs, unless it carries a non-empty preflight-forcing header (default:
+   * `x-graphql-csrf`, `apollo-require-preflight`, `x-apollo-operation-name`).
+   * A browser sends such a "simple" request cross-site, with cookies, without
+   * a CORS preflight — and NestJS's Express adapter parses form bodies by
+   * default. `false` disables the check.
+   *
+   * Configured header names are trimmed and lowercased; one that is not a
+   * valid header token throws a `TypeError` at construction.
+   *
+   * @default true
+   */
+  csrfPrevention?: boolean | CSRFPreventionOptions;
+}
+
+/**
+ * CSRF prevention options
+ *
+ * Twin of `CSRFPreventionOptions` in `packages/http/src/handler.ts`: the two
+ * must stay in step.
+ */
+export interface CSRFPreventionOptions {
+  /**
+   * Headers whose presence (with a non-empty value) proves the request was
+   * preflighted. Replaces the default list
+   * (`x-graphql-csrf`, `apollo-require-preflight`, `x-apollo-operation-name`).
+   */
+  requestHeaders?: string[];
 }
 
 /**

@@ -260,35 +260,113 @@ export interface CacheHintOptions {
 /**
  * Yield only the source events a predicate accepts.
  *
- * Cancelling the returned iterator cancels the source, because `for await`
- * calls `return()` on the source when the loop completes abruptly — including
- * when the consumer cancels this generator. No extra teardown is performed:
- * a second `return()` would both replace any in-flight error with a cleanup
- * error and, for shared engines, release a topic subscription twice.
+ * Hand-written rather than an `async function*` on purpose. A generator's
+ * `return()` is queued behind its pending `next()`, so cancelling a filtered
+ * stream while the source is idle (the normal state of a pub/sub-backed
+ * subscription between events) could not reach the source until the next
+ * event arrived: the subscription transport would wait out its teardown
+ * deadline, abandon the iterator and leak the topic subscription. Here
+ * `return()` and `throw()` are forwarded straight to the source, whatever
+ * `next()` is doing, and rejected events are skipped inside `next()`.
+ *
+ * The source is only closed by an explicit `return()`/`throw()` from the
+ * consumer: a source that completes or fails on its own is never closed a
+ * second time, which would replace an in-flight error with a cleanup error
+ * and, for shared engines, release a topic subscription twice.
  *
  * A predicate that throws drops the offending event and is reported to
  * `console.error` rather than tearing down the whole subscription.
  *
- * @internal Shared by {@link SubscriptionFilter} and the `filter` option of
- * the `Subscription` decorator.
+ * @internal Shared by {@link SubscriptionFilter}, the `filter` option of the
+ * `Subscription` decorator, and `LeavenGraphQLDriver.subscriptionWithFilter`
+ * (`@nestjs/graphql`'s `filter` option).
  */
-export async function* filterAsyncIterator<T>(
+export function filterAsyncIterator<T>(
   source: AsyncIterable<T>,
   predicate: (payload: T) => boolean | Promise<boolean>
-): AsyncGenerator<T> {
-  for await (const payload of source) {
-    let accepted: boolean;
-    try {
-      accepted = await predicate(payload);
-    } catch (error) {
-      console.error('Subscription filter threw; dropping event:', error);
-      continue;
-    }
+): AsyncIterableIterator<T> {
+  let iterator: AsyncIterator<T> | undefined;
+  let done = false;
 
-    if (accepted) {
-      yield payload;
-    }
-  }
+  // Acquired lazily, as `for await` would, so a non-iterable source still
+  // fails on first use rather than when the resolver method is called.
+  const acquire = (): AsyncIterator<T> => {
+    iterator ??= source[Symbol.asyncIterator]();
+    return iterator;
+  };
+  const finished = (): IteratorResult<T> => ({ value: undefined, done: true });
+
+  return {
+    [Symbol.asyncIterator](): AsyncIterableIterator<T> {
+      return this;
+    },
+
+    async next(): Promise<IteratorResult<T>> {
+      while (!done) {
+        let step: IteratorResult<T>;
+        try {
+          step = await acquire().next();
+        } catch (error) {
+          // A failed source is finished: never pull from or close it again.
+          done = true;
+          throw error;
+        }
+        // Cancelled while the source was pending: the late event is dropped.
+        if (done) {
+          break;
+        }
+        if (step.done) {
+          done = true;
+          return finished();
+        }
+
+        let accepted: boolean;
+        try {
+          accepted = await predicate(step.value);
+        } catch (error) {
+          console.error('Subscription filter threw; dropping event:', error);
+          continue;
+        }
+
+        if (accepted && !done) {
+          return { value: step.value, done: false };
+        }
+      }
+      return finished();
+    },
+
+    async return(value?: unknown): Promise<IteratorResult<T>> {
+      if (done) {
+        return finished();
+      }
+      done = true;
+      const target = acquire();
+      if (target.return) {
+        await target.return(value);
+      }
+      return finished();
+    },
+
+    async throw(error?: unknown): Promise<IteratorResult<T>> {
+      if (!done) {
+        done = true;
+        const target = acquire();
+        if (target.throw) {
+          const step = await target.throw(error);
+          // The source caught the error and yielded: it is still suspended,
+          // and our return() is a no-op from here on, so close it now.
+          if (!step.done && target.return) {
+            await target.return();
+          }
+          return finished();
+        }
+        if (target.return) {
+          await target.return();
+        }
+      }
+      throw error;
+    },
+  };
 }
 
 /**
@@ -344,11 +422,21 @@ export function wrapWithFilter(
  * The predicate is also recorded under {@link SUBSCRIPTION_FILTER_KEY} so a
  * schema builder can inspect it.
  *
+ * The variables and context come from the raw `(root, args, context, info)`
+ * arguments the method is called with, so do not combine it with NestJS
+ * parameter decorators such as `@Args`. On the code-first
+ * `LeavenGraphQLDriver` path use the `filter` option of `@nestjs/graphql`'s
+ * `@Subscription` instead.
+ *
  * @example
  * ```typescript
- * @Subscription(() => Comment)
- * @SubscriptionFilter((payload, variables) => payload.postId === variables.postId)
- * commentAdded() {
+ * // The payload is what was published: { commentAdded: comment }
+ * @SubscriptionFilter(
+ *   (payload, variables) =>
+ *     (payload as { commentAdded: { postId: string } }).commentAdded.postId ===
+ *     (variables as { postId: string }).postId
+ * )
+ * commentAdded(_root: unknown, _args: { postId: string }) {
  *   return pubSub.asyncIterator('COMMENT_ADDED');
  * }
  * ```

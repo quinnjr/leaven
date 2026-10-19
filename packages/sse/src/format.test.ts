@@ -45,7 +45,11 @@ describe('formatResultErrors', () => {
       { maskErrors: true }
     );
     expect(formatted.errors).toEqual([
-      { message: 'An unexpected error occurred', extensions: { code: 'INTERNAL_ERROR' } },
+      {
+        message: 'An unexpected error occurred',
+        path: ['me'],
+        extensions: { code: 'INTERNAL_ERROR' },
+      },
     ]);
   });
 

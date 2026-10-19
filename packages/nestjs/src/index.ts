@@ -53,6 +53,7 @@ export type {
   /** @deprecated Has no effect; removal target 0.3.0. */
   PluginContext,
   CorsOptions,
+  CSRFPreventionOptions,
   GqlContext,
   GqlExecutionContext as GqlExecutionContextInterface,
 } from './types';
@@ -142,6 +143,7 @@ export {
   type SubscriptionContext,
   type SubscriptionSocket,
   type BunWebSocketConfig,
+  type UpgradeRequestLike,
   type SubscribeMessage,
   type CompleteMessage,
   type ExecutionArgs,

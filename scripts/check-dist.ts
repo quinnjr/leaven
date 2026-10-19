@@ -12,7 +12,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import { readdirSync } from 'node:fs';
+import { readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 const root = join(import.meta.dir, '..');
@@ -55,6 +55,18 @@ for (const name of readdirSync(packagesDir)) {
   }
 }
 
+// 1b. No test helpers or test files may ship in a package's dist.
+for (const name of readdirSync(packagesDir)) {
+  const dist = join(packagesDir, name, 'dist');
+  if (!existsSync(dist)) continue;
+  const stray = (readdirSync(dist, { recursive: true }) as string[]).filter(
+    (entry) => /(^|[\\/])test-utils([\\/]|$)/.test(entry) || /\.test\.[^\\/]+$/.test(entry),
+  );
+  if (stray.length > 0) {
+    failures.push(`${name}: dist contains test files: ${stray.sort().join(', ')}`);
+  }
+}
+
 // 2. Smoke test: a schema built with the consumer's `graphql` must work with the built executor
 //    and the built WebSocket subscription manager, and the built SSE package must encode a stream.
 if (failures.length === 0) {
@@ -62,6 +74,19 @@ if (failures.length === 0) {
   const core = await import(join(packagesDir, 'core', 'dist', 'index.js'));
   const ws = await import(join(packagesDir, 'ws', 'dist', 'index.js'));
   const sse = await import(join(packagesDir, 'sse', 'dist', 'index.js'));
+  const plugins = await import(join(packagesDir, 'plugins', 'dist', 'index.js'));
+  const schemaPkg = await import(join(packagesDir, 'schema', 'dist', 'index.js'));
+  const playground = await import(join(packagesDir, 'playground', 'dist', 'index.js'));
+
+  for (const [pkg, mod, key] of [
+    ['plugins', plugins, 'createDepthLimitPlugin'],
+    ['schema', schemaPkg, 'mergeSchemas'],
+    ['playground', playground, 'renderGraphiQL'],
+  ] as const) {
+    if (typeof (mod as Record<string, unknown>)[key] !== 'function') {
+      failures.push(`${pkg}: dist export ${key} is not a function`);
+    }
+  }
 
   const schema = new GraphQLSchema({
     query: new GraphQLObjectType({

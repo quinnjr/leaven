@@ -22,6 +22,9 @@ export {
   formatError,
   formatErrors,
   maskError,
+  MASKED_ERROR_MESSAGE,
+  maskedErrorFor,
+  withMaskingDefault,
   isLeavenError,
   errorToGraphQL,
   fromFormattedError,
@@ -34,4 +37,7 @@ export {
   ERROR_CODES,
   getErrorCode,
   getErrorMessage,
+  statusForResponse,
 } from './codes';
+
+export { isPlainObject } from './guards';

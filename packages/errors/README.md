@@ -268,7 +268,8 @@ type ErrorFormatter = (
 
 There is no `includeExtensions` option: `extensions` are always included when
 the error has any, and a masked error is always reduced to
-`{ message, extensions: { code: 'INTERNAL_ERROR' } }`.
+`{ message, locations?, path?, extensions: { code: 'INTERNAL_ERROR' } }` (see
+`maskedErrorFor`).
 
 ### `formatError` / `formatErrors`
 
@@ -406,6 +407,64 @@ if (cause instanceof MyDbError) { /* ... */ }
 
 `maskError` uses that same `originalError` check, which is why Leaven errors
 survive masking.
+
+### `maskedErrorFor(error, message?)`
+
+Builds the generic masked error `{ message, extensions: { code: 'INTERNAL_ERROR' } }`.
+`path` is copied only when it is a non-empty array whose every element is a
+string or a finite number (anything else, such as an object or a DSN-bearing
+object, is dropped); `locations` only when every entry
+has a numeric `line`/`column`, and each is rebuilt as `{ line, column }`, so
+nothing else leaks:
+
+```typescript
+import { maskedErrorFor } from '@leaven-graphql/errors';
+
+maskedErrorFor({ locations: [{ line: 1, column: 3 }], path: ['user'] }, 'Oops');
+// { message: 'Oops', locations: [{ line: 1, column: 3 }], path: ['user'],
+//   extensions: { code: 'INTERNAL_ERROR' } }
+```
+
+### `MASKED_ERROR_MESSAGE`
+
+The default masked message, `'An unexpected error occurred'`.
+
+### `withMaskingDefault(options?)`
+
+Returns the options with `maskErrors` defaulted to `true` (an explicit `false`
+is kept). Transports use it for errors thrown outside execution:
+
+```typescript
+import { withMaskingDefault } from '@leaven-graphql/errors';
+
+withMaskingDefault();                      // { maskErrors: true }
+withMaskingDefault({ maskErrors: false }); // { maskErrors: false }
+```
+
+### `statusForResponse(response)`
+
+The shared GraphQL-over-HTTP status rule: 200 when there are no errors or when
+`data` is non-null (partial success), otherwise the status registered for the
+first error's `extensions.code`, or 500:
+
+```typescript
+import { statusForResponse } from '@leaven-graphql/errors';
+
+statusForResponse({ data: null, errors: [{ extensions: { code: 'NOT_FOUND' } }] }); // 404
+statusForResponse({ data: { a: 1 }, errors: [{ extensions: { code: 'NOT_FOUND' } }] }); // 200
+```
+
+### `isPlainObject(value)`
+
+True only for objects whose prototype is `Object.prototype` or `null`; arrays,
+`Date`, `Map` and class instances are rejected:
+
+```typescript
+import { isPlainObject } from '@leaven-graphql/errors';
+
+isPlainObject({});         // true
+isPlainObject(new Map());  // false
+```
 
 ## Usage in Resolvers
 

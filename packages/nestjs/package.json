@@ -34,7 +34,6 @@
   },
   "dependencies": {
     "@graphql-tools/schema": "^10.1.5",
-    "@leaven-graphql/context": "workspace:*",
     "@leaven-graphql/core": "workspace:*",
     "@leaven-graphql/errors": "workspace:*",
     "@leaven-graphql/playground": "workspace:*",

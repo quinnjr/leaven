@@ -5,7 +5,8 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import { Kind } from 'graphql';
+import { Kind, getOperationAST } from 'graphql';
+import type { DocumentNode, OperationDefinitionNode } from 'graphql';
 import { ComplexityError, DepthLimitError } from '@leaven-graphql/errors';
 import type { GraphQLResponse } from '@leaven-graphql/core';
 import type { Plugin, PluginContext, PluginHooks, PluginMetadata } from './types';
@@ -201,7 +202,18 @@ export function createCachingPlugin(options?: {
         'Caches successful query responses and serves them on subsequent requests',
     },
 
-    async beforeExecute(_document, context) {
+    async beforeExecute(document, context) {
+      // Only queries are cacheable: a mutation has side effects and must run
+      // every time, and a subscription is a stream.
+      const operation = getOperationAST(
+        document,
+        context.request.operationName ?? undefined
+      );
+      if (operation?.operation !== 'query') {
+        context.state.set('cacheSkip', true);
+        return;
+      }
+
       const key = makeKey(context);
       context.state.set('cacheKey', key);
 
@@ -229,6 +241,10 @@ export function createCachingPlugin(options?: {
     },
 
     async afterExecute(response, context) {
+      if (context.state.get('cacheSkip')) {
+        return response;
+      }
+
       if (context.state.get('cacheHit')) {
         return context.state.get('cachedResponse') as typeof response;
       }
@@ -238,8 +254,13 @@ export function createCachingPlugin(options?: {
         return response;
       }
 
-      const key =
-        (context.state.get('cacheKey') as string | undefined) ?? makeKey(context);
+      // Only store what this plugin's own beforeExecute cleared as a query. If
+      // an earlier plugin short-circuited, that hook never ran, the operation
+      // type is unchecked, and a mutation's response must not take a slot.
+      const key = context.state.get('cacheKey') as string | undefined;
+      if (key === undefined) {
+        return response;
+      }
       const now = Date.now();
 
       // No full sweep here: it would cost O(maxSize) on every response.
@@ -312,14 +333,19 @@ export function createLoggingPlugin(options?: {
     },
 
     async afterExecute(response, context) {
-      const startTime = context.state.get('startTime') as number;
-      const duration = performance.now() - startTime;
+      const startTime = context.state.get('startTime') as number | undefined;
+      // beforeExecute may not have run (another plugin short-circuited), in
+      // which case there is no start time and the duration is unknown.
+      const duration =
+        startTime === undefined
+          ? 'unknown'
+          : `${(performance.now() - startTime).toFixed(2)}ms`;
 
       if (response.errors && response.errors.length > 0) {
         if (shouldLog('error')) {
           logger.error('GraphQL operation completed with errors', {
             operationName: context.request.operationName,
-            duration: `${duration.toFixed(2)}ms`,
+            duration,
             errors: response.errors,
           });
         }
@@ -327,7 +353,7 @@ export function createLoggingPlugin(options?: {
         if (shouldLog('info')) {
           logger.info('GraphQL operation completed', {
             operationName: context.request.operationName,
-            duration: `${duration.toFixed(2)}ms`,
+            duration,
           });
         }
       }
@@ -638,6 +664,8 @@ export function createDepthLimitPlugin(
         limit,
       };
 
+      // No operation selection: every operation is measured and the deepest
+      // one wins.
       let depth = 0;
 
       for (const definition of document.definitions) {
@@ -656,6 +684,26 @@ export function createDepthLimitPlugin(
       return document;
     },
   };
+}
+
+/**
+ * Operations a request is scored against: the single operation named by
+ * `operationName` when exactly one matches, otherwise every operation in the
+ * document (no name, or a name matching zero or several operations).
+ */
+function selectOperations(
+  document: DocumentNode,
+  operationName: string | null | undefined
+): OperationDefinitionNode[] {
+  const operations = document.definitions.filter(
+    (definition): definition is OperationDefinitionNode =>
+      definition.kind === Kind.OPERATION_DEFINITION
+  );
+  if (operationName === undefined || operationName === null) {
+    return operations;
+  }
+  const matching = operations.filter((op) => op.name?.value === operationName);
+  return matching.length === 1 ? matching : operations;
 }
 
 /** Arguments whose value is treated as a page size that multiplies cost. */
@@ -883,6 +931,10 @@ function walkComplexity(walker: ComplexityWalker, node: unknown): number {
  * `extensions.code: 'COMPLEXITY_LIMIT'`) when a query exceeds the configured
  * complexity, or when analyzing the document would exceed the node budget
  * (`extensions.reason: 'ANALYSIS_BUDGET_EXCEEDED'`).
+ *
+ * The operation `operationName` selects is scored; without a unique match (no
+ * name, or a name matching zero or several operations), the most complex
+ * operation is. Every operation shares one analysis budget.
  */
 export function createComplexityPlugin(options: {
   /** Maximum allowed complexity */
@@ -928,27 +980,36 @@ export function createComplexityPlugin(options: {
       // Shared across operations so one document cannot buy extra budget by
       // splitting the work across many operation definitions.
       const budget: VisitBudget = { visits: 0 };
+      // Score only the operation the request selects. With no usable
+      // selection, fall back to the max across all operations. (The depth
+      // plugin does no selection: it always takes the max over every
+      // operation.)
+      const selected = selectOperations(
+        document,
+        context.request.operationName
+      );
       let totalComplexity = 0;
 
-      for (const definition of document.definitions) {
-        if ((definition as { kind: string }).kind === Kind.OPERATION_DEFINITION) {
-          // Variable defaults are per-operation, and fragment scores depend on
-          // them, so each operation gets its own memo table.
-          const walker: ComplexityWalker = {
-            fragments,
-            fragmentComplexities: new Map(),
-            inProgress: new Set(),
-            budget,
-            maxComplexity,
-            defaultComplexity,
-            calculator,
-            variables: context.request.variables,
-            variableDefaults: collectVariableDefaults(definition),
-            unknownMultiplier,
-          };
+      for (const definition of selected) {
+        // Variable defaults are per-operation, and fragment scores depend on
+        // them, so each operation gets its own memo table.
+        const walker: ComplexityWalker = {
+          fragments,
+          fragmentComplexities: new Map(),
+          inProgress: new Set(),
+          budget,
+          maxComplexity,
+          defaultComplexity,
+          calculator,
+          variables: context.request.variables,
+          variableDefaults: collectVariableDefaults(definition),
+          unknownMultiplier,
+        };
 
-          totalComplexity += walkComplexity(walker, definition);
-        }
+        totalComplexity = Math.max(
+          totalComplexity,
+          walkComplexity(walker, definition)
+        );
       }
 
       context.state.set('complexity', totalComplexity);

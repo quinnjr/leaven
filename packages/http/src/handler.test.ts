@@ -7,6 +7,7 @@
 
 import { describe, test, expect } from 'bun:test';
 import {
+  GraphQLError,
   GraphQLInt,
   GraphQLNonNull,
   GraphQLObjectType,
@@ -111,6 +112,17 @@ describe('createHandler', () => {
 
     expect(response.status).toBe(204);
     expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
+  });
+
+  test('should answer OPTIONS with 204 and Allow when cors is unset', async () => {
+    const handler = createHandler({ schema });
+
+    const response = await handler(
+      new Request('http://localhost/graphql', { method: 'OPTIONS' })
+    );
+
+    expect(response.status).toBe(204);
+    expect(response.headers.get('Allow')).toBe('GET, POST, OPTIONS');
   });
 
   test('should include CORS headers on responses when cors is enabled', async () => {
@@ -309,7 +321,59 @@ describe('createHandler', () => {
 
       expect(response.status).toBe(400);
       const body = await response.json();
-      expect(body.errors[0].message).toMatch(/Timed out reading request body/);
+      expect(body.errors[0].message).toMatch(/^Timed out reading request body after \d+ms$/);
+    });
+
+    test.each([
+      ['Infinity', Infinity],
+      ['0', 0],
+      ['NaN', Number.NaN],
+      ['a negative number', -5],
+    ])('should not arm a read deadline when bodyReadTimeoutMs is %s', async (_label, value) => {
+      const handler = createHandler({ schema, bodyReadTimeoutMs: value });
+
+      // Delivered after the ~1ms a misarmed timer would fire at.
+      const stream = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          controller.enqueue(new TextEncoder().encode('{"query":"{ hello }"}'));
+          controller.close();
+        },
+      });
+
+      const response = await handler(
+        new Request('http://localhost/graphql', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: stream,
+        })
+      );
+
+      expect(response.status).toBe(200);
+    });
+
+    test('should clamp an oversized bodyReadTimeoutMs to the 32-bit timer maximum', async () => {
+      const handler = createHandler({ schema, bodyReadTimeoutMs: 2 ** 40 });
+      const realSetTimeout = globalThis.setTimeout;
+      const delays: unknown[] = [];
+      globalThis.setTimeout = ((cb: (...a: unknown[]) => void, ms?: number, ...a: unknown[]) => {
+        delays.push(ms);
+        return realSetTimeout(cb, ms, ...a);
+      }) as unknown as typeof setTimeout;
+      try {
+        const response = await handler(
+          new Request('http://localhost/graphql', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{"query":"{ hello }"}',
+          })
+        );
+        expect(response.status).toBe(200);
+      } finally {
+        globalThis.setTimeout = realSetTimeout;
+      }
+      expect(delays).toContain(2 ** 31 - 1);
+      expect(delays).not.toContain(2 ** 40);
     });
 
     test('should cancel the read deadline once the body has been read', async () => {
@@ -406,16 +470,533 @@ describe('createHandler', () => {
       expect(body.errors[0].extensions.code).toBe('BAD_REQUEST');
     });
 
-    test('should return 400 for an unsupported content type', async () => {
+    test('should return 415 for an unknown content type', async () => {
       const handler = createHandler({ schema });
 
       const response = await handler(
-        postRequest('not supported', { 'Content-Type': 'text/plain' })
+        postRequest(JSON.stringify({ query: '{ hello }' }), {
+          'Content-Type': 'application/xml',
+        })
+      );
+
+      expect(response.status).toBe(415);
+      const body = await response.json();
+      expect(body.errors[0].message).toMatch(/Unsupported content type/);
+      expect(body.errors[0].extensions.code).toBe('BAD_REQUEST');
+    });
+
+    test('should return 415 for text/plain once CSRF prevention is off', async () => {
+      const handler = createHandler({ schema, csrfPrevention: false });
+
+      const response = await handler(
+        postRequest(JSON.stringify({ query: '{ hello }' }), {
+          'Content-Type': 'text/plain; x=application/json',
+        })
+      );
+
+      expect(response.status).toBe(415);
+    });
+
+    test('should return 415 for a body with no Content-Type', async () => {
+      const handler = createHandler({ schema });
+
+      const response = await handler(
+        new Request('http://localhost/graphql', {
+          method: 'POST',
+          headers: { 'x-graphql-csrf': '1' },
+          body: new TextEncoder().encode(JSON.stringify({ query: '{ hello }' })),
+        })
+      );
+
+      expect(response.status).toBe(415);
+    });
+
+    test('should take the query from the URL for an empty-body POST', async () => {
+      const handler = createHandler({ schema });
+
+      const response = await handler(
+        new Request('http://localhost/graphql?query=%7B%20hello%20%7D', {
+          method: 'POST',
+          headers: { 'x-graphql-csrf': '1' },
+        })
+      );
+
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.data).toEqual({ hello: 'world' });
+    });
+  });
+
+  describe('CSRF prevention', () => {
+    const query = JSON.stringify({ query: '{ hello }' });
+
+    function formRequest(headers: Record<string, string> = {}): Request {
+      return new Request('http://localhost/graphql', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...headers },
+        body: new URLSearchParams({ query: '{ hello }' }).toString(),
+      });
+    }
+
+    function multipartRequest(headers: Record<string, string> = {}): Request {
+      const formData = new FormData();
+      formData.append('query', '{ hello }');
+      return new Request('http://localhost/graphql', {
+        method: 'POST',
+        headers,
+        body: formData,
+      });
+    }
+
+    async function expectBlocked(response: Response): Promise<void> {
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(body.errors[0].message).toMatch(/blocked by CSRF prevention/);
+      expect(body.errors[0].extensions.code).toBe('BAD_REQUEST');
+    }
+
+    test('should block a text/plain JSON body before the context factory or resolver runs', async () => {
+      let resolved = false;
+      let contextBuilt = false;
+      const trackedSchema = new GraphQLSchema({
+        query: new GraphQLObjectType({
+          name: 'Query',
+          fields: {
+            hello: {
+              type: GraphQLString,
+              resolve: () => {
+                resolved = true;
+                return 'world';
+              },
+            },
+          },
+        }),
+      });
+      const handler = createHandler({
+        schema: trackedSchema,
+        context: () => {
+          contextBuilt = true;
+          return {};
+        },
+      });
+
+      await expectBlocked(await handler(postRequest(query, { 'Content-Type': 'text/plain' })));
+      expect(resolved).toBe(false);
+      expect(contextBuilt).toBe(false);
+    });
+
+    test('should not let a parameter smuggle application/json past the check', async () => {
+      const handler = createHandler({ schema });
+
+      await expectBlocked(
+        await handler(
+          postRequest(query, { 'Content-Type': 'text/plain; x=application/json' })
+        )
+      );
+    });
+
+    test('should block a POST with no Content-Type', async () => {
+      const handler = createHandler({ schema });
+
+      await expectBlocked(
+        await handler(
+          new Request('http://localhost/graphql?query=%7B%20hello%20%7D', {
+            method: 'POST',
+          })
+        )
+      );
+    });
+
+    test('should block form-urlencoded without a preflight header', async () => {
+      const handler = createHandler({ schema });
+
+      await expectBlocked(await handler(formRequest()));
+    });
+
+    test('should block multipart without a preflight header', async () => {
+      const handler = createHandler({ schema });
+
+      await expectBlocked(await handler(multipartRequest()));
+    });
+
+    test('should ignore an empty preflight header', async () => {
+      const handler = createHandler({ schema });
+
+      await expectBlocked(await handler(formRequest({ 'x-graphql-csrf': ' ' })));
+    });
+
+    test('should accept form-urlencoded with x-graphql-csrf', async () => {
+      const handler = createHandler({ schema });
+
+      const response = await handler(formRequest({ 'x-graphql-csrf': '1' }));
+
+      expect(response.status).toBe(200);
+      expect((await response.json()).data).toEqual({ hello: 'world' });
+    });
+
+    test('should accept multipart with x-graphql-csrf', async () => {
+      const handler = createHandler({ schema });
+
+      const response = await handler(multipartRequest({ 'x-graphql-csrf': '1' }));
+
+      expect(response.status).toBe(200);
+      expect((await response.json()).data).toEqual({ hello: 'world' });
+    });
+
+    test('should accept the other default headers', async () => {
+      const handler = createHandler({ schema });
+
+      for (const header of ['apollo-require-preflight', 'x-apollo-operation-name']) {
+        const response = await handler(formRequest({ [header]: 'true' }));
+        expect(response.status).toBe(200);
+      }
+    });
+
+    test('should accept application/json without a header', async () => {
+      const handler = createHandler({ schema });
+
+      const response = await handler(postRequest(query));
+
+      expect(response.status).toBe(200);
+    });
+
+    test('should accept application/graphql without a header', async () => {
+      const handler = createHandler({ schema });
+
+      const response = await handler(
+        postRequest('{ hello }', { 'Content-Type': 'application/graphql' })
+      );
+
+      expect(response.status).toBe(200);
+    });
+
+    test('should not apply to GET', async () => {
+      const handler = createHandler({ schema });
+
+      const response = await handler(
+        new Request('http://localhost/graphql?query=%7B%20hello%20%7D')
+      );
+
+      expect(response.status).toBe(200);
+    });
+
+    test('should let form bodies through when disabled', async () => {
+      const handler = createHandler({ schema, csrfPrevention: false });
+
+      expect((await handler(formRequest())).status).toBe(200);
+      expect((await handler(multipartRequest())).status).toBe(200);
+    });
+
+    test('should honour a custom requestHeaders list', async () => {
+      const handler = createHandler({
+        schema,
+        csrfPrevention: { requestHeaders: ['x-my-csrf'] },
+      });
+
+      expect((await handler(formRequest({ 'x-my-csrf': 'yes' }))).status).toBe(200);
+      // The custom list replaces the defaults.
+      await expectBlocked(await handler(formRequest({ 'x-graphql-csrf': '1' })));
+    });
+
+    test('should throw a TypeError for an invalid header name', () => {
+      expect(() =>
+        createHandler({ schema, csrfPrevention: { requestHeaders: ['bad header'] } })
+      ).toThrow(TypeError);
+      expect(() =>
+        createHandler({ schema, csrfPrevention: { requestHeaders: ['bad header'] } })
+      ).toThrow('"bad header" is not a valid header name');
+    });
+
+    test('should throw a TypeError, not crash, for a non-string header name', () => {
+      expect(() =>
+        createHandler({
+          schema,
+          csrfPrevention: { requestHeaders: [42 as unknown as string] },
+        })
+      ).toThrow('csrfPrevention.requestHeaders: 42 is not a valid header name');
+    });
+
+    test('should trim and lowercase configured header names', async () => {
+      const handler = createHandler({
+        schema,
+        csrfPrevention: { requestHeaders: ['  X-My-CSRF '] },
+      });
+      expect((await handler(formRequest({ 'x-my-csrf': 'yes' }))).status).toBe(200);
+    });
+
+    test('should list the CSRF headers in the default preflight allow list', async () => {
+      const handler = createHandler({ schema, cors: true });
+      const res = await handler(
+        new Request('http://localhost/graphql', { method: 'OPTIONS' })
+      );
+      expect(res.headers.get('Access-Control-Allow-Headers')).toContain('x-graphql-csrf');
+    });
+
+    test('should leave explicit cors.allowedHeaders untouched', async () => {
+      const handler = createHandler({ schema, cors: { allowedHeaders: ['X-A'] } });
+      const res = await handler(
+        new Request('http://localhost/graphql', { method: 'OPTIONS' })
+      );
+      expect(res.headers.get('Access-Control-Allow-Headers')).toBe('X-A');
+    });
+
+    test('should not add CSRF headers to the allow list when csrfPrevention is off', async () => {
+      const handler = createHandler({ schema, cors: true, csrfPrevention: false });
+      const res = await handler(
+        new Request('http://localhost/graphql', { method: 'OPTIONS' })
+      );
+      expect(res.headers.get('Access-Control-Allow-Headers')).toBe(
+        'Content-Type, Authorization'
+      );
+    });
+
+    test('should treat an object without requestHeaders as the defaults', async () => {
+      const handler = createHandler({ schema, csrfPrevention: {} });
+
+      await expectBlocked(await handler(formRequest()));
+      expect((await handler(formRequest({ 'x-graphql-csrf': '1' }))).status).toBe(200);
+    });
+  });
+
+  describe('thrown errors and body read failures', () => {
+    test('should mask a context factory failure when errorFormatting is unset', async () => {
+      const handler = createHandler({
+        schema,
+        context: () => {
+          throw new Error('connect ECONNREFUSED postgres://user:secret@db/app');
+        },
+      });
+
+      const response = await handler(postRequest(JSON.stringify({ query: '{ hello }' })));
+
+      expect(response.status).toBe(500);
+      const text = await response.text();
+      expect(text).not.toContain('secret');
+      expect(JSON.parse(text).errors[0].message).toBe('An unexpected error occurred');
+    });
+
+    test('should answer 401 when the context factory throws an UNAUTHENTICATED GraphQLError', async () => {
+      const handler = createHandler({
+        schema,
+        context: () => {
+          throw new GraphQLError('Not signed in', { extensions: { code: 'UNAUTHENTICATED' } });
+        },
+      });
+
+      const response = await handler(postRequest(JSON.stringify({ query: '{ hello }' })));
+
+      expect(response.status).toBe(401);
+    });
+
+    test('should answer 500 with a masked message when the context factory throws a plain Error', async () => {
+      const handler = createHandler({
+        schema,
+        context: () => {
+          throw new Error('boom secret');
+        },
+      });
+
+      const response = await handler(postRequest(JSON.stringify({ query: '{ hello }' })));
+
+      expect(response.status).toBe(500);
+      const body = await response.json();
+      expect(body.errors[0].message).toBe('An unexpected error occurred');
+    });
+
+    test('should keep masking a context factory failure when other options are set', async () => {
+      const handler = createHandler({
+        schema,
+        errorFormatting: { includeStackTrace: false },
+        context: () => {
+          throw new Error('connect ECONNREFUSED postgres://user:secret@db/app');
+        },
+      });
+
+      const response = await handler(postRequest(JSON.stringify({ query: '{ hello }' })));
+
+      expect(response.status).toBe(500);
+      const body = await response.json();
+      expect(body.errors[0].message).toBe('An unexpected error occurred');
+    });
+
+    test('should not mask a context factory failure with maskErrors: false', async () => {
+      const handler = createHandler({
+        schema,
+        errorFormatting: { maskErrors: false },
+        context: () => {
+          throw new Error('raw context failure');
+        },
+      });
+
+      const response = await handler(postRequest(JSON.stringify({ query: '{ hello }' })));
+
+      const body = await response.json();
+      expect(body.errors[0].message).toBe('raw context failure');
+    });
+
+    test('should keep masking when maskErrors is explicitly undefined (JSON)', async () => {
+      const handler = createHandler({
+        schema,
+        errorFormatting: { maskErrors: undefined },
+        context: () => {
+          throw new Error('connect ECONNREFUSED postgres://user:secret@db/app');
+        },
+      });
+
+      const response = await handler(postRequest(JSON.stringify({ query: '{ hello }' })));
+
+      const body = await response.json();
+      expect(body.errors[0].message).toBe('An unexpected error occurred');
+    });
+
+    test('should merge a user Vary header with the CORS Vary header', async () => {
+      const handler = createHandler({
+        schema,
+        cors: { origin: ['http://example.com'] },
+        response: { headers: { vary: 'Accept-Encoding' } },
+      });
+
+      const response = await handler(
+        new Request('http://localhost/graphql', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+          body: JSON.stringify({ query: '{ hello }' }),
+        })
+      );
+
+      const vary = (response.headers.get('vary') ?? '').toLowerCase();
+      expect(vary).toContain('accept-encoding');
+      expect(vary).toContain('origin');
+    });
+
+    test('should combine a lowercase user vary header with the CORS Vary into one Vary header', async () => {
+      const handler = createHandler({
+        schema,
+        cors: { origin: ['http://example.com'] },
+        response: { headers: { vary: 'Accept-Encoding', Vary: 'Accept-Language' } },
+      });
+
+      const response = await handler(
+        new Request('http://localhost/graphql', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+          body: JSON.stringify({ query: '{ hello }' }),
+        })
+      );
+
+      const tokens = (response.headers.get('vary') ?? '')
+        .split(',')
+        .map((t) => t.trim().toLowerCase());
+      expect(tokens.sort()).toEqual(['accept-encoding', 'accept-language', 'origin']);
+    });
+
+    test('should let CORS win over a lowercase user-set access-control-allow-origin', async () => {
+      const handler = createHandler({
+        schema,
+        cors: { origin: ['http://example.com'] },
+        response: { headers: { 'access-control-allow-origin': 'http://evil.com' } },
+      });
+
+      const response = await handler(
+        new Request('http://localhost/graphql', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+          body: JSON.stringify({ query: '{ hello }' }),
+        })
+      );
+
+      expect(response.headers.get('access-control-allow-origin')).toBe('http://example.com');
+    });
+
+    test('should let CORS win over a user-set Access-Control-Allow-Origin', async () => {
+      const handler = createHandler({
+        schema,
+        cors: { origin: ['http://example.com'] },
+        response: { headers: { 'Access-Control-Allow-Origin': 'http://evil.com' } },
+      });
+
+      const response = await handler(
+        new Request('http://localhost/graphql', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Origin: 'http://example.com' },
+          body: JSON.stringify({ query: '{ hello }' }),
+        })
+      );
+
+      expect(response.headers.get('access-control-allow-origin')).toBe('http://example.com');
+    });
+
+    test('should not leak the raw body read error message', async () => {
+      const handler = createHandler({ schema });
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.error(new Error('secret internal detail'));
+        },
+      });
+
+      const response = await handler(
+        new Request('http://localhost/graphql', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: stream,
+        })
       );
 
       expect(response.status).toBe(400);
       const body = await response.json();
-      expect(body.errors[0].message).toMatch(/Unsupported content type/);
+      expect(body.errors[0].message).toBe('Failed to read request body');
+    });
+
+    test('should answer 400 for invalid JSON in the variables query parameter', async () => {
+      const handler = createHandler({ schema });
+
+      const response = await handler(
+        new Request('http://localhost/graphql?query=%7B%20hello%20%7D&variables=nope')
+      );
+
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(body.errors[0].message).toBe('Invalid JSON in "variables"');
+    });
+
+    test('should accept a POST whose body supplies variables despite a junk variables query parameter', async () => {
+      const handler = createHandler({ schema });
+
+      const response = await handler(
+        new Request('http://localhost/graphql?variables=nope&extensions=nope', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: '{ hello }', variables: {}, extensions: {} }),
+        })
+      );
+
+      expect(response.status).toBe(200);
+    });
+
+    test('should answer 400 for a junk variables query parameter on a POST whose body omits variables', async () => {
+      const handler = createHandler({ schema });
+
+      const response = await handler(
+        new Request('http://localhost/graphql?variables=nope', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: '{ hello }' }),
+        })
+      );
+
+      expect(response.status).toBe(400);
+    });
+
+    test('should answer 400 for array variables in a JSON body', async () => {
+      const handler = createHandler({ schema });
+
+      const response = await handler(
+        postRequest(JSON.stringify({ query: '{ hello }', variables: [1] }))
+      );
+
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(body.errors[0].message).toBe('"variables" must be a JSON object');
     });
   });
 
@@ -678,6 +1259,48 @@ describe('GET mutations', () => {
     expect(body.errors[0].message).toBe('Mutations can only be sent with POST');
   });
 
+  test('should reject a mutation sent over HEAD with 405 and not run the resolver', async () => {
+    let ran = false;
+    const schema = new GraphQLSchema({
+      query: new GraphQLObjectType({
+        name: 'Query',
+        fields: { hello: { type: GraphQLString, resolve: () => 'world' } },
+      }),
+      mutation: new GraphQLObjectType({
+        name: 'Mutation',
+        fields: {
+          noop: {
+            type: GraphQLString,
+            resolve: () => {
+              ran = true;
+              return 'done';
+            },
+          },
+        },
+      }),
+    });
+    const handler = createHandler({
+      schema,
+      allowedMethods: ['GET', 'HEAD', 'POST'],
+    });
+    const res = await handler(
+      new Request(getUrl('mutation { noop }'), { method: 'HEAD' })
+    );
+    expect(res.status).toBe(405);
+    expect(res.headers.get('allow')).toBe('POST');
+    expect(ran).toBe(false);
+  });
+
+  test('should not combine a user allow header with the computed Allow on 405', async () => {
+    const handler = createHandler({
+      schema: mutationSchema,
+      response: { headers: { allow: 'GET' } },
+    });
+    const res = await handler(new Request(getUrl('mutation { noop }')));
+    expect(res.status).toBe(405);
+    expect(res.headers.get('allow')).toBe('POST');
+  });
+
   test('should keep CORS headers on the 405 response', async () => {
     const handler = createHandler({ schema: mutationSchema, cors: true });
     const res = await handler(
@@ -812,6 +1435,13 @@ describe('SSE', () => {
             throw new Error('secret');
           },
         },
+        flaky: {
+          type: GraphQLInt,
+          subscribe: async function* () {
+            yield { flaky: 1 };
+            throw new Error('secret');
+          },
+        },
         pending: {
           type: GraphQLInt,
           subscribe: () => pendingIterator(),
@@ -907,6 +1537,35 @@ describe('SSE', () => {
     expect(text.endsWith(COMPLETE)).toBe(true);
   });
 
+  test('should keep masking a mid-stream error when maskErrors is explicitly undefined', async () => {
+    const handler = createHandler({
+      schema: sseSchema,
+      sse: true,
+      errorFormatting: { maskErrors: undefined },
+    });
+    const res = await handler(
+      post({ query: 'subscription { flaky }' }, { accept: 'text/event-stream' })
+    );
+    const text = await res.text();
+    expect(text).toContain('"flaky":1');
+    expect(text).not.toContain('secret');
+    expect(text.endsWith(COMPLETE)).toBe(true);
+  });
+
+  test('should expose a mid-stream error when maskErrors is false', async () => {
+    const handler = createHandler({
+      schema: sseSchema,
+      sse: true,
+      errorFormatting: { maskErrors: false },
+    });
+    const res = await handler(
+      post({ query: 'subscription { flaky }' }, { accept: 'text/event-stream' })
+    );
+    const text = await res.text();
+    expect(text).toContain('secret');
+    expect(text.endsWith(COMPLETE)).toBe(true);
+  });
+
   test('should stream an execution failure with data null as 200 next then complete', async () => {
     const handler = createHandler({ schema: sseSchema, sse: true });
     const res = await handler(post({ query: 'mutation { fail }' }, { accept: 'text/event-stream' }));
@@ -988,6 +1647,20 @@ describe('SSE', () => {
     expect(text.endsWith(COMPLETE)).toBe(true);
   });
 
+  test('should keep masking a thrown subscription error when other options are set', async () => {
+    const handler = createHandler({
+      schema: sseSchema,
+      sse: true,
+      errorFormatting: { includeStackTrace: false },
+    });
+    const res = await handler(
+      post({ query: 'subscription { boom }' }, { accept: 'text/event-stream' })
+    );
+    const text = await res.text();
+    expect(text).not.toContain('secret');
+    expect(text).toContain('An unexpected error occurred');
+  });
+
   test('should return a JSON error response for a validation failure', async () => {
     const handler = createHandler({ schema: sseSchema, sse: true });
     const res = await handler(post({ query: '{ nope }' }, { accept: 'text/event-stream' }));
@@ -1018,6 +1691,20 @@ describe('SSE', () => {
     const res = await handler(post({ query: '{ hello }' }, { accept: 'text/event-stream' }));
     expect(res.status).toBe(500);
     expect(res.headers.get('content-type')).toContain('application/json');
+    const body = await res.json();
+    expect(body.errors[0].message).toBe('An unexpected error occurred');
+  });
+
+  test('should keep masking over SSE when maskErrors is explicitly undefined', async () => {
+    const handler = createHandler({
+      schema: sseSchema,
+      sse: true,
+      errorFormatting: { maskErrors: undefined },
+      context: () => {
+        throw new Error('connect ECONNREFUSED 10.0.3.14:5432');
+      },
+    });
+    const res = await handler(post({ query: '{ hello }' }, { accept: 'text/event-stream' }));
     const body = await res.json();
     expect(body.errors[0].message).toBe('An unexpected error occurred');
   });

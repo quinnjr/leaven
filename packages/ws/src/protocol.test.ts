@@ -210,7 +210,7 @@ describe('operation id validation', () => {
     expect(isValidOperationId(id)).toBe(false);
   });
 
-  test('isValidOperationId rejects non-strings', () => {
+  test('should reject non-string operation ids in isValidOperationId', () => {
     expect(isValidOperationId(1)).toBe(false);
     expect(isValidOperationId(undefined)).toBe(false);
     expect(isValidOperationId(null)).toBe(false);
@@ -235,7 +235,7 @@ describe('operation id validation', () => {
     expect(parseMessage(frame).type).toBe(MessageType.Subscribe);
   });
 
-  test('parseMessage leaves server -> client ids alone when requireId is false', () => {
+  test('should leave server -> client ids alone in parseMessage when requireId is false', () => {
     // A client parsing server frames must not be torn down over an id it
     // did not choose; the format rule guards what a server accepts.
     expect(
@@ -351,5 +351,61 @@ describe('createPongMessage', () => {
     const message = createPongMessage({ timestamp: 123 });
 
     expect(message.payload?.timestamp).toBe(123);
+  });
+});
+
+describe('parseMessage subscribe payload', () => {
+  const reject = (json: string): void => {
+    expect(() => parseMessage(json)).toThrow('Invalid message');
+  };
+
+  test('should reject a subscribe with no payload', () => {
+    reject('{"type":"subscribe","id":"1"}');
+  });
+
+  test('should reject a non-object payload', () => {
+    reject('{"type":"subscribe","id":"1","payload":"x"}');
+    reject('{"type":"subscribe","id":"1","payload":[]}');
+    reject('{"type":"subscribe","id":"1","payload":null}');
+  });
+
+  test('should reject a non-string query', () => {
+    reject('{"type":"subscribe","id":"1","payload":{"query":5}}');
+    reject('{"type":"subscribe","id":"1","payload":{}}');
+  });
+
+  test('should reject malformed optional fields', () => {
+    reject('{"type":"subscribe","id":"1","payload":{"query":"{a}","operationName":1}}');
+    reject('{"type":"subscribe","id":"1","payload":{"query":"{a}","variables":"x"}}');
+    reject('{"type":"subscribe","id":"1","payload":{"query":"{a}","extensions":[]}}');
+  });
+
+  test('should reject a malformed payload even with requireId false', () => {
+    for (const json of [
+      '{"type":"subscribe","id":"1","payload":5}',
+      '{"type":"subscribe","id":"1","payload":{"query":5}}',
+      '{"type":"subscribe","id":"1","payload":{"query":"{a}","extensions":[]}}',
+    ]) {
+      expect(() => parseMessage(json, { requireId: false })).toThrow('Invalid message');
+    }
+  });
+
+  test('should accept a well-formed payload', () => {
+    const message = parseMessage(
+      '{"type":"subscribe","id":"1","payload":{"query":"{a}","operationName":"A","variables":{"x":1},"extensions":{}}}'
+    );
+    expect(message.type).toBe(MessageType.Subscribe);
+  });
+});
+
+describe('createNextMessage extensions', () => {
+  test('should include extensions when given', () => {
+    const message = createNextMessage('1', { a: 1 }, undefined, { trace: true });
+    expect(message.payload.extensions).toEqual({ trace: true });
+  });
+
+  test('should omit extensions when absent', () => {
+    const message = createNextMessage('1', { a: 1 });
+    expect('extensions' in message.payload).toBe(false);
   });
 });
