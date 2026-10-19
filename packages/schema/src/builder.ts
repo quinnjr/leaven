@@ -23,6 +23,7 @@ import {
   type GraphQLType,
   type GraphQLOutputType,
   type GraphQLInputType,
+  type GraphQLNullableType,
   type GraphQLFieldConfig,
   type GraphQLInputFieldConfig,
 } from 'graphql';
@@ -313,7 +314,7 @@ export class SchemaBuilder {
     // Handle non-null types
     if (trimmed.endsWith('!')) {
       const innerType = this.parseType(trimmed.slice(0, -1), isInput);
-      return new GraphQLNonNull(innerType as GraphQLOutputType | GraphQLInputType);
+      return new GraphQLNonNull(innerType as GraphQLNullableType);
     }
 
     // Handle list types

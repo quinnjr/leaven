@@ -5,8 +5,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import type { Type } from '@nestjs/common';
-import type { ModuleMetadata } from '@nestjs/common/interfaces';
+import type { ModuleMetadata, Type } from '@nestjs/common';
 import type { GraphQLSchema, DocumentNode } from 'graphql';
 import type { DocumentCacheConfig, ParseOptions } from '@leaven-graphql/core';
 import type { PubSub } from '@leaven-graphql/ws';
