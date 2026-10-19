@@ -1,6 +1,6 @@
 {
   "name": "@leaven-graphql/core",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Core GraphQL execution engine for Leaven",
   "type": "module",
   "main": "./src/index.ts",
