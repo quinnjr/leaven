@@ -104,8 +104,10 @@ requests that `Accept` `text/event-stream`. It is off by default; with `sse`
 unset behaviour is unchanged. Subscriptions stream results, and queries and
 mutations answer with one `next` event then `complete`. Only request errors
 (no `data`, and rejected by the executor before any resolver ran: a syntax,
-validation, complexity, depth, operation-selection or variable-coercion error;
-see `isRequestError` in `@leaven-graphql/sse`) get a plain JSON response.
+validation, complexity, depth, operation-selection or variable-coercion error,
+or a failure before execution started such as a throwing `onParse` or
+`onValidated` hook or a document cache failure; see `isRequestError` in
+`@leaven-graphql/sse`) get a plain JSON response.
 Everything else, `data: null` and coded errors raised after execution started
 included, is streamed, because the `graphql-sse` client
 retries non-`200` responses. `LeavenServer` disables Bun's idle timeout while an event

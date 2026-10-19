@@ -114,7 +114,7 @@ describe('createEventStream', () => {
     expect(out).toBe(
       formatNextEvent({ data: { n: 1 } }) + formatNextEvent({ data: { n: 2 } }) + formatCompleteEvent()
     );
-    expect(iterator.returnCalls).toBe(0);
+    expect(iterator.returnCalls).toBe(1);
   });
 
   test('should pass each result through formatResult', async () => {
@@ -139,7 +139,7 @@ describe('createEventStream', () => {
     expect(out).toContain('event: next');
     expect(out).not.toContain('db password leaked');
     expect(out.endsWith(formatCompleteEvent())).toBe(true);
-    expect(iterator.returnCalls).toBe(0);
+    expect(iterator.returnCalls).toBe(1);
   });
 
   test('should use a custom formatError for iterator errors', async () => {
@@ -595,5 +595,71 @@ describe('createEventStreamResponse', () => {
   test('should stream the events as the body', async () => {
     const res = createEventStreamResponse({ data: { a: 1 } });
     expect(await res.text()).toBe(formatNextEvent({ data: { a: 1 } }) + formatCompleteEvent());
+  });
+});
+
+describe('createEventStream iterator return after a throw', () => {
+  test('should call return once after the iterator throws, even if aborted afterwards', async () => {
+    const iterator = throwingIterator();
+    const controller = new AbortController();
+    const out = await readAll(
+      createEventStream(iterator, { signal: controller.signal, keepAliveInterval: 0 })
+    );
+    expect(out.endsWith(formatCompleteEvent())).toBe(true);
+    controller.abort();
+    expect(iterator.returnCalls).toBe(1);
+  });
+
+  test('should call return before onClose runs after the iterator throws', async () => {
+    const iterator = throwingIterator();
+    let returnCallsAtClose = -1;
+    await readAll(
+      createEventStream(iterator, { onClose: () => (returnCallsAtClose = iterator.returnCalls) })
+    );
+    expect(returnCallsAtClose).toBe(1);
+  });
+
+  test('should call return when createEventStreamResponse streams an iterator that throws', async () => {
+    const iterator = throwingIterator();
+    const response = createEventStreamResponse(iterator, { keepAliveInterval: 0 });
+    expect(await response.text()).toContain('event: complete');
+    expect(iterator.returnCalls).toBe(1);
+  });
+
+  test('should not leak a rejecting return after the iterator throws', async () => {
+    const iterator = throwingIterator();
+    iterator.return = async () => {
+      iterator.returnCalls++;
+      throw new Error('return failed');
+    };
+    const escaped = await withoutEscapes(async () => {
+      const out = await readAll(createEventStream(iterator, { keepAliveInterval: 0 }));
+      expect(out.endsWith(formatCompleteEvent())).toBe(true);
+    });
+    expect(escaped).toEqual([]);
+    expect(iterator.returnCalls).toBe(1);
+  });
+
+  test('should not leak a synchronously throwing return after the iterator throws', async () => {
+    const iterator = throwingIterator();
+    iterator.return = () => {
+      iterator.returnCalls++;
+      throw new Error('return threw');
+    };
+    let closes = 0;
+    const escaped = await withoutEscapes(async () => {
+      const out = await readAll(createEventStream(iterator, { onClose: () => closes++ }));
+      expect(out.endsWith(formatCompleteEvent())).toBe(true);
+    });
+    expect(escaped).toEqual([]);
+    expect(iterator.returnCalls).toBe(1);
+    expect(closes).toBe(1);
+  });
+
+  test('should tolerate an iterator without return', async () => {
+    const iterator = throwingIterator();
+    delete (iterator as Partial<ManualIterator>).return;
+    const out = await readAll(createEventStream(iterator, { keepAliveInterval: 0 }));
+    expect(out.endsWith(formatCompleteEvent())).toBe(true);
   });
 });

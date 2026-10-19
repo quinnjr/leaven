@@ -147,15 +147,6 @@ interface PipelineTelemetry {
  */
 const requestRejections = new WeakSet<object>();
 
-/**
- * Errors thrown by the executor's own analysis (parsing with its limits, and
- * query compilation with its visit budget). The analysis can run user code,
- * namely `compilerOptions.complexityCalculator`, but never a resolver, so a
- * throw from the calculator is still a pre-execution rejection. A response
- * built from one of these errors in a catch block is a rejection.
- */
-const rejectionThrows = new WeakSet<object>();
-
 function isObject(value: unknown): value is object {
   return (typeof value === 'object' && value !== null) || typeof value === 'function';
 }
@@ -165,25 +156,21 @@ function markRejection<T extends object>(response: T): T {
   return response;
 }
 
-/** Tag an error thrown by the executor's own analysis, then rethrow it */
-function rejectionThrow(error: unknown): never {
-  if (isObject(error)) {
-    rejectionThrows.add(error);
-  }
-  throw error;
-}
-
 /**
  * Whether a response is one the executor produced because it rejected the
  * request before running any resolver.
  *
  * That covers a syntax error, the parser limits (`maxTokens`, `maxDepth`,
  * the analysis budget), a validation failure, the complexity budget, an
- * unknown or missing operation name, and a variable that fails to coerce.
- * Nothing ran, so the request can safely be answered with a non-200 status
- * and retried. Errors from `onExecute`, `onExecuted`, resolvers, subscribe
- * resolvers and any other unexpected throw are never marked, whatever code
- * they carry.
+ * unknown or missing operation name, and a variable that fails to coerce. It
+ * also covers anything else that fails before execution starts, that is
+ * before `onExecute` is invoked: a throw (or rejection) from the `onParse`,
+ * `onParsed`, `onValidate` or `onValidated` hooks, from a
+ * `complexityCalculator`, or from the document cache. No resolver ran, so the
+ * request can safely be answered with a non-200 status and retried. Errors
+ * from `onExecute`, `onExecuted`, resolvers, subscribe resolvers, and
+ * anything else raised once execution started are never marked, whatever
+ * code they carry.
  *
  * The check is identity-based: pass the very `response` object that
  * `execute()` (inside its `ExecutionResult`) or `subscribe()` returned, not a
@@ -495,11 +482,7 @@ export class LeavenExecutor {
     // `this.parseOptions` already has any configured `maxDepth` folded in, and
     // is part of the cache-key fingerprint, so a cached document can never
     // have been parsed under different limits than the ones in force here.
-    try {
-      return { document: parseDocument(query, this.parseOptions), cached: false };
-    } catch (error) {
-      return rejectionThrow(error);
-    }
+    return { document: parseDocument(query, this.parseOptions), cached: false };
   }
 
   /**
@@ -593,8 +576,10 @@ export class LeavenExecutor {
    * gap.
    *
    * A rejected document comes back as `{ errors }`. Parse-level failures
-   * (syntax, `maxTokens`, depth limit, analysis budget) throw, and both
-   * callers wrap this in the same try/catch.
+   * (syntax, `maxTokens`, depth limit, analysis budget), hook throws and
+   * document cache failures throw, and both callers wrap this in the same
+   * try/catch. Nothing here runs a resolver, so every throw out of it is a
+   * pre-execution rejection (see {@link isRequestRejection}).
    */
   private async runPipeline(
     request: GraphQLRequest,
@@ -674,13 +659,11 @@ export class LeavenExecutor {
     // stored once it is known to be within budget (see below).
     let admitCompiled: (() => void) | undefined;
     if (this.compilerOptions) {
-      let compilation: ReturnType<LeavenExecutor['getCompiledQuery']>;
-      try {
-        compilation = this.getCompiledQuery(request.query, document, request.operationName);
-      } catch (error) {
-        return rejectionThrow(error);
-      }
-      const { compiled, cached, admit } = compilation;
+      const { compiled, cached, admit } = this.getCompiledQuery(
+        request.query,
+        document,
+        request.operationName
+      );
       admitCompiled = admit;
       telemetry.queryCached = cached;
       if (this.compilerOptions.calculateComplexity) {
@@ -759,6 +742,10 @@ export class LeavenExecutor {
       return metrics;
     };
 
+    // Set just before onExecute: a throw caught while it is false happened
+    // before any resolver could run, so the response is a request rejection.
+    let executionStarted = false;
+
     try {
       const prepared = await this.runPipeline(request, telemetry);
 
@@ -774,6 +761,7 @@ export class LeavenExecutor {
       // Execute
       const executeStart = this.metricsEnabled ? performance.now() : 0;
 
+      executionStarted = true;
       if (this.hooks?.onExecute) {
         await this.hooks.onExecute(context as TContext, document);
       }
@@ -816,7 +804,7 @@ export class LeavenExecutor {
       const response: GraphQLResponse<TData> = {
         errors: [this.formatCaughtError(error)],
       };
-      if (isObject(error) && rejectionThrows.has(error)) {
+      if (!executionStarted) {
         markRejection(response);
       }
       return {
@@ -913,6 +901,10 @@ export class LeavenExecutor {
       queryCached: false,
     };
 
+    // Set just before onExecute: a throw caught while it is false happened
+    // before any resolver could run, so the response is a request rejection.
+    let executionStarted = false;
+
     try {
       const prepared = await this.runPipeline(request, telemetry);
 
@@ -922,6 +914,7 @@ export class LeavenExecutor {
 
       const { document } = prepared;
 
+      executionStarted = true;
       if (this.hooks?.onExecute) {
         await this.hooks.onExecute(context as TContext, document);
       }
@@ -988,7 +981,7 @@ export class LeavenExecutor {
       await this.reportError(error);
 
       const response: GraphQLResponse<TData> = { errors: [this.formatCaughtError(error)] };
-      if (isObject(error) && rejectionThrows.has(error)) {
+      if (!executionStarted) {
         markRejection(response);
       }
       return response;

@@ -141,8 +141,10 @@ const resolvers = {
 
 ### Authentication
 
-Authenticate in `onConnect`. Returning `false` closes the socket with `4403`,
-and no `subscribe` frame is accepted before a connection is acknowledged
+Authenticate in `onConnect`. Returning `false` closes the socket with `4403`.
+`onConnect` gets `connectionInitTimeout` (counted from `connection_init`) to
+settle: if it has not, the socket is closed with `4408` and its late result is
+ignored (no ack, no keep-alive; a late rejection is logged). No `subscribe` frame is accepted before a connection is acknowledged
 (unacknowledged operations are closed with `4401`).
 
 ```typescript
@@ -308,7 +310,10 @@ interface WebSocketHandlerConfig<TContext = unknown> {
     socket: ServerWebSocket<WebSocketContext>,
     request: GraphQLRequest
   ) => TContext | Promise<TContext>;
-  /** Close with 4408 if `connection_init` does not arrive in time (default 3000ms) */
+  /**
+   * Close with 4408 if `connection_init` does not arrive in time, or if
+   * `onConnect` has not settled this long after it arrived (default 3000ms)
+   */
   connectionInitTimeout?: number;
   /** Server ping interval; 0 disables keep-alive (default 12000ms) */
   keepAliveInterval?: number;
@@ -354,7 +359,8 @@ interface WebSocketContext {
 
 Close codes follow the protocol: `4400` invalid message, `4401` unauthorized
 (operation before `connection_init`), `4403` rejected by `onConnect`, `4408`
-init timeout, `4409` duplicate subscription id, `4429` repeated
+init timeout (no `connection_init`, or an `onConnect` that did not settle in
+time), `4409` duplicate subscription id, `4429` repeated
 `connection_init` (including a second one sent while `onConnect` for the
 first is still running).
 

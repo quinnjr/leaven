@@ -1,5 +1,14 @@
 # @leaven-graphql/nestjs
 
+## 0.2.6
+
+### Patch Changes
+
+- Updated dependencies [507d308]
+- Updated dependencies [507d308]
+  - @leaven-graphql/core@0.4.1
+  - @leaven-graphql/ws@0.3.2
+
 ## 0.2.5
 
 ### Patch Changes

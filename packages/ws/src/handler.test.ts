@@ -5,7 +5,7 @@
  * Licensed under the Apache License, Version 2.0
  */
 
-import { describe, test, expect, spyOn } from 'bun:test';
+import { describe, test, expect, mock, spyOn } from 'bun:test';
 import {
   GraphQLError,
   GraphQLInt,
@@ -429,6 +429,120 @@ describe('WebSocketHandler', () => {
       expect(frames(socket).some((f) => f.type === 'connection_ack')).toBe(false);
       expect(frames(socket).some((f) => f.type === 'ping')).toBe(false);
       expect(socket.data.initialized).toBe(false);
+    });
+  });
+
+  describe('connection_init timeout while onConnect is pending', () => {
+    function silentLogger(): { error: ReturnType<typeof mock>; warn: ReturnType<typeof mock> } {
+      return { error: mock(() => {}), warn: mock(() => {}) };
+    }
+
+    test('should close with 4408 when onConnect never settles', async () => {
+      const handler = createHandler({
+        connectionInitTimeout: 20,
+        onConnect: () => new Promise<boolean>(() => {}),
+      });
+      const socket = createFakeSocket();
+      handler.handleOpen(socket);
+
+      void handler.handleMessage(socket, '{"type":"connection_init"}');
+      await waitFor(() => socket.closed !== null);
+
+      expect(socket.closed).toEqual({ code: 4408, reason: 'Connection initialization timeout' });
+      expect(frames(socket)).toEqual([]);
+      expect(socket.data.initialized).toBe(false);
+
+      await handler.handleClose(socket);
+    });
+
+    test('should neither ack nor start keep-alive when onConnect allows after the timeout', async () => {
+      let allow!: (allowed: boolean) => void;
+      const handler = createHandler({
+        connectionInitTimeout: 20,
+        keepAliveInterval: 5,
+        onConnect: () =>
+          new Promise<boolean>((resolve) => {
+            allow = resolve;
+          }),
+      });
+      const socket = createFakeSocket();
+      handler.handleOpen(socket);
+
+      const init = handler.handleMessage(socket, '{"type":"connection_init"}');
+      await waitFor(() => socket.closed !== null);
+      allow(true);
+      await init;
+
+      // Give a leaked keep-alive interval the chance to fire
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      expect(socket.closed?.code).toBe(4408);
+      expect(frames(socket)).toEqual([]);
+      expect(socket.data.initialized).toBe(false);
+
+      await handler.handleClose(socket);
+    });
+
+    test('should not close again when onConnect rejects after the timeout', async () => {
+      let fail!: (error: Error) => void;
+      const logger = silentLogger();
+      const handler = createHandler({
+        connectionInitTimeout: 20,
+        logger,
+        onConnect: () =>
+          new Promise<boolean>((_resolve, reject) => {
+            fail = reject;
+          }),
+      });
+      const socket = createFakeSocket();
+      handler.handleOpen(socket);
+
+      const init = handler.handleMessage(socket, '{"type":"connection_init"}');
+      await waitFor(() => socket.closed !== null);
+      fail(new Error('auth service unavailable'));
+      await init;
+
+      expect(socket.closed).toEqual({ code: 4408, reason: 'Connection initialization timeout' });
+      expect(frames(socket)).toEqual([]);
+      expect(logger.error).toHaveBeenCalledTimes(1);
+
+      await handler.handleClose(socket);
+    });
+
+    test('should measure the timeout from connection_init, not from open', async () => {
+      const handler = createHandler({
+        connectionInitTimeout: 40,
+        onConnect: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          return true;
+        },
+      });
+      const socket = createFakeSocket();
+      handler.handleOpen(socket);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      await handler.handleMessage(socket, '{"type":"connection_init"}');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(socket.closed).toBeNull();
+      expect(frames(socket)[0]?.type).toBe('connection_ack');
+
+      await handler.handleClose(socket);
+    });
+
+    test('should stop the onConnect timer when the socket closes', async () => {
+      const handler = createHandler({
+        connectionInitTimeout: 20,
+        onConnect: () => new Promise<boolean>(() => {}),
+      });
+      const socket = createFakeSocket();
+      handler.handleOpen(socket);
+
+      void handler.handleMessage(socket, '{"type":"connection_init"}');
+      await handler.handleClose(socket);
+      await new Promise((resolve) => setTimeout(resolve, 40));
+
+      expect(socket.closed).toBeNull();
     });
   });
 

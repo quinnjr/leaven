@@ -39,14 +39,16 @@ single `next` event followed by `complete`. Mutations are only accepted over
 Only a *request error* is answered as a plain JSON response with the usual
 status code rather than as a stream: a result with no `data` that the executor
 itself rejected before running any resolver (a syntax error, a parser limit,
-validation, complexity, operation selection or variable coercion). The executor
+validation, complexity, operation selection or variable coercion, or any
+other failure before execution starts: a throwing `onParse`, `onParsed`,
+`onValidate` or `onValidated` hook, or a document cache failure). The executor
 marks those responses, and `isRequestError` checks the mark
 (`isRequestRejection` from `@leaven-graphql/core`), so the decision is
 structural rather than by error code. Everything else is streamed as `200`
 `next` + `complete`, including a result with `data: null`, and any error raised
 after execution started, whatever its code: by a resolver, by a subscribe
 resolver at subscription start (an `AuthenticationError` or a
-`ValidationError`, for example), or by an `onExecuted` hook. The client receives
+`ValidationError`, for example), or by an `onExecute` or `onExecuted` hook. The client receives
 those as a result carrying `errors`. Streaming is the safe default, because a
 stream is never retried.
 
@@ -190,8 +192,10 @@ This is the route frameworks such as Knead take: they own routing and context
 creation and only need the stream.
 
 The stream applies backpressure (the iterator is only advanced as fast as the
-client reads), calls `iterator.return()` exactly once when the client
-disconnects or `signal` aborts, and masks errors thrown by the iterator by
+client reads), calls `iterator.return()` exactly once on every close (when the
+client disconnects, `signal` aborts, the iterator completes, or the iterator
+throws, so the source's subscriptions are always released; a throwing or
+rejecting `return()` is ignored), and masks errors thrown by the iterator by
 default; supply `formatError` to change that. Errors inside a result are left
 to `formatResult`.
 

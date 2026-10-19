@@ -15,10 +15,12 @@ import { isRequestRejection, type GraphQLResponse } from '@leaven-graphql/core';
  * True only when the result has no `data` and the executor marked it as a
  * pre-execution rejection (`isRequestRejection` from `@leaven-graphql/core`:
  * a syntax error, a parser limit, validation, complexity, operation selection
- * or variable coercion). The classification is structural, not by error
- * code: a coded error such as a `ValidationError` thrown by a resolver, a
- * subscribe resolver or an `onExecuted` hook ran after execution started and
- * is streamed. That is the safe default, because the graphql-sse client
+ * or variable coercion, and any other failure before execution starts, such
+ * as a throw from the `onParse`, `onParsed`, `onValidate` or `onValidated`
+ * hooks or a document cache failure). The classification is structural, not
+ * by error code: a coded error such as a `ValidationError` thrown by a
+ * resolver, a subscribe resolver, or an `onExecute` or `onExecuted` hook ran
+ * after execution started and is streamed. That is the safe default, because the graphql-sse client
  * retries every non-200 response and a retry would run the resolver again.
  *
  * The mark is identity-based: pass the object `execute()` or `subscribe()`
