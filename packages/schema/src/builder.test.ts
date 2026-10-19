@@ -308,8 +308,9 @@ describe('SchemaBuilder', () => {
         source: 'mutation { createUser(input: {}) }',
       });
 
-      expect(result.errors?.[0]?.message).toContain(
-        'CreateUserInput.name" of required type "String!" was not provided'
+      // graphql 16 and 17 word this rejection differently.
+      expect(result.errors?.[0]?.message).toMatch(
+        /CreateUserInput\.name" of required type "String!" was not provided|"CreateUserInput" to include required field "name"/
       );
     });
   });

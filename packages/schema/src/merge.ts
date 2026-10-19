@@ -19,6 +19,7 @@ import {
   type DefinitionNode,
   type DocumentNode,
   type GraphQLFieldMap,
+  type GraphQLScalarType,
   type InputObjectTypeDefinitionNode,
   type InterfaceTypeDefinitionNode,
   type NamedTypeNode,
@@ -71,7 +72,8 @@ export interface MergeOptions {
  * The merged schema is rebuilt from those definitions, so executable functions
  * from the source schemas — field `resolve`/`subscribe`, `resolveType` on
  * interfaces and unions, `isTypeOf` on object types, and
- * `serialize`/`parseValue`/`parseLiteral` on custom scalars — are re-attached
+ * the coercion functions on custom scalars (`serialize`/`parseValue`/
+ * `parseLiteral`, and graphql 17's `coerce*`/`valueToLiteral`) — are re-attached
  * afterwards, following the same conflict policy.
  *
  * @throws If two source schemas declare the same type name as different kinds
@@ -437,9 +439,7 @@ function reattachExecutableFunctions(
 
       if (isScalarType(sourceType) && isScalarType(mergedType)) {
         if (!isSpecifiedScalarType(sourceType)) {
-          mergedType.serialize = sourceType.serialize;
-          mergedType.parseValue = sourceType.parseValue;
-          mergedType.parseLiteral = sourceType.parseLiteral;
+          copyScalarFunctions(sourceType, mergedType);
         }
       } else if (isObjectType(sourceType) && isObjectType(mergedType)) {
         if (sourceType.isTypeOf) {
@@ -465,6 +465,38 @@ function reattachExecutableFunctions(
           `Cannot merge type "${typeName}": source is ${sourceType.constructor.name} but merged is ${mergedType.constructor.name}`
         );
       }
+    }
+  }
+}
+
+/**
+ * Scalar function slots carried across a merge. graphql 17 executes through
+ * the `coerce*` functions and only keeps the legacy `serialize`/`parse*` names
+ * as deprecated aliases, so both sets are copied; slots the installed graphql
+ * version does not define are skipped.
+ */
+const SCALAR_FUNCTION_KEYS = [
+  'serialize',
+  'parseValue',
+  'parseLiteral',
+  'coerceOutputValue',
+  'coerceInputValue',
+  'coerceInputLiteral',
+  'valueToLiteral',
+] as const;
+
+/**
+ * Copy the executable functions of a custom scalar onto its rebuilt copy.
+ */
+function copyScalarFunctions(
+  source: GraphQLScalarType,
+  target: GraphQLScalarType
+): void {
+  const from = source as unknown as Record<string, unknown>;
+  const to = target as unknown as Record<string, unknown>;
+  for (const key of SCALAR_FUNCTION_KEYS) {
+    if (key in from) {
+      to[key] = from[key];
     }
   }
 }
