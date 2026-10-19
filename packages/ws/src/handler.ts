@@ -60,7 +60,11 @@ export interface WebSocketHandlerConfig<TContext = unknown> {
   schema: GraphQLSchema;
   /** Context factory */
   context?: WebSocketContextFactory<TContext>;
-  /** Connection initialization timeout (ms) */
+  /**
+   * Connection initialization timeout (ms, default 3000). The socket is
+   * closed with 4408 if `connection_init` does not arrive in time, or if
+   * `onConnect` has not settled this long after it arrived.
+   */
   connectionInitTimeout?: number;
   /** Keep alive interval (ms) */
   keepAliveInterval?: number;
@@ -339,12 +343,14 @@ export class WebSocketHandler<TContext = unknown> {
 
     // Check onConnect hook
     if (this.onConnect) {
-      const allowed = await this.onConnect(socket, params);
-      // The socket may have closed while onConnect ran. Acknowledging it now
-      // would start a keep-alive timer that nothing ever clears.
-      if (state.closed) {
+      const outcome = await this.awaitOnConnect(this.onConnect, socket, params);
+      // The socket may have closed, or timed out, while onConnect ran.
+      // Acknowledging it now would start a keep-alive timer that nothing
+      // ever clears.
+      if (state.closed || outcome.timedOut) {
         return;
       }
+      const { allowed } = outcome;
       if (!allowed) {
         socket.close(4403, 'Forbidden');
         return;
@@ -366,6 +372,48 @@ export class WebSocketHandler<TContext = unknown> {
       }, this.keepAliveInterval);
 
       this.keepAliveTimers.set(socket.data.connectionId, timer);
+    }
+  }
+
+  /**
+   * Run onConnect, bounded by `connectionInitTimeout`.
+   *
+   * The open-time init timer stops when connection_init arrives, so without
+   * this an onConnect that never settles would hold the socket open
+   * unauthenticated forever. If it has not settled in time the socket is
+   * closed with the same 4408 as a missing connection_init, and its late
+   * result is ignored: a late rejection is logged rather than closing the
+   * socket a second time. The timer lives in `initTimeouts`, so a close
+   * during onConnect stops it.
+   */
+  private async awaitOnConnect(
+    onConnect: NonNullable<WebSocketHandlerConfig<TContext>['onConnect']>,
+    socket: ServerWebSocket<WebSocketContext>,
+    params: Record<string, unknown> | undefined
+  ): Promise<{ timedOut: true } | { timedOut: false; allowed: boolean }> {
+    const { connectionId } = socket.data;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      this.initTimeouts.delete(connectionId);
+      socket.close(4408, 'Connection initialization timeout');
+    }, this.connectionInitTimeout);
+    this.initTimeouts.set(connectionId, timer);
+
+    try {
+      const allowed = await onConnect(socket, params);
+      return timedOut ? { timedOut: true } : { timedOut: false, allowed };
+    } catch (error) {
+      if (timedOut) {
+        this.logger.error('onConnect failed after the connection initialisation timeout:', error);
+        return { timedOut: true };
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      if (this.initTimeouts.get(connectionId) === timer) {
+        this.initTimeouts.delete(connectionId);
+      }
     }
   }
 

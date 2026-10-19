@@ -83,7 +83,13 @@ const FALLBACK_ERROR: GraphQLFormattedError = Object.freeze({
  * error thrown by the iterator or by `formatResult` is sent as a `next` event
  * carrying `{ errors: [formatError(error)] }`, then the stream completes. An
  * abort, a consumer cancel, or a failure to format or enqueue ends the stream
- * early and calls `iterator.return()`.
+ * early.
+ *
+ * Every close of a subscription iterator calls `iterator.return()` exactly
+ * once, however the stream ended: early, on completion, or after the
+ * iterator threw (so a source that only releases its subscriptions in
+ * `return()` is always released). A `return()` that throws or rejects is
+ * ignored.
  *
  * The stream honours backpressure: the iterator is not advanced, and
  * keep-alive ticks are skipped, while the consumer's queue is full.
@@ -109,7 +115,7 @@ export function createEventStream<TData = Record<string, unknown>>(
   let timer: ReturnType<typeof setInterval> | undefined;
   let resumePump: (() => void) | undefined;
   let closed = false;
-  let iteratorFinished = false;
+  let returned = false;
 
   // A null desiredSize (an errored stream) is unreachable: this stream never calls controller.error
   const hasDemand = (): boolean => (controller?.desiredSize ?? 0) > 0;
@@ -140,8 +146,11 @@ export function createEventStream<TData = Record<string, unknown>>(
     }
     signal?.removeEventListener('abort', close);
     wake();
-    if (iterator && !iteratorFinished) {
+    if (iterator && !returned) {
+      returned = true;
       try {
+        // The stream has no logger: a rejecting return() is swallowed so it
+        // never surfaces as an unhandled rejection
         void Promise.resolve(iterator.return?.()).catch(() => undefined);
       } catch {
         // A throwing return() must not block teardown
@@ -219,7 +228,6 @@ export function createEventStream<TData = Record<string, unknown>>(
       try {
         step = await iterator.next();
       } catch (error) {
-        iteratorFinished = true;
         sendError(error);
         finish();
         return;
@@ -228,7 +236,6 @@ export function createEventStream<TData = Record<string, unknown>>(
         return;
       }
       if (step.done) {
-        iteratorFinished = true;
         finish();
         return;
       }
