@@ -39,3 +39,11 @@ overrides:
   # GHSA-7mx3-vvmw-hjmv (high): prototype pollution in mergeDeep. Reaches us
   # via @nestjs/graphql and @graphql-tools/schema (nestjs package).
   '@graphql-tools/utils@<=12.0.0': '^12.0.1'
+
+# Dependencies allowed to run install scripts (pnpm 10 skips any not listed).
+# All three come in through the docs site's Angular build: native file
+# watching and the build cache's LMDB store and msgpack codec.
+onlyBuiltDependencies:
+  - '@parcel/watcher'
+  - lmdb
+  - msgpackr-extract
