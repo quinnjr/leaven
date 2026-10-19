@@ -16,8 +16,8 @@ name: Release
 # PR has merged into `develop`, cut `release/*` from `develop` and merge it
 # into `main`, which triggers the publish job.
 #
-# Each changesets/action invocation is given only ONE of `version:` /
-# `publish:` — that is what constrains it to a single behaviour per branch.
+# Each changesets/action invocation is given only ONE of `version-script:` /
+# `publish-script:` — that is what constrains it to a single behaviour per branch.
 # Giving it both (the previous configuration) is why a push to `main` opened a
 # version PR against `main`, bypassing `develop` entirely.
 
@@ -70,14 +70,15 @@ jobs:
       - name: Run tests
         run: pnpm test
 
+      # changesets/action@v2 pairs with @changesets/cli v3 (v1 pairs with
+      # CLI v2 and cannot read v3's publish output). The token defaults to
+      # this job's GITHUB_TOKEN.
       - name: Create version pull request
-        uses: changesets/action@v1
+        uses: changesets/action@v2
         with:
-          version: pnpm version-packages
-          commit: 'chore: version packages'
-          title: 'chore: version packages'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          version-script: pnpm version-packages
+          commit-message: 'chore: version packages'
+          pr-title: 'chore: version packages'
 
   publish:
     name: Publish packages (main)
@@ -129,9 +130,10 @@ jobs:
             exit 1
           }
 
+      # v2 reads CLI v3's publish output, then pushes the release tags and
+      # creates the GitHub releases. Under v1 + CLI v3 it published to npm
+      # but saw nothing, so no tags or releases were made (0.5.0).
       - name: Publish to npm
-        uses: changesets/action@v1
+        uses: changesets/action@v2
         with:
-          publish: pnpm release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          publish-script: pnpm release
