@@ -1,5 +1,19 @@
 # @leaven-graphql/leaven
 
+## 0.3.1
+
+### Patch Changes
+
+- Updated dependencies [507d308]
+- Updated dependencies [507d308]
+- Updated dependencies [507d308]
+- Updated dependencies [507d308]
+  - @leaven-graphql/core@0.4.1
+  - @leaven-graphql/http@0.3.1
+  - @leaven-graphql/sse@0.4.1
+  - @leaven-graphql/ws@0.3.2
+  - @leaven-graphql/plugins@0.2.6
+
 ## 0.3.0
 
 ### Minor Changes
