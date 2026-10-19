@@ -192,8 +192,10 @@ This is the route frameworks such as Knead take: they own routing and context
 creation and only need the stream.
 
 The stream applies backpressure (the iterator is only advanced as fast as the
-client reads), calls `iterator.return()` exactly once when the client
-disconnects or `signal` aborts, and masks errors thrown by the iterator by
+client reads), calls `iterator.return()` exactly once on every close (when the
+client disconnects, `signal` aborts, the iterator completes, or the iterator
+throws, so the source's subscriptions are always released; a throwing or
+rejecting `return()` is ignored), and masks errors thrown by the iterator by
 default; supply `formatError` to change that. Errors inside a result are left
 to `formatResult`.
 
