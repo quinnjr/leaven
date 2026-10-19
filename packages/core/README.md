@@ -435,9 +435,13 @@ isRequestRejection(response); // true: rejected before any resolver ran
 because it rejected the request before running any resolver: a syntax error, a
 parser limit (`maxTokens`, `maxDepth`, the analysis budget), validation, the
 complexity budget, an unknown or missing operation name, or a variable that
-fails to coerce. Such a request is safe to answer with a non-200 status and to
-retry. An error from a resolver, a subscribe resolver, `onExecute` or
-`onExecuted` is never marked, whatever its code. The check is identity-based:
+fails to coerce. Anything else that fails before execution starts (before
+`onExecute` is invoked) is marked too: a throw or rejection from the
+`onParse`, `onParsed`, `onValidate` or `onValidated` hooks, from a
+`complexityCalculator`, or from the document cache. Such a request is safe to
+answer with a non-200 status and to retry. An error from `onExecute`,
+`onExecuted`, a resolver, a subscribe resolver, or anything else raised once
+execution started is never marked, whatever its code. The check is identity-based:
 pass the object `execute()` or `subscribe()` returned, not a copy. The mark
 changes nothing on the wire.
 

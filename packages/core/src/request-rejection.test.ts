@@ -80,6 +80,24 @@ function executor(config: Partial<ExecutorConfig> = {}): LeavenExecutor {
   return new LeavenExecutor({ schema, ...config });
 }
 
+/** A document cache whose read (and optionally write) runs the given functions */
+function failingCache(
+  read: () => unknown,
+  write: () => unknown = () => undefined
+): ExecutorConfig['cache'] {
+  return {
+    get: read,
+    getWithValidation: read,
+    set: write,
+    setValidation: write,
+    setWithValidation: write,
+    has: () => false,
+    delete: () => false,
+    clear: () => {},
+    size: () => 0,
+  } as unknown as ExecutorConfig['cache'];
+}
+
 async function executeResponse(query: string, config: Partial<ExecutorConfig> = {}, extra = {}) {
   return (await executor(config).execute({ query, ...extra })).response;
 }
@@ -109,6 +127,61 @@ describe('isRequestRejection', () => {
       expect(response.errors?.length).toBeGreaterThan(0);
       expect(response.data).toBeUndefined();
       expect(isRequestRejection(response)).toBe(true);
+    });
+  });
+
+  describe('execute: failures before execution starts', () => {
+    test.each(['onParse', 'onParsed', 'onValidate', 'onValidated'] as const)(
+      'should mark a %s throw',
+      async (hook) => {
+        resolverRuns = 0;
+        const response = await executeResponse('mutation { record }', {
+          hooks: {
+            [hook]: () => {
+              throw new Error(`${hook} failed`);
+            },
+          },
+        });
+        expect(resolverRuns).toBe(0);
+        expect(response.data).toBeUndefined();
+        expect(response.errors?.length).toBe(1);
+        expect(isRequestRejection(response)).toBe(true);
+      }
+    );
+
+    test('should mark a rejecting async onParse hook', async () => {
+      const response = await executeResponse('{ hello }', {
+        hooks: { onParse: () => Promise.reject(new Error('denied')) },
+      });
+      expect(isRequestRejection(response)).toBe(true);
+    });
+
+    test('should mark a synchronous document cache read failure', async () => {
+      const response = await executeResponse('{ hello }', {
+        cache: failingCache(() => {
+          throw new Error('redis down');
+        }),
+      });
+      expect(response.errors?.length).toBe(1);
+      expect(isRequestRejection(response)).toBe(true);
+    });
+
+    test('should mark an asynchronous document cache read failure', async () => {
+      const response = await executeResponse('{ hello }', {
+        cache: failingCache(() => Promise.reject(new Error('redis down'))),
+      });
+      expect(response.errors?.length).toBe(1);
+      expect(isRequestRejection(response)).toBe(true);
+    });
+
+    test('should still run the request when a document cache write fails', async () => {
+      const response = await executeResponse('{ hello }', {
+        cache: failingCache(() => null, () => {
+          throw new Error('redis down');
+        }),
+      });
+      expect(response.data).toEqual({ hello: 'world' });
+      expect(isRequestRejection(response)).toBe(false);
     });
   });
 
@@ -150,26 +223,6 @@ describe('isRequestRejection', () => {
       expect(isRequestRejection(response)).toBe(false);
     });
 
-    test('should not mark a cache read failure', async () => {
-      const response = await executeResponse('{ hello }', {
-        cache: {
-          get: () => undefined,
-          getWithValidation: () => {
-            throw new Error('redis down');
-          },
-          set: () => {},
-          setValidation: () => {},
-          setWithValidation: () => {},
-          has: () => false,
-          delete: () => false,
-          clear: () => {},
-          size: () => 0,
-        } as unknown as ExecutorConfig['cache'],
-      });
-      expect(response.errors?.length).toBe(1);
-      expect(isRequestRejection(response)).toBe(false);
-    });
-
     test('should be identity-based: a copy of a rejection is not marked', async () => {
       const response = await executeResponse('{ nope }');
       expect(isRequestRejection(response)).toBe(true);
@@ -197,6 +250,29 @@ describe('isRequestRejection', () => {
         query: 'subscription ($from: Int!) { ticks(from: $from) }',
         variables: { from: 'one' },
       });
+      expect(isRequestRejection(result)).toBe(true);
+    });
+
+    test.each(['onParse', 'onParsed', 'onValidate', 'onValidated'] as const)(
+      'should mark a %s throw',
+      async (hook) => {
+        const result = await executor({
+          hooks: {
+            [hook]: () => {
+              throw new Error(`${hook} failed`);
+            },
+          },
+        }).subscribe({ query: 'subscription { ticks(from: 1) }' });
+        expect(Symbol.asyncIterator in result).toBe(false);
+        expect(isRequestRejection(result)).toBe(true);
+      }
+    );
+
+    test('should mark a document cache read failure', async () => {
+      const result = await executor({
+        cache: failingCache(() => Promise.reject(new Error('redis down'))),
+      }).subscribe({ query: 'subscription { ticks(from: 1) }' });
+      expect(Symbol.asyncIterator in result).toBe(false);
       expect(isRequestRejection(result)).toBe(true);
     });
 
