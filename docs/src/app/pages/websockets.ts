@@ -82,6 +82,25 @@ import { SeoService } from '../services/seo.service';
         <app-code-block [code]="authCode" title="auth.ts" />
       </section>
 
+      <!-- Allowed Origins -->
+      <section class="mb-12">
+        <h2 class="text-2xl font-semibold text-white mb-4">Allowed Origins</h2>
+        <p class="text-zinc-400 mb-4">
+          Browsers send cookies with a cross-site WebSocket handshake and no CORS preflight applies,
+          so by default only the server's own origin may connect: the <code class="text-green-400">Origin</code>
+          header's host:port must equal the request's <code class="text-green-400">Host</code> header
+          (case-insensitive, default ports normalised). A request with no <code class="text-green-400">Origin</code>
+          (a non-browser client) is always allowed. Behind a reverse proxy that rewrites
+          <code class="text-green-400">Host</code> (nginx does by default) every genuine browser is refused: forward the
+          public Host (<code class="text-green-400">proxy_set_header Host $host</code>) or list the public origin in
+          <code class="text-green-400">allowedOrigins</code>. <code class="text-green-400">LeavenServer</code> calls
+          <code class="text-green-400">isOriginAllowed(request)</code> before upgrading and answers 403
+          <code class="text-green-400">Forbidden</code> when it fails. List cross-origin browser clients in
+          <code class="text-green-400">allowedOrigins</code>, or use <code class="text-green-400">'*'</code>:
+        </p>
+        <app-code-block [code]="originsCode" title="origins.ts" />
+      </section>
+
       <!-- Error masking -->
       <section class="mb-12">
         <h2 class="text-2xl font-semibold text-white mb-4">Error Formatting</h2>
@@ -89,10 +108,11 @@ import { SeoService } from '../services/seo.service';
           <code class="text-green-400">errorFormatting</code> takes the same options as the HTTP
           transport. Errors thrown by <code class="text-green-400">onSubscribe</code>, the context
           factory or a source stream always go through <code class="text-green-400">formatError</code>,
-          so coded errors keep their <code class="text-green-400">extensions.code</code>; execution
+          so only a Leaven error or an error with a known non-<code class="text-green-400">INTERNAL_ERROR</code> code keeps its message and <code class="text-green-400">extensions.code</code> (an uncoded <code class="text-green-400">GraphQLError</code> is masked too); execution
           errors in <code class="text-green-400">next</code> payloads are re-formatted when the option
-          is set. Turn on <code class="text-green-400">maskErrors</code> in production so a failing
-          context factory never sends its raw message to the client:
+          is set. Thrown errors are masked by default, so a failing
+          context factory never sends its raw message to the client; set
+          <code class="text-green-400">maskErrors: false</code> to disable:
         </p>
         <app-code-block [code]="errorFormattingCode" title="masking.ts" />
       </section>
@@ -181,7 +201,8 @@ import { SeoService } from '../services/seo.service';
                 <td class="py-3 pr-4"><code class="text-green-400">WebSocketHandler</code></td>
                 <td class="py-3">
                   Handler class; <code class="text-green-400">getWebSocketConfig()</code> returns Bun's
-                  open/message/close callbacks
+                  open/message/close callbacks, <code class="text-green-400">isOriginAllowed(request)</code>
+                  checks an upgrade's Origin
                 </td>
               </tr>
               <tr class="border-b border-zinc-800/50">
@@ -308,8 +329,17 @@ const server = createServer({
 server.start();
 
 // Standalone Bun.serve instead? getWebSocketConfig() returns the
-// open/message/close callbacks Bun expects:
+// open/message/close callbacks Bun expects. Call
+// websocket.isOriginAllowed(request) before server.upgrade() yourself:
 // Bun.serve({ fetch, websocket: websocket.getWebSocketConfig() });`;
+
+  originsCode = `import { createWebSocketHandler } from '@leaven-graphql/ws';
+
+const websocket = createWebSocketHandler({
+  schema,
+  // Added to the server's own origin; '*' allows any origin
+  allowedOrigins: ['https://app.example.com'],
+});`;
 
   pubsubCode = `import { PubSub, createPubSub } from '@leaven-graphql/ws';
 
@@ -347,12 +377,11 @@ customPubSub.subscribe('user.#', onAnyUserEvent);
 const iterator = pubsub.asyncIterator('messages:new');
 const multi = pubsub.asyncIterator(['messages:new', 'messages:edited']);
 
-// Use in a subscribe resolver
-async function* messageAdded() {
-  for await (const event of iterator) {
-    yield event;
-  }
-}
+// Use in a subscribe resolver: return the iterator itself. Wrapping it in an
+// async function* would delay cancellation until the next event arrives.
+const messageAdded = {
+  subscribe: () => pubsub.asyncIterator('messages:new'),
+};
 
 // Introspection helpers
 pubsub.getSubscriberCount('messages:new');
@@ -437,10 +466,15 @@ const websocket = createWebSocketHandler({
 const websocket = createWebSocketHandler({
   schema,
   context: async () => ({ db: await getDatabase() }),
-  // Unexpected errors become "An unexpected error occurred"; Leaven errors and
-  // errors with a known code (FORBIDDEN, UNAUTHENTICATED, ...) pass through
-  errorFormatting: { maskErrors: process.env.NODE_ENV === 'production' },
-});`;
+  // Thrown errors are masked by default ("An unexpected error occurred");
+  // setting errorFormatting also masks errors resolvers raise in next
+  // payloads. Leaven errors and errors with a known code (FORBIDDEN,
+  // UNAUTHENTICATED, ...) pass through
+  errorFormatting: { maskErrors: true },
+});
+
+// Explicit opt-out: thrown errors reach the client with their raw message
+createWebSocketHandler({ schema, errorFormatting: { maskErrors: false } });`;
 
   protocolCode = `import {
   MessageType,

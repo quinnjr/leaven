@@ -146,6 +146,59 @@ describe('ContextBuilder', () => {
     });
   });
 
+  describe('build shared context', () => {
+    test('should let a later extension see an earlier extension result', async () => {
+      const builder = new ContextBuilder<void, TestContext>({
+        factory: () => ({ requestId: 'r', startTime: 0 }),
+      })
+        .extend(() => ({ userId: 'u1' }))
+        .extend((ctx) => ({ role: `role-of-${ctx.userId}` }));
+
+      const context = await builder.build();
+
+      expect(context.role).toBe('role-of-u1');
+    });
+
+    test('should return the same object the extensions received', async () => {
+      const seen: unknown[] = [];
+      const builder = new ContextBuilder<void, TestContext>({
+        factory: () => ({ requestId: 'r', startTime: 0 }),
+      })
+        .extend((ctx) => {
+          seen.push(ctx);
+          return { userId: 'u1' };
+        })
+        .extend((ctx) => {
+          seen.push(ctx);
+          return {};
+        });
+
+      const context = await builder.build();
+
+      expect(seen[0]).toBe(seen[1]);
+      expect(seen[0]).toBe(context);
+    });
+
+    test('should not mutate the factory result when extensions exist', async () => {
+      const base: TestContext = { requestId: 'r', startTime: 0 };
+      const builder = new ContextBuilder<void, TestContext>({ factory: () => base }).extend(
+        () => ({ userId: 'u1' })
+      );
+
+      const context = await builder.build();
+
+      expect(context).not.toBe(base);
+      expect(base.userId).toBeUndefined();
+    });
+
+    test('should return the factory result itself with zero extensions', async () => {
+      const base: TestContext = { requestId: 'r', startTime: 0 };
+      const builder = new ContextBuilder<void, TestContext>({ factory: () => base });
+
+      expect(await builder.build()).toBe(base);
+    });
+  });
+
   describe('withInput', () => {
     test('should transform input type', async () => {
       const builder = new ContextBuilder<{ userId: string }, TestContext>({

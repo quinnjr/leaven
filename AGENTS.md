@@ -567,6 +567,8 @@ already-serialized `GraphQLFormattedError`.
 
 ## Error Handling in Resolvers
 
+Developer-time misuse errors (for example registry setup mistakes, or asking for a context outside a request) may be a plain `Error`; request-time failures use the Leaven error classes.
+
 ```typescript
 const resolve = async (_, args, context) => {
   try {
@@ -592,8 +594,10 @@ const resolve = async (_, args, context) => {
 
 `ERROR_CODES` in `@leaven-graphql/errors` is the single source of truth: it maps
 every `ErrorCode` to its HTTP status, and `LeavenError` reads its `statusCode`
-from it unless one is passed explicitly. `buildResponse` in
-`@leaven-graphql/http` derives response statuses from the same registry.
+from it unless one is passed explicitly. `statusForResponse` in the same
+package derives response statuses from this registry; `buildResponse` in
+`@leaven-graphql/http` and the `@leaven-graphql/nestjs` driver and middleware
+all use it.
 
 Each error class carries a `statusCode` property for transports to use
 when mapping errors to HTTP responses. The reference mapping:

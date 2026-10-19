@@ -17,8 +17,8 @@ import { isRequestRejection, type GraphQLResponse } from '@leaven-graphql/core';
  * a syntax error, a parser limit, validation, complexity, operation selection
  * or variable coercion, and any other failure before execution starts, such
  * as a throw from the `onParse`, `onParsed`, `onValidate` or `onValidated`
- * hooks or a document cache failure). The classification is structural, not
- * by error code: a coded error such as a `ValidationError` thrown by a
+ * hooks; a document cache failure is a cache miss, not a failure). The
+ * classification is structural, not by error code: a coded error such as a `ValidationError` thrown by a
  * resolver, a subscribe resolver, or an `onExecute` or `onExecuted` hook ran
  * after execution started and is streamed. That is the safe default, because the graphql-sse client
  * retries every non-200 response and a retry would run the resolver again.

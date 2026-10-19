@@ -116,7 +116,10 @@ export interface ValidationResult {
   valid: boolean;
   /** Validation errors if invalid */
   errors: readonly GraphQLError[];
-  /** Warnings that don't prevent execution */
+  /**
+   * Reserved for non-fatal warnings. Currently never populated: always
+   * `undefined`. Nothing in Leaven reads it.
+   */
   warnings?: readonly GraphQLError[];
 }
 

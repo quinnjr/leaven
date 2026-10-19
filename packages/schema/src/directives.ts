@@ -194,6 +194,14 @@ function valueFromNode(value: ValueNode): unknown {
  * present. String, Int, Float, Boolean, Null, Enum, List and Object values
  * are all converted (lists and objects recursively); variable references —
  * which cannot occur in valid SDL directive positions — map to `undefined`.
+ *
+ * Only the arguments written in the SDL are returned, converted from the raw
+ * AST: the directive definition's `defaultValue`s are not applied, and values
+ * are converted by their literal kind rather than coerced against the
+ * declared argument types (an enum value comes back as its name string, and
+ * a custom scalar's `parseLiteral` is never called). Omitted arguments are
+ * absent from the result. Use graphql-js `getDirectiveValues(directive, node)`
+ * when defaults and coercion matter.
  */
 export function getDirectiveValues(
   field: GraphQLFieldConfig<unknown, unknown>,

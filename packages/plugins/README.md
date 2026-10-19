@@ -101,6 +101,9 @@ logger.info('GraphQL operation completed', {
   duration: '15.23ms',
 });
 
+// `duration` is 'unknown' when beforeExecute did not run, for example when
+// an earlier plugin short-circuited execution with a cached response
+
 // after an execution that produced errors
 logger.error('GraphQL operation completed with errors', {
   operationName: 'getUser',
@@ -200,6 +203,9 @@ const customComplexity = createComplexityPlugin({
 
 Throws `ComplexityError` (HTTP 400, `extensions.code: 'COMPLEXITY_LIMIT'`) when
 an operation exceeds `maxComplexity`, or when analysis exceeds the node budget.
+The operation `operationName` selects is scored; without a unique match (no
+name, or a name matching zero or several operations), the most complex
+operation is. Every operation shares one analysis budget.
 
 ### Caching Plugin
 
@@ -210,10 +216,17 @@ const cachingPlugin = createCachingPlugin({
   ttl: 60000,           // Cache TTL in ms (default: 60000)
   maxSize: 100,         // Max cached responses, LRU-evicted (default: 100)
   // Derives the cache key. Incorporate the caller's identity here so
-  // responses are never served across users.
+  // responses are never served across users. `keyFn` replaces the whole
+  // default key (query + operationName + variables), so include
+  // `operationName` and `variables` yourself.
   keyFn: (context) => {
     const userId = (context.context as { user?: { id: string } })?.user?.id ?? 'anonymous';
-    return `${userId}:${context.request.query}:${JSON.stringify(context.request.variables)}`;
+    return JSON.stringify([
+      userId,
+      context.request.query,
+      context.request.operationName ?? null,
+      context.request.variables ?? null,
+    ]);
   },
 });
 ```
@@ -226,6 +239,8 @@ data that is genuinely public:
 ```typescript
 const publicCache = createCachingPlugin({ ttl: 60000, allowSharedCache: true });
 ```
+
+Only `query` operations are cached; mutations and subscriptions always execute.
 
 A cache hit short-circuits `beforeExecute`, so resolvers — and any field-level
 authorization they perform — do not run.

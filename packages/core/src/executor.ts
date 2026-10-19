@@ -15,10 +15,11 @@ import {
   printSchema,
   type GraphQLSchema,
   type DocumentNode,
+  type OperationDefinitionNode,
   type GraphQLFormattedError,
   type ExecutionResult as GraphQLExecutionResult,
 } from 'graphql';
-import { ComplexityError, ErrorCode, isLeavenError } from '@leaven-graphql/errors';
+import { ComplexityError, ErrorCode, LeavenError, isLeavenError } from '@leaven-graphql/errors';
 
 import { DocumentCache, type DocumentCacheConfig, type CachedValidation, type IDocumentCache, resolveValue } from './cache';
 import {
@@ -162,15 +163,17 @@ function markRejection<T extends object>(response: T): T {
  *
  * That covers a syntax error, the parser limits (`maxTokens`, `maxDepth`,
  * the analysis budget), a validation failure, the complexity budget, an
- * unknown or missing operation name, and a variable that fails to coerce. It
- * also covers anything else that fails before execution starts, that is
- * before `onExecute` is invoked: a throw (or rejection) from the `onParse`,
- * `onParsed`, `onValidate` or `onValidated` hooks, from a
- * `complexityCalculator`, or from the document cache. No resolver ran, so the
- * request can safely be answered with a non-200 status and retried. Errors
- * from `onExecute`, `onExecuted`, resolvers, subscribe resolvers, and
- * anything else raised once execution started are never marked, whatever
- * code they carry.
+ * unknown or missing operation name, an operation type the schema has no root
+ * type for (a mutation or subscription sent to a schema without one), and a
+ * variable that fails to coerce. It also covers anything else that fails
+ * before execution starts, that is before `onExecute` is invoked: a throw (or
+ * rejection) from the `onParse`, `onParsed`, `onValidate` or `onValidated`
+ * hooks, or from a `complexityCalculator`. (A document cache failure is not
+ * one: a failed read is a cache miss, reported to `onCacheError`.) No resolver
+ * ran, so the request can safely be answered with a non-200 status and
+ * retried. Errors from `onExecute`, `onExecuted`, resolvers, subscribe
+ * resolvers, and anything else raised once execution started are never
+ * marked, whatever code they carry.
  *
  * The check is identity-based: pass the very `response` object that
  * `execute()` (inside its `ExecutionResult`) or `subscribe()` returned, not a
@@ -430,7 +433,8 @@ export class LeavenExecutor {
   }
 
   /**
-   * Report a background cache failure via the optional onCacheError hook.
+   * Report a cache failure (a read treated as a miss, or a background write)
+   * via the optional onCacheError hook.
    * Cache failures never fail the request, and neither may the hook itself.
    */
   private handleCacheError(error: unknown): void {
@@ -469,7 +473,14 @@ export class LeavenExecutor {
   }> {
     // Check cache first
     if (this.cache) {
-      const cached = await resolveValue(this.cache.getWithValidation(cacheKey));
+      // A cache failure is a miss, never a request failure; it is only
+      // reported through onCacheError.
+      let cached: Awaited<ReturnType<IDocumentCache['getWithValidation']>> | undefined;
+      try {
+        cached = await resolveValue(this.cache.getWithValidation(cacheKey));
+      } catch (error) {
+        this.handleCacheError(error);
+      }
       if (cached) {
         return {
           document: cached.document,
@@ -525,19 +536,13 @@ export class LeavenExecutor {
   private getCompiledQuery(
     query: string,
     document: DocumentNode,
+    operation: OperationDefinitionNode,
     operationName?: string
   ): { compiled: CompiledQuery; cached: boolean; admit?: () => void } {
-    // Resolve the operation BEFORE building a key. The operation name is
-    // client-chosen: keyed on it unchecked, every request with a fresh bogus
-    // name would mint a new entry. A name the document lacks (or an
-    // ambiguous selection) has no key and is left to compileQuery to reject.
-    const operation = getOperationAST(document, operationName);
-    if (!operation) {
-      return {
-        compiled: compileQuery(this.schema, document, operationName, this.compilerOptions),
-        cached: false,
-      };
-    }
+    // The operation is resolved BEFORE building a key (by the caller, once per
+    // request). The operation name is client-chosen: keyed on it unchecked,
+    // every request with a fresh bogus name would mint a new entry. A name the
+    // document lacks (or an ambiguous selection) is rejected by the caller.
 
     // Key by the raw query string (already in hand) rather than
     // re-serializing the AST, and by the name of the operation actually
@@ -647,10 +652,29 @@ export class LeavenExecutor {
     // client mistakes: reject them here as BAD_REQUEST, on every path (the
     // compiler and graphql-js would otherwise report them as an uncoded or
     // INTERNAL_ERROR failure, which a masking transport hides as a 500).
-    if (!getOperationAST(document, request.operationName)) {
+    const operation = getOperationAST(document, request.operationName);
+    if (!operation) {
       return {
         errors: [
           operationSelectionError(document, request.operationName).toGraphQLError().toJSON(),
+        ],
+      };
+    }
+
+    // A schema without the root type for this operation (a mutation sent to a
+    // query-only schema) is a client mistake. graphql 17 already rejects it
+    // during validation; graphql 16 validation passes it and execution would
+    // answer `{ data: null }` with an uncoded error, which a masking transport
+    // hides as a 500, so reject it here as BAD_REQUEST on every path.
+    if (!this.schema.getRootType(operation.operation)) {
+      return {
+        errors: [
+          new LeavenError(
+            `Schema does not support ${operation.operation} operations`,
+            ErrorCode.BAD_REQUEST
+          )
+            .toGraphQLError()
+            .toJSON(),
         ],
       };
     }
@@ -662,6 +686,7 @@ export class LeavenExecutor {
       const { compiled, cached, admit } = this.getCompiledQuery(
         request.query,
         document,
+        operation,
         request.operationName
       );
       admitCompiled = admit;
@@ -1040,9 +1065,14 @@ export class LeavenExecutor {
    */
   public async parse(query: string): Promise<DocumentNode> {
     if (this.cache) {
-      const cached = await resolveValue(this.cache.get(this.cacheKeyFor(query)));
-      if (cached) {
-        return cached;
+      try {
+        const cached = await resolveValue(this.cache.get(this.cacheKeyFor(query)));
+        if (cached) {
+          return cached;
+        }
+      } catch (error) {
+        // A cache failure is a miss, never a request failure.
+        this.handleCacheError(error);
       }
     }
     return parseDocument(query, this.parseOptions);

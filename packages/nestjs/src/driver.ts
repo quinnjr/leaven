@@ -8,10 +8,13 @@
 import { Injectable, type OnModuleInit, type OnModuleDestroy } from '@nestjs/common';
 import {
   GraphQLError,
+  OperationTypeNode,
+  getOperationAST,
   parse,
   print,
   type GraphQLSchema,
   type DocumentNode,
+  type GraphQLFormattedError as GraphQLJsFormattedError,
 } from 'graphql';
 import {
   LeavenExecutor,
@@ -21,12 +24,32 @@ import {
   type ExecutorConfig,
   type ParseOptions,
 } from '@leaven-graphql/core';
-import { ValidationError, formatError, isLeavenError } from '@leaven-graphql/errors';
+import {
+  ErrorCode,
+  LeavenError,
+  maskedErrorFor,
+  ValidationError,
+  formatError,
+  isLeavenError,
+  maskError,
+} from '@leaven-graphql/errors';
 import type {
   LeavenModuleOptions,
   GqlContext,
   GraphQLFormattedError,
 } from './types';
+import {
+  csrfBlockedError,
+  DEFAULT_BODY_READ_TIMEOUT_MS,
+  DEFAULT_MAX_BODY_SIZE,
+  isCsrfBlocked,
+  mediaType,
+  resolveCsrfRequestHeaders,
+  readBodyText,
+  validateGraphQLBody,
+  validateVariables,
+} from './request-body';
+import { httpExceptionCode, normalizeHttpException } from './http-exception';
 
 /**
  * Request handler result
@@ -66,6 +89,12 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
   private schema: GraphQLSchema | null = null;
   private readonly options: LeavenModuleOptions;
 
+  /**
+   * Header names that satisfy CSRF prevention, or `undefined` when
+   * `csrfPrevention` is `false`. Resolved (and validated) at construction.
+   */
+  private readonly csrfRequestHeaders: readonly string[] | undefined;
+
   /** Maximum number of memoized query analyses retained */
   private static readonly MAX_ANALYSIS_ENTRIES = 1000;
 
@@ -88,6 +117,7 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
 
   constructor(options: LeavenModuleOptions) {
     this.options = options;
+    this.csrfRequestHeaders = resolveCsrfRequestHeaders(options.csrfPrevention);
   }
 
   /**
@@ -171,6 +201,7 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
       maxDepth: this.options.maxDepth,
       parseOptions: this.getParseOptions(),
       introspection: this.isIntrospectionEnabled(),
+      formatExecutionError: (error) => this.formatExecutionError(error),
     };
 
     // Complexity is schema-dependent, so a new schema invalidates every
@@ -241,19 +272,107 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Apply a configured `formatError` to errors the executor reported.
+   * Whether unexpected errors are masked: in production only, and never when
+   * `includeStacktraceInErrorResponses` is set, since a masked error carries
+   * no stack to include.
+   */
+  private shouldMaskErrors(): boolean {
+    return (
+      process.env.NODE_ENV === 'production' &&
+      !(this.options.includeStacktraceInErrorResponses ?? false)
+    );
+  }
+
+  /**
+   * Serialize one execution error, masking it in production.
    *
-   * The formatter has an arity-1 contract, so it must not be handed to `map`
-   * directly (which would also pass the index and array).
+   * Installed as the executor's `formatExecutionError` hook, the last point at
+   * which `originalError` is still reachable, so the `maskError` rules of
+   * `@leaven-graphql/errors` apply exactly: an intentional Leaven error, or one
+   * carrying a known non-`INTERNAL_ERROR` code, keeps its message; anything
+   * else (a resolver's plain `Error`, an `INTERNAL_ERROR`) is replaced by the
+   * generic masked error. This is the same rule {@link formatThrownError}
+   * applies to errors thrown out of the executor. Unmasked errors are
+   * serialized exactly as the executor's default would (`toJSON()`).
+   *
+   * A NestJS `HttpException` (a resolver's `UnauthorizedException`, say) has
+   * no `extensions` for graphql-js to adopt, so it is first given its mapped
+   * {@link ErrorCode} — the same translation `LeavenGraphQLDriver` applies —
+   * and its own message. A known code then keeps it unmasked in production,
+   * instead of reaching the client as a masked `INTERNAL_ERROR`; a 5xx maps to
+   * `INTERNAL_ERROR` and is still masked.
+   */
+  private formatExecutionError(error: GraphQLError): GraphQLJsFormattedError {
+    const target = LeavenDriver.withHttpExceptionCode(error);
+    if (!this.shouldMaskErrors()) {
+      return target.toJSON();
+    }
+    return maskError(target, {
+      maskErrors: true,
+      formatter: (original, shouldMask) =>
+        shouldMask
+          ? maskedErrorFor(original)
+          : original.toJSON(),
+    });
+  }
+
+  /**
+   * `error` with a NestJS `HttpException` cause translated: its mapped
+   * `extensions.code` and `statusCode`, and the exception's message. Any other
+   * error is returned unchanged.
+   */
+  private static withHttpExceptionCode(error: GraphQLError): GraphQLError {
+    const original = error.originalError;
+    const mapped = httpExceptionCode(original);
+    if (mapped === undefined || original === undefined) {
+      return error;
+    }
+    return new GraphQLError(original.message, {
+      nodes: error.nodes,
+      source: error.source,
+      positions: error.positions,
+      path: error.path,
+      originalError: original,
+      extensions: { ...error.extensions, code: mapped.code, statusCode: mapped.status },
+    });
+  }
+
+  /**
+   * Finalize the errors the executor reported.
+   *
+   * Most were already serialized, and masked in production, by
+   * {@link formatExecutionError}. Errors the executor catches itself
+   * (`formatCaughtError`: a compiler throw, a pipeline `Error`) skip that hook
+   * and arrive with a raw message and either no code or `INTERNAL_ERROR`, so
+   * in production (see {@link shouldMaskErrors}) those are masked here, as in
+   * `LeavenGraphQLDriver`. Errors with a `path` are left to
+   * {@link formatExecutionError}; already-masked errors are unchanged.
+   * Then a configured `formatError` gets the last word. It has an arity-1
+   * contract, so it must not be handed to `map` directly (which would also
+   * pass the index and array).
    */
   private formatResultErrors(
     errors: readonly GraphQLFormattedError[] | undefined
   ): readonly GraphQLFormattedError[] | undefined {
     const formatErrorFn = this.options.formatError;
-    if (!errors || !formatErrorFn) {
+    const mask = this.shouldMaskErrors();
+    if (!errors || (!formatErrorFn && !mask)) {
       return errors;
     }
-    return errors.map((error) => formatErrorFn(error));
+    return errors.map((error) => {
+      const rawCode = error.extensions?.code;
+      // An error with a `path` came out of a resolver and was already
+      // serialized (and masked when unexpected) by formatExecutionError, which
+      // knows whether it was intentional. Only pipeline-caught errors, which
+      // carry no path, are unclassified here.
+      const masked =
+        mask &&
+        error.path === undefined &&
+        (rawCode === undefined || rawCode === ErrorCode.INTERNAL_ERROR)
+          ? (maskedErrorFor(error) as GraphQLFormattedError)
+          : error;
+      return formatErrorFn ? formatErrorFn(masked) : masked;
+    });
   }
 
   /**
@@ -275,11 +394,13 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
    * @param error - Anything thrown
    * @returns The formatted error to send to the client
    */
-  public formatThrownError(error: unknown): GraphQLFormattedError {
-    const isProduction = process.env.NODE_ENV === 'production';
+  public formatThrownError(thrown: unknown): GraphQLFormattedError {
+    // A NestJS `HttpException` (a guard-style `UnauthorizedException` thrown
+    // from a context factory or hook) keeps its mapped code and message.
+    const error = normalizeHttpException(thrown);
     const includeStack = this.options.includeStacktraceInErrorResponses ?? false;
     const formattedError = formatError(error, {
-      maskErrors: !isLeavenError(error) && isProduction && !includeStack,
+      maskErrors: !isLeavenError(error) && this.shouldMaskErrors(),
       includeStackTrace: includeStack,
     }) as GraphQLFormattedError;
 
@@ -333,10 +454,11 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
 
       return this.formatStream(result as unknown as AsyncIterableIterator<HandlerResult<TData>>);
     } catch (error) {
-      // `LeavenExecutor.subscribe` throws (rather than returning errors) on a
-      // syntax error, an over-depth document, or a failure inside a subscribe
-      // resolver. The documented contract is that only a missing executor
-      // rejects, so those surface as a `HandlerResult` here.
+      // `LeavenExecutor.subscribe` is documented never to throw: parse,
+      // validation and subscribe-resolver failures come back as `errors`.
+      // This catch is defensive — a broken cache or a replaced executor could
+      // still throw — and keeps this method's contract that only a missing
+      // executor rejects.
       return { errors: [this.formatThrownError(error)] } as HandlerResult<TData>;
     }
   }
@@ -351,7 +473,7 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
   private formatStream<TData>(
     iterator: AsyncIterableIterator<HandlerResult<TData>>
   ): AsyncIterableIterator<HandlerResult<TData>> {
-    if (!this.options.formatError) {
+    if (!this.options.formatError && !this.shouldMaskErrors()) {
       return iterator;
     }
     const format = (value: HandlerResult<TData>): HandlerResult<TData> =>
@@ -381,13 +503,71 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
 
   /**
    * Handle an HTTP request
+   *
+   * A malformed request is rejected by throwing a coded `LeavenError` whose
+   * `statusCode` the caller maps to the HTTP response:
+   * - a malformed payload: `ValidationError` (400);
+   * - a method other than GET or POST (HEAD, PUT, DELETE, PATCH, ...):
+   *   `BAD_REQUEST` with `statusCode` 405 and `extensions.allow` of
+   *   `'GET, POST'`, which should be sent as `Allow: GET, POST`. Checked
+   *   before anything is read, so such a request never executes — HEAD in
+   *   particular is CORS-safelisted, so letting it run a mutation would be a
+   *   CSRF hole;
+   * - a body over `maxBodySize`: `PAYLOAD_TOO_LARGE` (413);
+   * - a body not read within `bodyReadTimeoutMs`, or whose read fails (a
+   *   client abort, say): `BAD_REQUEST` (400);
+   * - a mutation sent over GET: `BAD_REQUEST` with `statusCode` 405 and
+   *   `extensions.allow` of `'POST'`, which should be sent as `Allow: POST`.
+   *   Mutations are not safe over GET (GraphQL over HTTP spec), so this is
+   *   checked before the context factory runs;
+   * - a POST blocked by `csrfPrevention` (a missing or CORS-safelisted
+   *   Content-Type and no preflight-forcing header): `BAD_REQUEST` (400),
+   *   checked before the body is read. This path only accepts JSON and
+   *   `application/graphql` bodies anyway; the check keeps every entry point
+   *   answering a simple cross-site POST the same way;
+   * - a POST whose `Content-Type` is not `application/json` or
+   *   `application/graphql`: `BAD_REQUEST` with `statusCode` 415, checked
+   *   after the CSRF check;
+   * - a `context` factory that throws a NestJS `HttpException`: a `LeavenError`
+   *   carrying the mapped code and the exception's status (an
+   *   `UnauthorizedException` is `UNAUTHENTICATED`, 401). A 5xx exception and
+   *   any other error are rethrown unchanged.
    */
   public async handleRequest(
     request: Request,
     response: Response
   ): Promise<HandlerResult> {
+    if (request.method !== 'GET' && request.method !== 'POST') {
+      throw new LeavenError(
+        `Method ${escapeLog(request.method, 16)} is not allowed: use GET or POST`,
+        ErrorCode.BAD_REQUEST,
+        { statusCode: 405, extensions: { allow: 'GET, POST' } }
+      );
+    }
+    if (
+      request.method === 'POST' &&
+      this.csrfRequestHeaders !== undefined &&
+      isCsrfBlocked(
+        request.headers.get('content-type'),
+        (name) => request.headers.get(name),
+        this.csrfRequestHeaders
+      )
+    ) {
+      throw csrfBlockedError();
+    }
     const body = await this.parseRequestBody(request);
-    const context = await this.createContext(request, response);
+    if (request.method === 'GET' && (await this.isMutation(body.query, body.operationName))) {
+      throw new LeavenError('Mutations can only be sent with POST', ErrorCode.BAD_REQUEST, {
+        statusCode: 405,
+        extensions: { allow: 'POST' },
+      });
+    }
+    let context: GqlContext;
+    try {
+      context = await this.createContext(request, response);
+    } catch (thrown) {
+      throw normalizeHttpException(thrown);
+    }
 
     return this.execute(
       body.query,
@@ -398,45 +578,70 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Whether the operation a request selects is a mutation.
+   *
+   * Parses under the executor's limits. A parse failure or an ambiguous
+   * operation is `false`, so that execution reports the real error.
+   */
+  private async isMutation(query: string, operationName?: string): Promise<boolean> {
+    if (!this.executor) {
+      return false;
+    }
+    try {
+      const document = await this.executor.parse(query);
+      return getOperationAST(document, operationName)?.operation === OperationTypeNode.MUTATION;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Parse the request body
    *
    * POST requests are dispatched on their content type: `application/json`
    * bodies carry `{ query, variables, operationName }`, and
    * `application/graphql` bodies (per the GraphQL-over-HTTP spec) carry the
-   * raw query string. Other methods read the operation from URL parameters.
+   * raw query string. GET reads the operation from URL parameters;
+   * `handleRequest` rejects every other method with a 405 before this runs.
+   * A POST body over `maxBodySize` is rejected with `PAYLOAD_TOO_LARGE`, and
+   * one not read within `bodyReadTimeoutMs` with `BAD_REQUEST`. Any other
+   * content type is a 415 `BAD_REQUEST`.
    */
   private async parseRequestBody(request: Request): Promise<{
     query: string;
     variables?: Record<string, unknown>;
     operationName?: string;
   }> {
-    const contentType = request.headers.get('content-type') ?? '';
+    const contentType = mediaType(request.headers.get('content-type'));
 
     if (request.method === 'POST') {
-      if (contentType.includes('application/json')) {
-        const body = await request.json() as Record<string, unknown>;
-        return {
-          query: body.query as string,
-          variables: body.variables as Record<string, unknown> | undefined,
-          operationName: body.operationName as string | undefined,
-        };
-      }
+      const maxBodySize = this.options.maxBodySize ?? DEFAULT_MAX_BODY_SIZE;
+      const timeoutMs = this.options.bodyReadTimeoutMs ?? DEFAULT_BODY_READ_TIMEOUT_MS;
 
-      if (contentType.includes('application/graphql')) {
-        const query = await request.text();
-        if (!query) {
-          throw new ValidationError('Query is required');
+      if (contentType === 'application/json') {
+        const text = await readBodyText(request, maxBodySize, timeoutMs);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          throw new ValidationError('Invalid JSON body');
         }
-        return { query };
+        return validateGraphQLBody(parsed);
       }
 
-      throw new ValidationError(
-        `Unsupported content type "${contentType ? escapeLog(contentType, 64) : '(none)'}": ` +
-          'use application/json or application/graphql'
+      if (contentType === 'application/graphql') {
+        // The body is the raw query string; only the query check applies.
+        return validateGraphQLBody({ query: await readBodyText(request, maxBodySize, timeoutMs) });
+      }
+
+      throw new LeavenError(
+        'Unsupported Content-Type: expected application/json or application/graphql',
+        ErrorCode.BAD_REQUEST,
+        { statusCode: 415 }
       );
     }
 
-    // GET (and other) requests carry the operation in URL query params
+    // GET requests carry the operation in URL query params
     const url = new URL(request.url);
     const query = url.searchParams.get('query');
     const variables = url.searchParams.get('variables');
@@ -448,13 +653,16 @@ export class LeavenDriver implements OnModuleInit, OnModuleDestroy {
 
     let parsedVariables: Record<string, unknown> | undefined;
     if (variables) {
+      let decoded: unknown;
       try {
-        parsedVariables = JSON.parse(variables) as Record<string, unknown>;
+        decoded = JSON.parse(variables);
       } catch {
         throw new ValidationError(
           'The "variables" query parameter contains malformed JSON'
         );
       }
+      // `null` means "no variables"; an array, number or string is rejected
+      parsedVariables = validateVariables(decoded);
     }
 
     return {

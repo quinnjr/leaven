@@ -4,11 +4,13 @@
  * Provides graphql-ws protocol handling over WebSocket for NestJS.
  *
  * Single-result operations (queries and mutations) are answered with one
- * `next` message followed by `complete`. Streaming `subscription` operations
- * are executed through the Leaven executor and each event is forwarded as a
- * `next` message until the stream ends, the client sends `complete`, or the
- * connection closes. Topic-keyed delivery driven by an external pub/sub
- * engine is available via `SubscriptionManager.registerSubscription` and
+ * `next` message followed by `complete`, or with a single `error` message
+ * when they fail before execution (parse, validation, complexity or depth).
+ * Streaming `subscription` operations are executed through the Leaven
+ * executor and each event is forwarded as a `next` message until the stream
+ * ends, the client sends `complete`, or the connection closes. Topic-keyed
+ * delivery driven by an external pub/sub engine is available via
+ * `SubscriptionManager.registerSubscription` and
  * `SubscriptionManager.publishToTopic`.
  *
  * TRANSPORT: this module speaks the protocol, it does NOT own a server. Two
@@ -49,6 +51,8 @@ import { escapeLog } from '@leaven-graphql/core';
 import { isValidOperationId } from '@leaven-graphql/ws';
 import { LeavenDriver, type HandlerResult } from './driver';
 import { wrapWithFilter, SUBSCRIPTION_FILTER_KEY } from './decorators';
+import { TopicIndex } from './topic-index';
+import { readHeader } from './request-body';
 import {
   LEAVEN_MODULE_OPTIONS,
   LEAVEN_DRIVER,
@@ -107,6 +111,43 @@ export interface SubscriptionSocket {
 }
 
 /**
+ * An upgrade request reduced to the headers
+ * {@link SubscriptionManager.isOriginAllowed} reads: a Fetch `Headers` or a
+ * Node-style header map.
+ */
+export interface UpgradeRequestLike {
+  readonly headers:
+    | { get(name: string): string | null }
+    | Readonly<Record<string, string | readonly string[] | undefined>>;
+}
+
+/**
+ * Normalise an origin for comparison: its scheme and host, lowercased and
+ * without the scheme's default port. A value that does not parse as a URL
+ * (the opaque origin `null`, say) is just trimmed and lowercased.
+ *
+ * Twin of `normalizeOrigin` in `packages/ws/src/handler.ts`.
+ */
+function normalizeOrigin(origin: string): string {
+  try {
+    const url = new URL(origin);
+    // `URL.origin` is `null` for non-special schemes; fall back to the parts.
+    return url.origin !== 'null' ? url.origin : `${url.protocol}//${url.host}`;
+  } catch {
+    return origin.trim().toLowerCase();
+  }
+}
+
+/** The `host[:port]` of a URL, or `undefined` when it does not parse. */
+function safeHost(url: string): string | undefined {
+  try {
+    return new URL(url).host;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Bun WebSocket handlers, shaped for `Bun.serve({ websocket })`.
  *
  * @see SubscriptionManager.getWebSocketConfig
@@ -149,6 +190,26 @@ export interface SubscriptionConfig {
    * @default 100
    */
   maxSubscriptionsPerConnection?: number;
+
+  /**
+   * Cross-origin browser origins allowed to open a socket, closing
+   * cross-site WebSocket hijacking (a browser attaches the user's cookies to
+   * a cross-site upgrade, and WebSockets are exempt from CORS).
+   *
+   * By default only the server's own origin is allowed: the `Origin` header's
+   * host and port must equal the upgrade request's `Host`. Each entry here
+   * (`'https://app.example.com'`, say) is allowed in addition; `'*'` allows
+   * every origin. Origins compare case-insensitively with default ports
+   * normalised. A request with no `Origin` header (a non-browser client) is
+   * always allowed.
+   *
+   * Checked by {@link SubscriptionManager.isOriginAllowed}, which the upgrade
+   * route should call, and enforced again when a socket is opened with its
+   * upgrade request (closed with `4403 Forbidden`).
+   *
+   * @default only the server's own origin
+   */
+  allowedOrigins?: readonly string[] | '*';
 
   /**
    * Context factory for subscription connections
@@ -256,7 +317,10 @@ export interface ExecutionArgs {
  * Manages WebSocket connections speaking the graphql-ws protocol.
  *
  * Single-result operations (queries and mutations) receive one `next`
- * message followed by `complete`. Streaming `subscription` operations are
+ * message followed by `complete`, or one `error` message when they fail
+ * before execution. While in flight they are tracked under their operation
+ * id like streams, so a reused id closes with 4409 and they count against
+ * `maxSubscriptionsPerConnection`. Streaming `subscription` operations are
  * executed through the driver and each event is forwarded as a `next`
  * message; the stream is cancelled when the client sends `complete` or the
  * connection closes. Server-side, topic-keyed delivery driven by an external
@@ -276,13 +340,27 @@ export interface ExecutionArgs {
 @Injectable()
 export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
   private connections = new Map<SubscriptionSocket, ConnectionState>();
+  /**
+   * Topic -> subscriptions registered for it via {@link registerSubscription},
+   * so {@link publishToTopic} touches only the subscribers of that topic
+   * instead of scanning every connection. Every removal from
+   * `ConnectionState.subscriptions` goes through {@link removeSubscription},
+   * which keeps it in sync.
+   */
+  private readonly topicIndex = new TopicIndex<TopicSubscriber>();
   private config: SubscriptionConfig;
+  /** The listed `allowedOrigins`, normalised once (empty when unset or `'*'`). */
+  private readonly listedOrigins: ReadonlySet<string>;
 
   constructor(
     @Inject(LEAVEN_MODULE_OPTIONS) private readonly options: LeavenModuleOptions,
     @Inject(LEAVEN_DRIVER) private readonly driver: LeavenDriver
   ) {
     this.config = this.normalizeConfig();
+    const allowedOrigins = this.config.allowedOrigins;
+    this.listedOrigins = new Set(
+      Array.isArray(allowedOrigins) ? allowedOrigins.map(normalizeOrigin) : []
+    );
   }
 
   /**
@@ -322,6 +400,7 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
     // `handleClose` empties the map entry by entry; this only catches sockets
     // registered concurrently with the teardown above.
     this.connections.clear();
+    this.topicIndex.clear();
   }
 
   /**
@@ -361,6 +440,71 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Whether a WebSocket upgrade request's `Origin` may open a socket, per
+   * `subscriptions.allowedOrigins`.
+   *
+   * Call it in the upgrade route before `server.upgrade()` and answer `403`
+   * when it returns `false`. A browser sends the user's cookies with a
+   * cross-site upgrade and WebSockets are not covered by CORS, so without
+   * this check any site could open an authenticated socket.
+   *
+   * Allowed: a request with no `Origin` header (a non-browser client); an
+   * `Origin` whose host and port equal the request's `Host` (falling back to
+   * the host of `request.url`); an `Origin` listed in `allowedOrigins`; any
+   * `Origin` when `allowedOrigins` is `'*'`. Comparison is case-insensitive
+   * and normalises default ports (`https://a.test:443` is `https://a.test`).
+   *
+   * Twin of `WebSocketHandler.isOriginAllowed` in
+   * `packages/ws/src/handler.ts`: the semantics must stay in step.
+   *
+   * @param request - The upgrade request, or anything exposing its headers as
+   *   a Fetch `Headers` or a Node-style header map
+   * @returns `true` when the socket may be opened
+   *
+   * @example
+   * ```typescript
+   * if (!manager.isOriginAllowed(request)) {
+   *   return new Response('Forbidden', { status: 403 });
+   * }
+   * ```
+   */
+  public isOriginAllowed(request: Request | UpgradeRequestLike): boolean {
+    const origin = readHeader(request.headers, 'origin');
+    const allowed = this.config.allowedOrigins;
+    if (origin === undefined || allowed === '*') {
+      return true;
+    }
+
+    const listed = this.listedOrigins;
+    let parsed: URL;
+    try {
+      parsed = new URL(origin);
+    } catch {
+      // An opaque or malformed origin (e.g. `null`) can only be listed.
+      return listed.has(normalizeOrigin(origin));
+    }
+    if (listed.has(normalizeOrigin(origin))) {
+      return true;
+    }
+
+    const host =
+      readHeader(request.headers, 'host') ??
+      ('url' in request && typeof request.url === 'string' ? safeHost(request.url) : undefined);
+    if (host === undefined || host === '') {
+      return false;
+    }
+    // Resolve Host against the origin's scheme so the URL parser lowercases
+    // it and drops that scheme's default port (`example.com:443` under https).
+    let serverHost: string;
+    try {
+      serverHost = new URL(`${parsed.protocol}//${host}`).host;
+    } catch {
+      return false;
+    }
+    return parsed.host === serverHost;
+  }
+
+  /**
    * Bun WebSocket handlers for `Bun.serve({ websocket })`.
    *
    * Mirrors `@leaven-graphql/ws`'s `WebSocketHandler.getWebSocketConfig` so
@@ -369,7 +513,8 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
    * The returned handlers cover the socket lifecycle ONLY. The upgrade itself
    * is not — and cannot be — done here: `server.upgrade(request)` needs the
    * `Server` instance, which this manager never sees. Route it yourself at
-   * {@link getPath}.
+   * {@link getPath}. These handlers never see the upgrade request, so the
+   * route must check {@link isOriginAllowed} itself.
    *
    * @example
    * ```typescript
@@ -378,6 +523,10 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
    * Bun.serve({
    *   fetch(request, server) {
    *     if (new URL(request.url).pathname === manager.getPath()) {
+   *       // Refuse cross-site WebSocket hijacking before upgrading.
+   *       if (!manager.isOriginAllowed(request)) {
+   *         return new Response('Forbidden', { status: 403 });
+   *       }
    *       // The manager does NOT call this for you.
    *       if (server.upgrade(request)) return undefined;
    *     }
@@ -421,7 +570,9 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
    *
    * @param socket - The freshly opened socket
    * @param request - The upgrade request, exposed to the `context` and
-   *   `onConnect` hooks
+   *   `onConnect` hooks. When given, its `Origin` is checked with
+   *   {@link isOriginAllowed} and a disallowed socket is closed with
+   *   `4403 Forbidden`
    */
   public handleOpen(socket: SubscriptionSocket, request?: Request): void {
     this.openConnection(socket, request);
@@ -433,9 +584,15 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
    * Use this when the socket dispatches events (`addEventListener`) — the
    * manager wires `message`/`close`/`error` itself. Bun's server-side socket
    * does NOT: use {@link handleOpen} and friends for that shape.
+   *
+   * When `request` is given, its `Origin` is checked with
+   * {@link isOriginAllowed}; a disallowed socket is closed with
+   * `4403 Forbidden` and no listeners are attached.
    */
   public async handleConnection(socket: WebSocket, request?: Request): Promise<void> {
-    this.openConnection(socket, request);
+    if (!this.openConnection(socket, request)) {
+      return;
+    }
 
     socket.addEventListener('message', (event) => {
       void this.handleMessage(socket, event.data as string).catch((error: unknown) =>
@@ -461,7 +618,18 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
    * matter which entry point the socket arrived through; only the event
    * wiring differs.
    */
-  private openConnection(socket: SubscriptionSocket, request?: Request): ConnectionState {
+  private openConnection(
+    socket: SubscriptionSocket,
+    request?: Request
+  ): ConnectionState | undefined {
+    // Enforced here as well as in the upgrade route, so a caller that skipped
+    // `isOriginAllowed` there is still protected. The socket is never
+    // registered, so its frames and close are ignored.
+    if (request !== undefined && !this.isOriginAllowed(request)) {
+      socket.close(4403, 'Forbidden');
+      return undefined;
+    }
+
     const state: ConnectionState = {
       socket,
       request: request,
@@ -621,8 +789,10 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
       if (this.connections.get(socket) !== state) {
         return;
       }
+      // graphql-ws: a rejected `connection_init` is 4403 Forbidden. 4401
+      // Unauthorized is reserved for a `subscribe` before `connection_ack`.
       if (!allowed) {
-        socket.close(4401, 'Unauthorized');
+        socket.close(4403, 'Forbidden');
         return;
       }
     }
@@ -654,9 +824,10 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
    * Handle subscribe message.
    *
    * Single-result operations (queries and mutations) are answered with a
-   * `next` message followed by `complete`. Streaming `subscription`
-   * operations are handed to {@link startStream}, which forwards each event
-   * as it arrives.
+   * `next` message followed by `complete`, or with one `error` message when
+   * they fail before execution. Every operation claims its id while in
+   * flight. Streaming `subscription` operations are handed to
+   * {@link startStream}, which forwards each event as it arrives.
    */
   private async handleSubscribe(
     socket: SubscriptionSocket,
@@ -687,21 +858,28 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    // Claim the operation id synchronously for streaming operations, before
-    // any await: a `complete` or close arriving during setup must be able to
-    // cancel the stream, and a second `subscribe` reusing the id must lose.
-    const streaming = this.isSubscriptionOperation(
-      message.payload.query,
-      message.payload.operationName
-    );
-    let registration: SubscriptionState | undefined;
-    if (streaming) {
-      registration = { clientId: message.id };
-      state.subscriptions.set(message.id, registration);
-    }
+    // Claim the operation id synchronously for EVERY operation, before any
+    // await: a `complete` or close arriving during setup must be able to
+    // cancel it, a second `subscribe` reusing the id must lose (4409), and an
+    // in-flight query or mutation counts against
+    // maxSubscriptionsPerConnection exactly like a stream.
+    const registration: SubscriptionState = { clientId: message.id };
+    state.subscriptions.set(message.id, registration);
+    const owns = (): boolean => state.subscriptions.get(message.id) === registration;
+    const release = (): void => {
+      // Identity, not presence: a later subscribe may own the id now.
+      if (owns()) {
+        this.removeSubscription(state, message.id);
+      }
+    };
 
     // Execute the operation; failures are contained to this operation id.
     try {
+      const streaming = await this.isSubscriptionOperation(
+        message.payload.query,
+        message.payload.operationName
+      );
+
       // Call onSubscribe callback
       if (this.config.onSubscribe && state.context) {
         await this.config.onSubscribe(state.context, message);
@@ -712,10 +890,11 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
         // Release the id claimed above before answering. Returning without
         // releasing leaves a phantom entry that makes any retry with the same
         // id (clients reuse "1", "2", …) close the whole connection with 4409
-        // and counts against maxSubscriptionsPerConnection forever. Identity
-        // check matches the `catch` below: a later subscribe may own it now.
-        if (registration && state.subscriptions.get(message.id) === registration) {
-          state.subscriptions.delete(message.id);
+        // and counts against maxSubscriptionsPerConnection forever.
+        const owned = owns();
+        release();
+        if (!owned) {
+          return;
         }
         this.sendError(socket, message.id, 'Schema not available');
         return;
@@ -750,7 +929,7 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
         args = await this.config.onOperation(state.context, message, args);
       }
 
-      if (registration) {
+      if (streaming) {
         await this.startStream(socket, state, message.id, args, registration);
         return;
       }
@@ -763,6 +942,22 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
         args.operationName
       );
 
+      // The client completed the operation (or the connection closed) while
+      // it ran: it no longer wants the result.
+      if (!owns()) {
+        return;
+      }
+      release();
+
+      // A result with no `data` at all failed before execution (parse,
+      // validation, complexity or depth). graphql-ws reports such request
+      // errors with a single `error` frame, as the streaming path does; an
+      // execution result (even `data: null`) is a `next` + `complete`.
+      if (result.data === undefined && result.errors?.length) {
+        this.sendErrors(socket, message.id, result.errors);
+        return;
+      }
+
       this.send(socket, {
         id: message.id,
         type: 'next',
@@ -770,11 +965,14 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
       });
       this.send(socket, { id: message.id, type: 'complete' });
     } catch (error) {
-      // Release the id claimed above so the client may retry it, but only if
-      // this registration still owns it — a later subscribe may have reused
-      // the id. A stream that started owns its teardown in `pumpStream`.
-      if (registration && state.subscriptions.get(message.id) === registration) {
-        state.subscriptions.delete(message.id);
+      // Release the id claimed above so the client may retry it. A stream
+      // that started owns its teardown in `pumpStream`. If the id was
+      // completed (and possibly reused) meanwhile, this run is stale and must
+      // not report to the client, matching the success path.
+      const owned = owns();
+      release();
+      if (!owned) {
+        return;
       }
 
       // Formatted and masked exactly as the driver formats a thrown error: a
@@ -810,9 +1008,11 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
 
     // A non-iterable result means the operation failed to parse or validate.
     if (!(Symbol.asyncIterator in result)) {
-      if (state.subscriptions.get(id) === registration) {
-        state.subscriptions.delete(id);
+      if (state.subscriptions.get(id) !== registration) {
+        // Completed or reused during `subscribe`: stale, so report nothing.
+        return;
       }
+      this.removeSubscription(state, id);
       const errors = result.errors ?? [{ message: 'Subscription failed' }];
       this.send(socket, { id, type: 'error', payload: [...errors] });
       return;
@@ -836,7 +1036,7 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
     // connection — defeating the per-operation isolation above.
     void this.pumpStream(socket, state, id, registration, iterator).catch((error) => {
       console.error(`Subscription pump failed for operation ${escapeLog(id)}:`, error);
-      state.subscriptions.delete(id);
+      this.removeSubscription(state, id);
     });
   }
 
@@ -876,7 +1076,7 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
       }
     } finally {
       if (owns()) {
-        state.subscriptions.delete(id);
+        this.removeSubscription(state, id);
       }
     }
   }
@@ -938,16 +1138,31 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
   /**
    * Determine whether a query string is a streaming `subscription` operation.
    *
+   * With an executor available the document is parsed through
+   * `LeavenExecutor.parse`, which applies the executor's parser limits and
+   * reuses a cached document when one exists (it reads the cache but does
+   * not populate it). Without one (the driver has not been given a schema
+   * yet) the query is parsed here under the same `parseOptions`.
+   *
    * Parse failures return `false` so that syntax errors surface through the
    * normal execution/error path instead of being masked here. That includes
-   * an exceeded `parseOptions.maxTokens`: the parse here applies the same
+   * an exceeded `parseOptions.maxTokens`: either parse applies the same
    * token budget as the executor (default 10000), so an oversized document is
    * never lexed in full, and the executor then reports the limit.
    */
-  private isSubscriptionOperation(query: string, operationName?: string): boolean {
+  private async isSubscriptionOperation(
+    query: string,
+    operationName?: string
+  ): Promise<boolean> {
     try {
-      const { graphqlOptions, maxTokens } = this.driver.getParseOptions();
-      const document = parse(query, { ...graphqlOptions, maxTokens });
+      const executor = this.driver.getExecutor();
+      let document: DocumentNode;
+      if (executor) {
+        document = await executor.parse(query);
+      } else {
+        const { graphqlOptions, maxTokens } = this.driver.getParseOptions();
+        document = parse(query, { ...graphqlOptions, maxTokens });
+      }
       return getOperationAST(document, operationName)?.operation === 'subscription';
     } catch {
       return false;
@@ -966,7 +1181,7 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
     if (subscription) {
       // Delete first: `pumpStream` treats a missing id as "cancelled" and
       // stops emitting, including for an event already in flight.
-      state.subscriptions.delete(message.id);
+      this.removeSubscription(state, message.id);
       await this.closeIterator(subscription.iterator);
 
       if (this.config.onComplete && state.context) {
@@ -1005,8 +1220,13 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
 
     // Cancel in-flight streams before dropping the connection, so resolver
     // generators run their cleanup instead of being left suspended.
-    const subscriptions = [...state.subscriptions.values()];
-    state.subscriptions.clear();
+    const subscriptions: SubscriptionState[] = [];
+    for (const id of [...state.subscriptions.keys()]) {
+      const subscription = this.removeSubscription(state, id);
+      if (subscription) {
+        subscriptions.push(subscription);
+      }
+    }
     this.connections.delete(ws);
 
     await Promise.all(subscriptions.map((s) => this.closeIterator(s.iterator)));
@@ -1102,8 +1322,39 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
       return false;
     }
 
-    state.subscriptions.set(clientId, { clientId, topic, context });
+    const subscription: SubscriptionState = { clientId, topic, context };
+    const indexEntry: TopicSubscriber = { state, subscription };
+    subscription.indexEntry = indexEntry;
+    state.subscriptions.set(clientId, subscription);
+    this.topicIndex.add(topic, indexEntry);
     return true;
+  }
+
+  /**
+   * Remove an operation from its connection's subscriptions and, for a topic
+   * subscription, from {@link topicIndex}.
+   *
+   * The ONLY way an entry leaves `ConnectionState.subscriptions`: routing
+   * every removal through here is what keeps the topic index in sync. The
+   * removal is unconditional; callers that must not evict a successor
+   * registration under a reused id check identity first.
+   *
+   * @returns The removed subscription, or `undefined` if the id was not
+   *   registered
+   */
+  private removeSubscription(
+    state: ConnectionState,
+    id: string
+  ): SubscriptionState | undefined {
+    const subscription = state.subscriptions.get(id);
+    if (!subscription) {
+      return undefined;
+    }
+    state.subscriptions.delete(id);
+    if (subscription.topic !== undefined && subscription.indexEntry) {
+      this.topicIndex.remove(subscription.topic, subscription.indexEntry);
+    }
+    return subscription;
   }
 
   /**
@@ -1120,16 +1371,29 @@ export class SubscriptionManager implements OnModuleInit, OnModuleDestroy {
    * @param payload - Value delivered as the `data` of the `next` message
    */
   public publishToTopic(topic: string, payload: unknown): void {
-    for (const [socket, state] of this.connections) {
-      for (const subscription of state.subscriptions.values()) {
-        if (subscription.topic === topic) {
-          this.send(socket, {
-            id: subscription.clientId,
-            type: 'next',
-            payload: { data: payload },
-          });
-        }
+    const subscribers = this.topicIndex.subscribers(topic);
+    if (!subscribers) {
+      return;
+    }
+    // Snapshot: a synchronous send may close a socket and mutate the set.
+    for (const entry of [...subscribers]) {
+      const { state, subscription } = entry;
+      // Only deliver to a registration that is still live. An entry that
+      // outlived it means some removal bypassed `removeSubscription`: warn so
+      // the bug is visible, then drop the stale entry.
+      if (state.subscriptions.get(subscription.clientId) !== subscription) {
+        console.warn(
+          `Stale topic index entry for operation ${escapeLog(subscription.clientId)} ` +
+            `on topic ${escapeLog(topic)}; a subscription was removed without being unindexed.`
+        );
+        this.topicIndex.remove(topic, entry);
+        continue;
       }
+      this.send(state.socket, {
+        id: subscription.clientId,
+        type: 'next',
+        payload: { data: payload },
+      });
     }
   }
 
@@ -1211,6 +1475,20 @@ interface SubscriptionState {
   context?: GqlContext;
   /** Live iterator for an executed subscription, cancelled on teardown. */
   iterator?: AsyncIterableIterator<HandlerResult>;
+  /**
+   * This subscription's entry in `SubscriptionManager.topicIndex`, kept so
+   * removal is a direct `Set.delete`. Set only alongside {@link topic}.
+   */
+  indexEntry?: TopicSubscriber;
+}
+
+/**
+ * One entry of `SubscriptionManager.topicIndex`: a topic subscription and the
+ * connection that owns it.
+ */
+interface TopicSubscriber {
+  state: ConnectionState;
+  subscription: SubscriptionState;
 }
 
 /**

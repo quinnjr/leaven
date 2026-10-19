@@ -18,6 +18,7 @@ import {
   LeavenError,
   formatError,
   fromFormattedError,
+  withMaskingDefault,
   type ErrorMaskingOptions,
 } from '@leaven-graphql/errors';
 
@@ -84,11 +85,12 @@ export interface SubscriptionManagerConfig {
    * `errorFormatting`.
    *
    * Errors thrown while subscribing or by a source stream always go through
-   * `formatError(error, errorFormatting)`, so a `GraphQLError` or
-   * `LeavenError` keeps its `extensions.code` and anything else is reported
-   * as `INTERNAL_ERROR`. Execution errors the executor already serialised
+   * `formatError(error, errorFormatting)`, so a `LeavenError` or an
+   * error with a known non-`INTERNAL_ERROR` code keeps its message and
+   * `extensions.code`, and anything else (an uncoded `GraphQLError` included)
+   * is masked as `INTERNAL_ERROR`. Execution errors the executor already serialised
    * (`errors` of a result or of a stream event) are re-formatted only when
-   * this is set. Nothing is masked unless `maskErrors` is `true`.
+   * this is set. Thrown errors are masked unless `maskErrors` is `false`.
    */
   errorFormatting?: ErrorMaskingOptions;
 }
@@ -113,6 +115,7 @@ export class SubscriptionManager {
   private readonly subscriptionTimeout: number;
   private readonly logger: WebSocketLogger;
   private readonly errorFormatting?: ErrorMaskingOptions;
+  private readonly maskingOptions: ErrorMaskingOptions;
 
   constructor(config: SubscriptionManagerConfig) {
     this.executor =
@@ -124,6 +127,7 @@ export class SubscriptionManager {
     this.subscriptionTimeout = config.subscriptionTimeout ?? 0;
     this.logger = config.logger ?? console;
     this.errorFormatting = config.errorFormatting;
+    this.maskingOptions = withMaskingDefault(config.errorFormatting);
   }
 
   /**
@@ -131,7 +135,7 @@ export class SubscriptionManager {
    * HTTP transport formats an error thrown outside execution.
    */
   private formatThrown(error: unknown): GraphQLFormattedError[] {
-    return [formatError(error, this.errorFormatting)];
+    return [formatError(error, this.maskingOptions)];
   }
 
   /**
@@ -250,8 +254,11 @@ export class SubscriptionManager {
       if (!(Symbol.asyncIterator in Object(result))) {
         subscription.status = 'error';
         const { errors } = this.formatResponse(result as GraphQLResponse);
-        onError(errors ?? this.formatThrown(new Error('Subscription failed')));
-        this.unsubscribe(connectionId, subscriptionId);
+        this.reportSetupError(
+          subscription,
+          onError,
+          errors ?? this.formatThrown(new Error('Subscription failed'))
+        );
         return subscription;
       }
 
@@ -309,7 +316,15 @@ export class SubscriptionManager {
         onNext,
         onComplete,
         onError
-      );
+      ).catch((error) => {
+        // Fire-and-forget: a throwing onComplete/onError callback must not
+        // become an unhandled rejection
+        this.logger.error(
+          `Subscription consumer failed (connection ${escapeLog(connectionId)}, ` +
+            `subscription ${escapeLog(subscriptionId)}):`,
+          error
+        );
+      });
 
       return subscription;
     } catch (error) {
@@ -319,9 +334,31 @@ export class SubscriptionManager {
         return subscription;
       }
       subscription.status = 'error';
-      onError(this.formatThrown(error));
-      this.unsubscribe(connectionId, subscriptionId);
+      this.reportSetupError(subscription, onError, this.formatThrown(error));
       return subscription;
+    }
+  }
+
+  /**
+   * Deliver a setup failure to `onError`, then release the subscription. A
+   * throwing callback is logged rather than rethrown, so it can neither
+   * trigger a second `onError` nor leave the subscription registered.
+   */
+  private reportSetupError(
+    subscription: Subscription,
+    onError: (errors: readonly { message: string }[]) => void,
+    errors: readonly { message: string }[]
+  ): void {
+    try {
+      onError(errors);
+    } catch (callbackError) {
+      this.logger.error(
+        `Subscription consumer failed (connection ${escapeLog(subscription.connectionId)}, ` +
+          `subscription ${escapeLog(subscription.id)}):`,
+        callbackError
+      );
+    } finally {
+      this.unsubscribe(subscription.connectionId, subscription.id);
     }
   }
 
@@ -345,6 +382,7 @@ export class SubscriptionManager {
     onError: (errors: readonly { message: string }[]) => void
   ): Promise<void> {
     const { connectionId, id: subscriptionId } = subscription;
+    let failure: { error: unknown } | undefined;
     try {
       for await (const result of iterator) {
         // Identity, not just the id: a reused id belongs to a newer
@@ -355,18 +393,26 @@ export class SubscriptionManager {
 
         onNext(this.formatResponse(result));
       }
+    } catch (error) {
+      failure = { error };
+    }
 
-      if (this.isCurrent(subscription)) {
+    if (!this.isCurrent(subscription)) {
+      return;
+    }
+
+    // The callbacks may throw; the subscription (and its timer) must still
+    // be torn down
+    try {
+      if (failure) {
+        subscription.status = 'error';
+        onError(this.formatThrown(failure.error));
+      } else {
         subscription.status = 'completed';
         onComplete();
-        this.unsubscribe(connectionId, subscriptionId);
       }
-    } catch (error) {
-      if (this.isCurrent(subscription)) {
-        subscription.status = 'error';
-        onError(this.formatThrown(error));
-        this.unsubscribe(connectionId, subscriptionId);
-      }
+    } finally {
+      this.unsubscribe(connectionId, subscriptionId);
     }
   }
 

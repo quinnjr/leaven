@@ -256,6 +256,62 @@ describe('SubscriptionManager', () => {
       expect(manager.subscriptionCount).toBe(0);
     });
 
+    test('should call a throwing onError once and release the subscription on an error result', async () => {
+      const logged: unknown[][] = [];
+      const manager = new SubscriptionManager({
+        schema: createTestSchema(),
+        logger: { error: (...args: unknown[]) => logged.push(args), warn: () => {} },
+      });
+      let calls = 0;
+
+      await manager.subscribe(
+        'conn-1',
+        'sub-1',
+        { query: 'subscription { nonexistent }' },
+        undefined,
+        () => {},
+        () => {},
+        () => {
+          calls++;
+          throw new Error('callback failed');
+        }
+      );
+
+      expect(calls).toBe(1);
+      expect(manager.getSubscription('conn-1', 'sub-1')).toBeUndefined();
+      expect(manager.subscriptionCount).toBe(0);
+      expect(String(logged[0]![0])).toMatch(/Subscription consumer failed/);
+    });
+
+    test('should call a throwing onError once and release the subscription when setup throws', async () => {
+      const manager = new SubscriptionManager({
+        schema: createTestSchema(),
+        logger: { error: () => {}, warn: () => {} },
+      });
+      (manager as unknown as { executor: { subscribe: () => never } }).executor.subscribe =
+        () => {
+          throw new Error('executor exploded');
+        };
+      let calls = 0;
+
+      await manager.subscribe(
+        'conn-1',
+        'sub-1',
+        { query: 'subscription { forever }' },
+        undefined,
+        () => {},
+        () => {},
+        () => {
+          calls++;
+          throw new Error('callback failed');
+        }
+      );
+
+      expect(calls).toBe(1);
+      expect(manager.getSubscription('conn-1', 'sub-1')).toBeUndefined();
+      expect(manager.subscriptionCount).toBe(0);
+    });
+
     test('should throw when max subscriptions per connection reached', async () => {
       const manager = new SubscriptionManager({
         schema: createTestSchema(),
@@ -854,8 +910,20 @@ describe('SubscriptionManager', () => {
       expect(errors[0]?.extensions?.code).toBe(ErrorCode.FORBIDDEN);
     });
 
-    test('should report a raw source stream Error as INTERNAL_ERROR without masking', async () => {
+    test('should mask a raw source stream Error when errorFormatting is unset', async () => {
       const manager = new SubscriptionManager({ schema: failingSchema() });
+
+      const errors = await streamErrors(manager, 'subscription { crashing }');
+
+      expect(errors[0]?.message).toBe('An unexpected error occurred');
+      expect(errors[0]?.extensions?.code).toBe(ErrorCode.INTERNAL_ERROR);
+    });
+
+    test('should report a raw source stream Error as INTERNAL_ERROR when maskErrors is false', async () => {
+      const manager = new SubscriptionManager({
+        schema: failingSchema(),
+        errorFormatting: { maskErrors: false },
+      });
 
       const errors = await streamErrors(manager, 'subscription { crashing }');
 
@@ -1155,5 +1223,105 @@ describe('createSubscriptionManager', () => {
   test('should create a SubscriptionManager instance', () => {
     const manager = createSubscriptionManager({ schema: createTestSchema() });
     expect(manager).toBeInstanceOf(SubscriptionManager);
+  });
+});
+
+describe('SubscriptionManager consumer failures', () => {
+  test('should log a throwing onComplete callback instead of leaving an unhandled rejection', async () => {
+    const errors: unknown[][] = [];
+    const manager = new SubscriptionManager({
+      schema: createTestSchema(),
+      logger: { error: (...args: unknown[]) => errors.push(args), warn: () => {} },
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      // The listener is process-wide: keep only this test's own rejections
+      if (reason instanceof Error && /^complete boom$/.test(reason.message)) {
+        unhandled.push(reason);
+      }
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      await manager.subscribe(
+        'conn-1',
+        'sub-1',
+        { query: 'subscription { count }' },
+        undefined,
+        () => {},
+        () => {
+          throw new Error('complete boom');
+        },
+        () => {}
+      );
+      await waitFor(() => errors.length > 0);
+      // The log entry is written; yield two macrotask turns so a pending rejection would have fired
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(unhandled).toEqual([]);
+      expect(String(errors[0]?.[0])).toContain('conn-1');
+      expect(String(errors[0]?.[0])).toContain('sub-1');
+      expect(manager.getSubscription('conn-1', 'sub-1')).toBeUndefined();
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      manager.clear();
+    }
+  });
+
+  test('should log a throwing onError callback instead of leaving an unhandled rejection', async () => {
+    const errors: unknown[][] = [];
+    const schema = new GraphQLSchema({
+      query: new GraphQLObjectType({
+        name: 'Query',
+        fields: { hello: { type: GraphQLString, resolve: () => 'world' } },
+      }),
+      subscription: new GraphQLObjectType({
+        name: 'Subscription',
+        fields: {
+          crashing: {
+            type: GraphQLInt,
+            subscribe: async function* () {
+              yield { crashing: 1 };
+              throw new Error('stream reset');
+            },
+          },
+        },
+      }),
+    });
+    const manager = new SubscriptionManager({
+      schema,
+      logger: { error: (...args: unknown[]) => errors.push(args), warn: () => {} },
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      // The listener is process-wide: keep only this test's own rejections
+      if (reason instanceof Error && reason.message === 'error boom') {
+        unhandled.push(reason);
+      }
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      await manager.subscribe(
+        'conn-1',
+        'sub-1',
+        { query: 'subscription { crashing }' },
+        undefined,
+        () => {},
+        () => {},
+        () => {
+          throw new Error('error boom');
+        }
+      );
+      await waitFor(() => errors.length > 0);
+      // The log entry is written; yield two macrotask turns so a pending rejection would have fired
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(unhandled).toEqual([]);
+      expect(String(errors[0]?.[0])).toContain('conn-1');
+      expect(String(errors[0]?.[0])).toContain('sub-1');
+      expect(manager.getSubscription('conn-1', 'sub-1')).toBeUndefined();
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      manager.clear();
+    }
   });
 });

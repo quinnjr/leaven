@@ -12,6 +12,7 @@ import {
   ErrorCode,
   LeavenError,
   formatError,
+  withMaskingDefault,
   type ErrorMaskingOptions,
 } from '@leaven-graphql/errors';
 
@@ -68,6 +69,21 @@ export interface WebSocketHandlerConfig<TContext = unknown> {
   connectionInitTimeout?: number;
   /** Keep alive interval (ms) */
   keepAliveInterval?: number;
+  /**
+   * Browser origins allowed to open a WebSocket, checked by
+   * {@link WebSocketHandler.isOriginAllowed} before the upgrade (LeavenServer
+   * does this automatically). Browsers attach cookies to cross-site WebSocket
+   * handshakes and no CORS preflight applies, so accepting any origin allows
+   * cross-site WebSocket hijacking.
+   *
+   * By default only the server's own origin is allowed: the `Origin` header's
+   * host:port must equal the upgrade request's `Host` header (compared
+   * case-insensitively, default ports normalised). A list adds the given
+   * origins (e.g. `'https://app.example.com'`) to the server's own; `'*'`
+   * allows any origin. A request with no `Origin` header (a non-browser
+   * client) is always allowed.
+   */
+  allowedOrigins?: readonly string[] | '*';
   /** Subscription manager config */
   subscriptionManager?: Omit<SubscriptionManagerConfig, 'schema'>;
   /**
@@ -81,13 +97,15 @@ export interface WebSocketHandlerConfig<TContext = unknown> {
    *
    * Every error sent in an `error` or `next` frame goes through
    * `formatError` from `@leaven-graphql/errors`: one thrown by `onSubscribe`,
-   * the context factory or a source stream always (so its `extensions.code`
-   * is kept, and anything uncoded is reported as `INTERNAL_ERROR`); execution
-   * errors the executor already serialised only when this is set. Unexpected
-   * errors are masked only when `maskErrors` is `true`, so set it in
-   * production: otherwise a throwing context factory sends its raw message
-   * (a DSN, a connection failure) to the client. Also passed to the
-   * subscription manager unless `subscriptionManager.errorFormatting` is set.
+   * the context factory or a source stream always; execution errors the
+   * executor already serialised only when this is set. Thrown errors are
+   * masked by default (`maskErrors` defaults to `true` for them, so a throwing
+   * context factory never sends its raw message, such as a DSN, to the
+   * client); set `maskErrors: false` to disable. A `LeavenError` or an error
+   * with a known non-`INTERNAL_ERROR` code keeps its message and
+   * `extensions.code`; anything else (an uncoded `GraphQLError` included) is
+   * masked as `INTERNAL_ERROR`. Also passed to the subscription manager unless
+   * `subscriptionManager.errorFormatting` is set.
    */
   errorFormatting?: ErrorMaskingOptions;
   /** Called when a connection is initialized */
@@ -152,7 +170,8 @@ export class WebSocketHandler<TContext = unknown> {
   private readonly onSubscribe?: WebSocketHandlerConfig<TContext>['onSubscribe'];
   private readonly onComplete?: WebSocketHandlerConfig<TContext>['onComplete'];
   private readonly logger: WebSocketLogger;
-  private readonly errorFormatting?: ErrorMaskingOptions;
+  private readonly maskingOptions: ErrorMaskingOptions;
+  private readonly allowedOrigins: ReadonlySet<string> | '*';
 
   private readonly initTimeouts: Map<string, ReturnType<typeof setTimeout>>;
   private readonly keepAliveTimers: Map<string, ReturnType<typeof setInterval>>;
@@ -164,7 +183,11 @@ export class WebSocketHandler<TContext = unknown> {
     this.connectionInitTimeout = config.connectionInitTimeout ?? 3000;
     this.keepAliveInterval = config.keepAliveInterval ?? 12000;
     this.logger = config.logger ?? console;
-    this.errorFormatting = config.errorFormatting;
+    this.maskingOptions = withMaskingDefault(config.errorFormatting);
+    this.allowedOrigins =
+      config.allowedOrigins === '*'
+        ? '*'
+        : new Set((config.allowedOrigins ?? []).map(normalizeOrigin));
     this.subscriptionManager = new SubscriptionManager({
       schema: config.schema,
       logger: this.logger,
@@ -231,6 +254,55 @@ export class WebSocketHandler<TContext = unknown> {
     } catch (error) {
       this.logger.error(`${name} failed:`, error);
     }
+  }
+
+  /**
+   * Whether an upgrade request's `Origin` may open a WebSocket, per
+   * `allowedOrigins`. Call it before `server.upgrade()` and refuse the
+   * upgrade (e.g. with 403) when it returns `false`; LeavenServer does so.
+   *
+   * A request without an `Origin` header (a non-browser client) is always
+   * allowed. Otherwise the origin is allowed when `allowedOrigins` is `'*'`,
+   * when its host:port equals the request's `Host` header (case-insensitive,
+   * default ports normalised), or when it is in `allowedOrigins`.
+   *
+   * Twin of `SubscriptionManager.isOriginAllowed` in
+   * packages/nestjs/src/subscriptions.ts. Only a `Request` is accepted, so the
+   * header lookup is case-insensitive.
+   *
+   * @param request - The WebSocket upgrade request
+   * @returns `true` when the upgrade may proceed
+   */
+  public isOriginAllowed(request: Request): boolean {
+    const origin = request.headers.get('origin');
+    if (origin === null || this.allowedOrigins === '*') {
+      return true;
+    }
+
+    let parsed: URL;
+    try {
+      parsed = new URL(origin);
+    } catch {
+      // An opaque or malformed origin (e.g. `null`) can only be listed.
+      return this.allowedOrigins.has(normalizeOrigin(origin));
+    }
+    if (this.allowedOrigins.has(normalizeOrigin(origin))) {
+      return true;
+    }
+
+    const host = request.headers.get('host') ?? safeHost(request);
+    if (host === '') {
+      return false;
+    }
+    // Resolve Host against the origin's scheme so the URL parser lowercases
+    // it and drops that scheme's default port (`example.com:443` under https).
+    let serverHost: string;
+    try {
+      serverHost = new URL(`${parsed.protocol}//${host}`).host;
+    } catch {
+      return false;
+    }
+    return parsed.host === serverHost;
   }
 
   /**
@@ -343,7 +415,18 @@ export class WebSocketHandler<TContext = unknown> {
 
     // Check onConnect hook
     if (this.onConnect) {
-      const outcome = await this.awaitOnConnect(this.onConnect, socket, params);
+      let outcome: Awaited<ReturnType<WebSocketHandler<TContext>['awaitOnConnect']>>;
+      try {
+        outcome = await this.awaitOnConnect(this.onConnect, socket, params);
+      } catch (error) {
+        // A throwing hook is treated like a rejection; its text (a DSN, a
+        // connection failure) must not reach the client as a close reason
+        this.logger.error('onConnect hook failed:', error);
+        if (!state.closed) {
+          socket.close(4403, 'Forbidden');
+        }
+        return;
+      }
       // The socket may have closed, or timed out, while onConnect ran.
       // Acknowledging it now would start a keep-alive timer that nothing
       // ever clears.
@@ -443,7 +526,7 @@ export class WebSocketHandler<TContext = unknown> {
         ErrorCode.BAD_REQUEST
       );
       socket.send(
-        formatMessage(createErrorMessage(id, [formatError(limitError, this.errorFormatting)]))
+        formatMessage(createErrorMessage(id, [formatError(limitError, this.maskingOptions)]))
       );
       return;
     }
@@ -503,7 +586,11 @@ export class WebSocketHandler<TContext = unknown> {
         if (response.data === undefined && response.errors && response.errors.length > 0) {
           socket.send(formatMessage(createErrorMessage(id, response.errors)));
         } else {
-          socket.send(formatMessage(createNextMessage(id, response.data, response.errors)));
+          socket.send(
+            formatMessage(
+              createNextMessage(id, response.data, response.errors, response.extensions)
+            )
+          );
           socket.send(formatMessage(createCompleteMessage(id)));
         }
 
@@ -520,7 +607,9 @@ export class WebSocketHandler<TContext = unknown> {
         request,
         context,
         (result) => {
-          socket.send(formatMessage(createNextMessage(id, result.data, result.errors)));
+          socket.send(
+            formatMessage(createNextMessage(id, result.data, result.errors, result.extensions))
+          );
         },
         () => {
           socket.send(formatMessage(createCompleteMessage(id)));
@@ -546,7 +635,7 @@ export class WebSocketHandler<TContext = unknown> {
       // factory must not send its raw text (a DSN, a connection failure) to
       // the client when masking is on, and a coded error keeps its code.
       socket.send(
-        formatMessage(createErrorMessage(id, [formatError(error, this.errorFormatting)]))
+        formatMessage(createErrorMessage(id, [formatError(error, this.maskingOptions)]))
       );
       socket.data.subscriptions.delete(id);
       // Terminal, like the other three paths: the id is finished, so the
@@ -595,11 +684,16 @@ export class WebSocketHandler<TContext = unknown> {
       state.pending.delete(subscriptionId);
     }
 
+    // Only an operation that was live fires onComplete: a duplicate, unknown
+    // or already-finished id must not
+    const wasLive = pending !== undefined || socket.data.subscriptions.has(subscriptionId);
     socket.data.subscriptions.delete(subscriptionId);
     // Scoped to THIS connection: operation ids are unique per connection, so
     // an unscoped teardown would drop another client's subscription
     this.subscriptionManager.unsubscribe(socket.data.connectionId, subscriptionId);
-    this.invokeHook('onComplete hook', () => this.onComplete?.(socket, subscriptionId));
+    if (wasLive) {
+      this.invokeHook('onComplete hook', () => this.onComplete?.(socket, subscriptionId));
+    }
   }
 
   /**
@@ -660,6 +754,31 @@ export class WebSocketHandler<TContext = unknown> {
       },
     };
   }
+}
+
+/**
+ * Normalise an origin for comparison: scheme://host[:port], lowercased and
+ * without the scheme's default port. A value that does not parse as a URL
+ * (e.g. the opaque origin `null`) is just trimmed and lowercased.
+ *
+ * Twin of `normalizeOrigin` in packages/nestjs/src/subscriptions.ts.
+ */
+function normalizeOrigin(origin: string): string {
+  try {
+    const url = new URL(origin);
+    // `URL.origin` is `null` for non-special schemes; fall back to the parts.
+    return url.origin !== 'null' ? url.origin : `${url.protocol}//${url.host}`;
+  } catch {
+    return origin.trim().toLowerCase();
+  }
+}
+
+/**
+ * The host:port of the request URL. `Request.url` always parses, so no guard
+ * is needed (the nestjs twin accepts non-Request inputs and keeps its own).
+ */
+function safeHost(request: Request): string {
+  return new URL(request.url).host;
 }
 
 /**

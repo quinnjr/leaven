@@ -11,7 +11,10 @@ import {
   Inject,
   type Type,
 } from '@nestjs/common';
-import { formatError, isLeavenError } from '@leaven-graphql/errors';
+import {
+  isLeavenError,
+  statusForResponse,
+} from '@leaven-graphql/errors';
 import { renderGraphiQL } from '@leaven-graphql/playground';
 import type { GqlContext } from './types';
 // Express types for NestJS middleware compatibility
@@ -22,7 +25,7 @@ interface Request {
   originalUrl?: string;
   url?: string;
   secure?: boolean;
-  body?: Record<string, unknown>;
+  body?: unknown;
   headers: Record<string, string | string[] | undefined>;
 }
 
@@ -37,6 +40,14 @@ interface Response {
 type NextFunction = () => void;
 import { LEAVEN_DRIVER, LEAVEN_MODULE_OPTIONS } from './module';
 import { LeavenDriver } from './driver';
+import { normalizeHttpException } from './http-exception';
+import {
+  csrfBlockedError,
+  isCsrfBlocked,
+  readHeader,
+  resolveCsrfRequestHeaders,
+  validateGraphQLBody,
+} from './request-body';
 import type { CorsOptions, LeavenModuleOptions } from './types';
 
 /**
@@ -46,6 +57,22 @@ import type { CorsOptions, LeavenModuleOptions } from './types';
  * rejected rather than trusted.
  */
 const VALID_HOST = /^[a-z0-9.-]+(:\d+)?$/i;
+
+/**
+ * `Request` members that read or depend on the body. Accessing any of them on
+ * the request handed to a context factory materializes the serialized body.
+ */
+const BODY_MEMBERS: ReadonlySet<string> = new Set([
+  'body',
+  'bodyUsed',
+  'json',
+  'text',
+  'arrayBuffer',
+  'blob',
+  'bytes',
+  'formData',
+  'clone',
+]);
 
 /**
  * GraphQL middleware for handling GraphQL requests
@@ -73,10 +100,18 @@ const VALID_HOST = /^[a-z0-9.-]+(:\d+)?$/i;
  */
 @Injectable()
 export class GraphQLMiddleware implements NestMiddleware {
+  /**
+   * Header names that satisfy CSRF prevention, or `undefined` when
+   * `csrfPrevention` is `false`. Resolved (and validated) at construction.
+   */
+  private readonly csrfRequestHeaders: readonly string[] | undefined;
+
   constructor(
     @Inject(LEAVEN_DRIVER) private readonly driver: LeavenDriver,
     @Inject(LEAVEN_MODULE_OPTIONS) private readonly options: LeavenModuleOptions
-  ) {}
+  ) {
+    this.csrfRequestHeaders = resolveCsrfRequestHeaders(options.csrfPrevention);
+  }
 
   /**
    * Handle incoming requests
@@ -123,14 +158,26 @@ export class GraphQLMiddleware implements NestMiddleware {
     this.applyCorsHeaders(req, res);
 
     try {
-      const { query, variables, operationName } = req.body ?? {};
-
-      if (!query) {
-        res.status(400).json({
-          errors: [{ message: 'Query is required' }],
-        });
-        return;
+      // CSRF prevention runs before the body is looked at or the context
+      // factory runs, whatever shape the body parser left `req.body` in:
+      // NestJS's Express adapter parses `application/x-www-form-urlencoded`
+      // by default, so a cross-site HTML form POST arrives as an object.
+      if (
+        this.csrfRequestHeaders !== undefined &&
+        isCsrfBlocked(
+          readHeader(req.headers, 'content-type'),
+          (name) => readHeader(req.headers, name),
+          this.csrfRequestHeaders
+        )
+      ) {
+        throw csrfBlockedError();
       }
+
+      // No body at all (no body-parser installed, or an empty POST) is a
+      // missing query rather than a malformed body.
+      const { query, variables, operationName } = validateGraphQLBody(
+        req.body === undefined ? {} : req.body
+      );
 
       // Create context with request info. `req`/`res` are the Express objects
       // this middleware was handed — NOT the Fetch pair `driver.handleRequest`
@@ -150,30 +197,34 @@ export class GraphQLMiddleware implements NestMiddleware {
       };
 
       const result = await this.driver.execute(
-        query as string,
-        variables as Record<string, unknown> | undefined,
+        query,
+        variables,
         context as unknown as GqlContext,
-        operationName as string | undefined
+        operationName
       );
 
-      // GraphQL-over-HTTP application/json responses always return 200,
-      // even when the result contains errors
-      res.status(200).json(result);
-    } catch (error) {
-      // Mirror the driver: a Leaven error keeps its own status and message
-      // (an AuthenticationError from the context factory must reach the
-      // client as 401 so token-refresh flows fire), and unexpected errors
-      // are masked in production only.
-      const isProduction = process.env.NODE_ENV === 'production';
-      const includeStack = this.options.includeStacktraceInErrorResponses ?? false;
-      const formattedError = formatError(error, {
-        maskErrors: !isLeavenError(error) && isProduction && !includeStack,
-        includeStackTrace: includeStack,
-      });
+      // A response with non-null `data` is a partial success and stays 200
+      // whatever the error codes say; only a total failure (`data` absent or
+      // `null`) derives its status from the first error's code via
+      // `ERROR_CODES`, exactly as `LeavenGraphQLDriver` does.
+      res.status(statusForResponse(result)).json(result);
+    } catch (thrown) {
+      // Format through the driver so the middleware agrees with every other
+      // path: production masking, stack-trace opt-in, and the user's
+      // `formatError` hook applied exactly once. A Leaven error keeps its own
+      // status — a NestJS `HttpException` is normalised to one first, so a
+      // context factory's `UnauthorizedException` answers 401 — and anything
+      // else derives it from the formatted error's code.
+      const error = normalizeHttpException(thrown);
+      const formattedError = this.driver.formatThrownError(error);
 
-      res.status(isLeavenError(error) ? error.statusCode : 500).json({
-        errors: [formattedError],
-      });
+      res
+        .status(
+          isLeavenError(error)
+            ? error.statusCode
+            : statusForResponse({ errors: [formattedError] })
+        )
+        .json({ errors: [formattedError] });
     }
   }
 
@@ -229,10 +280,16 @@ export class GraphQLMiddleware implements NestMiddleware {
    * The allowed origin is *reflected*, never defaulted to `*` when an
    * allowlist is configured: `origin: false` emits no origin header at all,
    * an array emits the request's `Origin` only when the allowlist contains
-   * it, and `origin: true` echoes the request's `Origin`. `Vary: Origin` is
-   * emitted whenever the value depends on the request so caches cannot serve
-   * one origin's response to another, and `*` is never paired with
-   * `credentials: true` (browsers reject that combination outright).
+   * it, and `origin: true` echoes the request's `Origin` only without
+   * `credentials`: with `credentials: true`, a wildcard (`true`, `'*'` or no
+   * `origin`) emits neither the origin nor the credentials header (see
+   * {@link resolveAllowedOrigin}). `Vary: Origin` is emitted whenever the
+   * value depends on the request so caches cannot serve one origin's response
+   * to another.
+   *
+   * Twin of `corsHeaders` in `packages/http/src/response.ts`: this method and
+   * {@link resolveAllowedOrigin} together are the nestjs side of the CORS
+   * emission, and must stay in step with it.
    */
   private applyCorsHeaders(req: Request, res: Response): void {
     const options = this.resolveCorsOptions();
@@ -241,14 +298,14 @@ export class GraphQLMiddleware implements NestMiddleware {
       return;
     }
 
-    const requestOrigin =
-      typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+    const requestOrigin = readHeader(req.headers, 'origin');
     const allowOrigin = this.resolveAllowedOrigin(options, requestOrigin);
 
-    if (allowOrigin.value !== undefined) {
-      res.setHeader('Access-Control-Allow-Origin', allowOrigin.value);
+    if (allowOrigin !== undefined) {
+      res.setHeader('Access-Control-Allow-Origin', allowOrigin);
     }
-    if (allowOrigin.varies) {
+    // The emitted origin depends on the request unless it is the literal '*'.
+    if (allowOrigin !== '*') {
       res.setHeader('Vary', 'Origin');
     }
 
@@ -262,7 +319,7 @@ export class GraphQLMiddleware implements NestMiddleware {
       'Access-Control-Allow-Headers',
       Array.isArray(options.allowedHeaders)
         ? options.allowedHeaders.join(', ')
-        : options.allowedHeaders ?? 'Content-Type, Authorization'
+        : options.allowedHeaders ?? this.defaultAllowedHeaders()
     );
 
     if (options.exposedHeaders) {
@@ -274,7 +331,9 @@ export class GraphQLMiddleware implements NestMiddleware {
       );
     }
 
-    if (options.credentials) {
+    // Credentials are only ever paired with an origin that passed an explicit
+    // string or allowlist check (see resolveAllowedOrigin).
+    if (options.credentials && allowOrigin !== undefined) {
       res.setHeader('Access-Control-Allow-Credentials', 'true');
     }
 
@@ -284,57 +343,74 @@ export class GraphQLMiddleware implements NestMiddleware {
   }
 
   /**
+   * The default `Access-Control-Allow-Headers`, used when `allowedHeaders`
+   * is not configured: `Content-Type`, `Authorization` and, while CSRF
+   * prevention is on, its configured header names, so a cross-origin client
+   * can send the header the check asks for.
+   *
+   * Twin of the CSRF-inclusive default allow-headers that `createHandler` in
+   * `packages/http/src/handler.ts` builds: the two must stay in step.
+   */
+  private defaultAllowedHeaders(): string {
+    return ['Content-Type', 'Authorization', ...(this.csrfRequestHeaders ?? [])].join(', ');
+  }
+
+  /**
    * Resolve the `Access-Control-Allow-Origin` value for a request
    *
-   * Returns `value: undefined` to mean "emit no origin header", and
-   * `varies: true` when the value was derived from the request's `Origin`
-   * header and therefore requires `Vary: Origin`.
+   * Returns `undefined` to mean "emit no origin header". Only an origin that
+   * passed an explicit string or allowlist check is ever paired with
+   * credentials: a credentialed response cannot use the `*` wildcard, and
+   * echoing the request `Origin` in its place would let any site make
+   * credentialed reads. So with `credentials` and a wildcard origin (`cors:
+   * true`, `origin: true`, `origin: '*'`, or an omitted `origin`), no origin is
+   * emitted at all, and the caller then omits the credentials header too.
+   *
+   * Twin of `corsHeaders` in `packages/http/src/response.ts` (with
+   * {@link applyCorsHeaders}, which emits the headers): the CORS origin rules
+   * must stay in step between the two.
    */
   private resolveAllowedOrigin(
     options: CorsOptions,
     requestOrigin: string | undefined
-  ): { value?: string; varies: boolean } {
+  ): string | undefined {
     const { origin, credentials } = options;
 
     // Explicitly deny cross-origin access
     if (origin === false) {
-      return { varies: false };
+      return undefined;
     }
 
     // Allowlist: reflect the request origin only when it is on the list
     if (Array.isArray(origin)) {
       return requestOrigin !== undefined && origin.includes(requestOrigin)
-        ? { value: requestOrigin, varies: true }
-        : { varies: true };
+        ? requestOrigin
+        : undefined;
     }
 
-    // A concrete origin is echoed verbatim (unless it is the wildcard, which
-    // is handled below so credentials are still honored correctly)
+    // A concrete origin is echoed verbatim
     if (typeof origin === 'string' && origin !== '*') {
-      return { value: origin, varies: false };
+      return origin;
     }
 
-    // CORS is enabled but no `origin` was narrowed (`cors: true`, `origin:
-    // '*'`, or an options object that omits `origin`): allow any origin.
-    // Credentialed requests cannot use the wildcard, so the request's own
-    // origin is reflected instead.
+    // Wildcard: no explicit check narrowed the origin, so it can never be
+    // combined with credentials.
     if (credentials) {
-      return requestOrigin !== undefined
-        ? { value: requestOrigin, varies: true }
-        : { varies: true };
+      return undefined;
     }
 
     if (origin === true) {
-      return requestOrigin !== undefined
-        ? { value: requestOrigin, varies: true }
-        : { value: '*', varies: true };
+      return requestOrigin ?? '*';
     }
 
-    return { value: '*', varies: false };
+    return '*';
   }
 
   /**
    * Adapt an Express-style request into a Fetch API `Request`
+   *
+   * The body is serialized only when the factory reads it (see
+   * {@link BODY_MEMBERS}); headers, URL and method cost no serialization.
    *
    * The `ContextFactory` contract (types.ts) is declared against the global
    * Fetch API types, and `driver.createContext` passes genuine Fetch objects.
@@ -377,20 +453,63 @@ export class GraphQLMiddleware implements NestMiddleware {
     const path = req.originalUrl ?? req.url ?? req.path;
     const url = `${this.resolveOrigin(req)}${path}`;
 
-    const init: RequestInit = { method: req.method, headers };
-    if (req.body !== undefined && req.method !== 'GET' && req.method !== 'HEAD') {
-      if (!headers.has('content-type')) {
-        headers.set('content-type', 'application/json');
-      }
-      init.body = JSON.stringify(req.body);
+    const hasBody =
+      req.body !== undefined && req.method !== 'GET' && req.method !== 'HEAD';
+    if (hasBody && !headers.has('content-type')) {
+      headers.set('content-type', 'application/json');
     }
 
-    try {
-      return new globalThis.Request(url, init);
-    } catch {
-      // A path that cannot be parsed as a URL must not take the request down
-      return new globalThis.Request(`${this.canonicalOrigin(req)}${this.driver.getPath()}`, init);
+    const build = (init: RequestInit): globalThis.Request => {
+      try {
+        return new globalThis.Request(url, init);
+      } catch {
+        // A path that cannot be parsed as a URL must not take the request down
+        return new globalThis.Request(
+          `${this.canonicalOrigin(req)}${this.driver.getPath()}`,
+          init
+        );
+      }
+    };
+
+    const bodiless = build({ method: req.method, headers });
+    if (!hasBody) {
+      return bodiless;
     }
+
+    // The body is serialized lazily: most factories only read headers or the
+    // URL, so `JSON.stringify(req.body)` runs only when a body member is
+    // touched. Every other member is served by the bodiless request.
+    //
+    // The body members are own properties defined on the bodiless request
+    // itself, not a Proxy around it: Bun treats a Proxy-wrapped Request as a
+    // plain object in `new Request(proxy, init)`, dropping its method and
+    // body. A real instance keeps the Request brand, and Bun's constructor
+    // reads `body` through the property, so the copy carries the body.
+    let withBody: globalThis.Request | undefined;
+    const body = (): globalThis.Request =>
+      (withBody ??= build({ method: req.method, headers, body: JSON.stringify(req.body) }));
+
+    for (const member of BODY_MEMBERS) {
+      const value: unknown = Reflect.get(bodiless, member);
+      Object.defineProperty(
+        bodiless,
+        member,
+        typeof value === 'function'
+          ? {
+              configurable: true,
+              value: (...args: unknown[]): unknown => {
+                const source = body();
+                return (Reflect.get(source, member) as (...a: unknown[]) => unknown).apply(
+                  source,
+                  args
+                );
+              },
+            }
+          : { configurable: true, get: (): unknown => Reflect.get(body(), member) }
+      );
+    }
+
+    return bodiless;
   }
 
   /**
@@ -405,8 +524,8 @@ export class GraphQLMiddleware implements NestMiddleware {
       return this.canonicalOrigin(req);
     }
 
-    const host = req.headers.host;
-    if (typeof host === 'string' && VALID_HOST.test(host)) {
+    const host = readHeader(req.headers, 'host');
+    if (host !== undefined && VALID_HOST.test(host)) {
       return `${req.secure ? 'https' : 'http'}://${host}`;
     }
 

@@ -18,5 +18,4 @@
 /.github/ @quinnjr
 
 # Security-sensitive files
-/SECURITY.md @quinnjr
 /.github/workflows/release.yml @quinnjr

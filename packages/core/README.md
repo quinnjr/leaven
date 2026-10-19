@@ -151,6 +151,10 @@ const executor = new LeavenExecutor({
 });
 ```
 
+A cache failure never fails the request: a failed read (a Redis outage, say)
+is treated as a miss, a failed background write is dropped, and both are
+reported to the `onCacheError` hook (see Lifecycle Hooks below).
+
 The Redis cache supports:
 - **Distributed caching** across multiple server instances
 - **Automatic TTL** handled by Redis
@@ -184,6 +188,10 @@ const executor = new LeavenExecutor({
     },
     onError(error) {
       console.error('Execution error:', error);
+    },
+    // A failed cache read (treated as a miss) or background write
+    onCacheError(error) {
+      console.warn('Document cache failure:', error);
     },
   },
 });
@@ -434,12 +442,14 @@ isRequestRejection(response); // true: rejected before any resolver ran
 `isRequestRejection(response)` is true for a response the executor produced
 because it rejected the request before running any resolver: a syntax error, a
 parser limit (`maxTokens`, `maxDepth`, the analysis budget), validation, the
-complexity budget, an unknown or missing operation name, or a variable that
-fails to coerce. Anything else that fails before execution starts (before
-`onExecute` is invoked) is marked too: a throw or rejection from the
-`onParse`, `onParsed`, `onValidate` or `onValidated` hooks, from a
-`complexityCalculator`, or from the document cache. Such a request is safe to
-answer with a non-200 status and to retry. An error from `onExecute`,
+complexity budget, an unknown or missing operation name, an operation type the
+schema has no root type for (a mutation or subscription sent to a schema
+without one), or a variable that fails to coerce. Anything else that fails
+before execution starts (before `onExecute` is invoked) is marked too: a throw
+or rejection from the `onParse`, `onParsed`, `onValidate` or `onValidated`
+hooks, or from a `complexityCalculator`. A document cache failure is not: a
+failed read is a cache miss, reported to `onCacheError`. Such a request is safe
+to answer with a non-200 status and to retry. An error from `onExecute`,
 `onExecuted`, a resolver, a subscribe resolver, or anything else raised once
 execution started is never marked, whatever its code. The check is identity-based:
 pass the object `execute()` or `subscribe()` returned, not a copy. The mark

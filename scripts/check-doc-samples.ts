@@ -822,14 +822,34 @@ function runTsc(): string[] {
     stderr: 'pipe',
   });
   const output = `${tsc.stdout.toString()}${tsc.stderr.toString()}`.trim();
-  return output.split('\n').filter((line) => /error TS\d+/.test(line));
+  const diagnostics = output.split('\n').filter((line) => /error TS\d+/.test(line));
+  // A crash or OOM exits nonzero without any `error TS` line; that must not read as a pass.
+  if (tsc.exitCode !== 0 && diagnostics.length === 0) {
+    throw new Error(`tsc exited with code ${tsc.exitCode} and produced no diagnostics:\n${output}`);
+  }
+  return diagnostics;
+}
+
+/** Run tsc, turning a crash into a failing exit. */
+function runTscOrExit(): string[] {
+  try {
+    return runTsc();
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
+}
+
+if (extracted.length === 0) {
+  console.error('No doc samples were extracted; refusing to report a vacuous pass.');
+  process.exit(1);
 }
 
 const byId = new Map(extracted.map((sample) => [sample.id, sample]));
 const idOf = (line: string): string =>
   (/^(.*?)\(/.exec(line)?.[1] ?? '').replace(/^.*samples\//, '').replace(/\.d\.ts$|\.ts$/, '');
 
-let errorLines = runTsc();
+let errorLines = runTscOrExit();
 
 // Second pass: prose placeholders.
 //
@@ -860,7 +880,7 @@ if (placeholders.size > 0) {
   );
   tsconfig.include.push('placeholders.d.ts');
   writeFileSync(join(SCRATCH_DIR, 'tsconfig.json'), `${JSON.stringify(tsconfig, null, 2)}\n`);
-  errorLines = runTsc();
+  errorLines = runTscOrExit();
 }
 
 const failing = new Set<string>();

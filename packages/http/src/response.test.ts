@@ -17,6 +17,63 @@ import {
 } from './response';
 
 describe('corsHeaders', () => {
+  const req = (origin?: string): Request =>
+    new Request('http://localhost/graphql', origin ? { headers: { Origin: origin } } : {});
+
+  test('should not add Vary for the literal wildcard', () => {
+    expect(corsHeaders(req('http://a.com')).Vary).toBeUndefined();
+  });
+
+  test('should add Vary: Origin when the origin is echoed', () => {
+    const headers = corsHeaders(req('http://a.com'), { origin: ['http://a.com'] });
+    expect(headers['Access-Control-Allow-Origin']).toBe('http://a.com');
+    expect(headers.Vary).toBe('Origin');
+  });
+
+  test('should add Vary: Origin when the origin is not allowed', () => {
+    const headers = corsHeaders(req('http://b.com'), { origin: ['http://a.com'] });
+    expect(headers['Access-Control-Allow-Origin']).toBeUndefined();
+    expect(headers.Vary).toBe('Origin');
+  });
+
+  test('should send neither origin nor credentials for a wildcard with credentials', () => {
+    for (const origin of [undefined, '*'] as const) {
+      const headers = corsHeaders(req('http://evil.com'), { origin, credentials: true });
+      expect(headers['Access-Control-Allow-Origin']).toBeUndefined();
+      expect(headers['Access-Control-Allow-Credentials']).toBeUndefined();
+      expect(headers.Vary).toBe('Origin');
+    }
+  });
+
+  test('should send neither origin nor credentials for a disallowed origin with credentials', () => {
+    const headers = corsHeaders(req('http://b.com'), {
+      origin: ['http://a.com'],
+      credentials: true,
+    });
+    expect(headers['Access-Control-Allow-Origin']).toBeUndefined();
+    expect(headers['Access-Control-Allow-Credentials']).toBeUndefined();
+  });
+
+  test('should echo an origin allowed by the array with credentials', () => {
+    const headers = corsHeaders(req('http://a.com'), {
+      origin: ['http://a.com'],
+      credentials: true,
+    });
+    expect(headers['Access-Control-Allow-Origin']).toBe('http://a.com');
+    expect(headers['Access-Control-Allow-Credentials']).toBe('true');
+    expect(headers.Vary).toBe('Origin');
+  });
+
+  test('should echo an origin allowed by the predicate with credentials', () => {
+    const headers = corsHeaders(req('http://a.com'), {
+      origin: (o) => o === 'http://a.com',
+      credentials: true,
+    });
+    expect(headers['Access-Control-Allow-Origin']).toBe('http://a.com');
+    expect(headers['Access-Control-Allow-Credentials']).toBe('true');
+    expect(headers.Vary).toBe('Origin');
+  });
+
   test('should return default CORS headers', () => {
     const request = new Request('http://localhost/graphql', {
       headers: { Origin: 'http://example.com' },
@@ -70,7 +127,10 @@ describe('corsHeaders', () => {
   test('should include credentials header', () => {
     const request = new Request('http://localhost/graphql');
 
-    const headers = corsHeaders(request, { credentials: true });
+    const headers = corsHeaders(request, {
+      origin: 'http://allowed.com',
+      credentials: true,
+    });
 
     expect(headers['Access-Control-Allow-Credentials']).toBe('true');
   });
@@ -134,6 +194,14 @@ const STATUS_BY_CODE: ReadonlyArray<{ code: string; status: number }> = [
 ];
 
 describe('buildResponse', () => {
+  test('should let a lowercase user content-type replace the default', () => {
+    const response = buildResponse(
+      { data: { a: 1 } },
+      { headers: { 'content-type': 'application/graphql-response+json' } }
+    );
+    expect(response.headers.get('content-type')).toBe('application/graphql-response+json');
+  });
+
   test('should build response with data', async () => {
     const response = buildResponse({
       data: { hello: 'world' },

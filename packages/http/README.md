@@ -48,6 +48,7 @@ const server = createServer({
   playground: true,              // Enable GraphiQL (boolean only)
   introspection: true,           // Enable introspection
   cors: true,                    // Enable CORS
+  csrfPrevention: true,          // Default: true (see CSRF Prevention)
 
   // HTTP
   allowedMethods: ['GET', 'POST', 'OPTIONS'],  // Default: GET, POST, OPTIONS
@@ -73,6 +74,8 @@ const server = createServer({
   },
 
   // Error handling
+  // Errors thrown outside execution (e.g. by the context factory) are masked
+  // unless `errorFormatting.maskErrors` is explicitly `false`
   errorFormatting: {
     maskErrors: true,
     includeStackTrace: false,
@@ -80,7 +83,7 @@ const server = createServer({
 
   // Body limits
   maxBodySize: 1024 * 1024,      // 1MB, default: 1_000_000
-  bodyReadTimeoutMs: 30_000,     // Deadline for reading a body, default: 30_000
+  bodyReadTimeoutMs: 30_000,     // Deadline for reading a body, default: 30_000; Infinity or 0 disables it
 
   // Subscriptions: upgrades `Upgrade: websocket` requests on `path`
   websocket: new WebSocketHandler({ schema }),
@@ -106,7 +109,7 @@ mutations answer with one `next` event then `complete`. Only request errors
 (no `data`, and rejected by the executor before any resolver ran: a syntax,
 validation, complexity, depth, operation-selection or variable-coercion error,
 or a failure before execution started such as a throwing `onParse` or
-`onValidated` hook or a document cache failure; see `isRequestError` in
+`onValidated` hook; see `isRequestError` in
 `@leaven-graphql/sse`) get a plain JSON response.
 Everything else, `data: null` and coded errors raised after execution started
 included, is streamed, because the `graphql-sse` client
@@ -120,8 +123,9 @@ subscription iterator itself mid-stream is masked by default, and follows
 `errorFormatting` when it is set. The SSE `Content-Type` and `Cache-Control`
 always win over `response.headers`; other headers, CORS included, are kept.
 
-A mutation sent with `GET` is rejected with `405` and `Allow: POST` on every
-path, whether or not `sse` is enabled.
+A mutation sent with any method other than `POST` (`GET`, or `HEAD` if you add
+it to `allowedMethods`) is rejected with `405` and `Allow: POST` on every path,
+whether or not `sse` is enabled.
 
 ### CORS Configuration
 
@@ -131,13 +135,68 @@ const server = createServer({
   cors: {
     origin: ['https://example.com', 'https://app.example.com'],
     methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-graphql-csrf'],
     exposedHeaders: ['X-Request-Id'],
     credentials: true,
     maxAge: 86400,
   },
 });
 ```
+
+`credentials: true` needs an explicit `origin` (a string, an array or a predicate). With the default `'*'` origin, a credentialed config sends neither `Access-Control-Allow-Origin` nor `Access-Control-Allow-Credentials`, because echoing an arbitrary request Origin would let any site make credentialed reads.
+
+Without `allowedHeaders`, the default `Access-Control-Allow-Headers` is
+`Content-Type`, `Authorization` and the `csrfPrevention` header names. An
+explicit `allowedHeaders` replaces that default, so it must include the CSRF
+header names (e.g. `x-graphql-csrf`) for cross-origin form or multipart
+clients, or their preflight fails.
+
+### CSRF Prevention
+
+CSRF prevention is on by default. A browser sends a "simple" cross-site `POST`
+without a CORS preflight, so CORS alone cannot stop a malicious page from
+running a mutation with the visitor's cookies. Leaven therefore refuses a
+`POST` whose `Content-Type` is missing or CORS-safelisted (`text/plain`,
+`application/x-www-form-urlencoded`, `multipart/form-data`) unless it carries
+at least one non-empty preflight-forcing header:
+
+- `x-graphql-csrf`
+- `apollo-require-preflight`
+- `x-apollo-operation-name`
+
+A blocked request gets `400` with code `BAD_REQUEST` and the message
+`This request is blocked by CSRF prevention: ...`, before the body is read or
+the context factory runs.
+
+`application/json` and `application/graphql` requests need no header, since
+browsers always preflight them cross-site. `GET` is not checked: mutations are
+already refused on every method other than `POST`, which also keeps
+`EventSource`-style SSE `GET`s working.
+
+File-upload clients (graphql-multipart-request-spec) post
+`multipart/form-data`, so they must send one of the headers, for example
+`x-graphql-csrf: 1` (Apollo's upload link sends `apollo-require-preflight`).
+
+```typescript
+import { createServer } from '@leaven-graphql/http';
+
+// Replace the accepted header list
+const server = createServer({
+  schema,
+  csrfPrevention: { requestHeaders: ['x-my-csrf'] },
+});
+
+// Or turn the check off (only behind another CSRF defence)
+const unprotected = createServer({ schema, csrfPrevention: false });
+```
+
+Body media types are matched exactly (case-insensitively, parameters
+ignored). Any other `Content-Type`, or a missing one on a non-empty body, gets
+`415` with code `BAD_REQUEST` once past CSRF prevention. With `csrfPrevention`
+on (the default), a missing or `text/plain` Content-Type is refused with `400`
+first; it reaches `415` only when a preflight header is present or
+`csrfPrevention` is `false`. The body is no longer parsed as JSON as a
+fallback. A `POST` with an empty body still takes its parameters from the URL.
 
 ### Custom Context
 
@@ -220,6 +279,7 @@ interface ServerConfig<TContext = unknown> extends HandlerConfig<TContext> {
   development?: boolean;
   routes?: Record<string, GraphQLHandler | ((request: Request) => Response | Promise<Response>)>;
   fallback?: (request: Request) => Response | Promise<Response>;
+  // Upgrades only if websocket.isOriginAllowed(request); otherwise 403 Forbidden
   websocket?: WebSocketHandler;
   onStart?: (server: Server<unknown>) => void;
   onStop?: () => void;
@@ -242,10 +302,17 @@ interface HandlerConfig<TContext = unknown> {
   maxBodySize?: number;
   bodyReadTimeoutMs?: number;
   sse?: boolean | SSEOptions;
+  csrfPrevention?: boolean | CSRFPreventionOptions; // default true
 }
 
 interface SSEOptions {
   keepAliveInterval?: number; // default 8000, 0 disables
+}
+
+interface CSRFPreventionOptions {
+  // Replaces the defaults: x-graphql-csrf, apollo-require-preflight,
+  // x-apollo-operation-name
+  requestHeaders?: string[];
 }
 ```
 
@@ -262,7 +329,7 @@ server instance.
 class LeavenServer {
   constructor(config: ServerConfig);
   start(): ServerInfo;
-  stop(): void;
+  stop(closeActiveConnections?: boolean): void; // default false: open SSE/WebSocket connections are left to finish
   reload(): void;
   getServer(): Server<unknown> | null;
   isRunning(): boolean;
@@ -293,16 +360,46 @@ type GraphQLHandler = (request: Request) => Promise<Response>;
 ### Request Utilities
 
 ```typescript
-import { parseBody, parseQuery, validateRequest } from '@leaven-graphql/http';
+import {
+  mediaType,
+  parseBody,
+  parseQuery,
+  UnsupportedMediaTypeError,
+  validateRequest,
+} from '@leaven-graphql/http';
 
-// Parse request body (JSON, GraphQL, form, multipart)
+// The media-type essence: lowercased, parameters dropped, '' when missing
+const type = mediaType(request.headers.get('content-type')); // 'application/json'
+
+// Parse request body (JSON, GraphQL, form, multipart). Any other
+// Content-Type throws `UnsupportedMediaTypeError` (an empty body returns {}).
 const body = await parseBody(request);
 
-// Parse query string parameters — takes a URL, not a Request
+// In a custom handler, map that error to 415
+async function parseOr415(req: Request) {
+  try {
+    return await parseBody(req);
+  } catch (error) {
+    if (error instanceof UnsupportedMediaTypeError) {
+      return new Response(error.message, { status: 415 });
+    }
+    throw error;
+  }
+}
+
+// Parse query string parameters — takes a URL, not a Request. Like
+// parseBody, it throws a plain Error on undecodable `variables`/`extensions`
+// JSON: answer 400. parseBody also throws one on a body that is not a JSON
+// object, an unparseable form or multipart body, or an upload whose
+// `operations`/`map` is not a JSON object, whose `map` entries are not
+// arrays of strings, or (with a `map`) whose `variables` is not an object.
 const params = parseQuery(new URL(request.url));
 
 // Validate a GraphQL request. The second argument holds the parameters
 // parsed off the URL and defaults to `{}`; the body wins on conflicts.
+// `valid: false` (answer 400) for a missing or non-string `query`, a
+// non-string `operationName`, or a `variables`/`extensions` that is not a
+// plain object; `null` counts as absent.
 const validation = validateRequest(body);
 const merged = validateRequest(body, params);
 ```

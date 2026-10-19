@@ -36,9 +36,9 @@ import { SeoService } from '../services/seo.service';
           <ul class="space-y-2 text-zinc-300">
             <li><strong class="text-white">Parsing</strong> - Parse GraphQL query strings into document ASTs</li>
             <li><strong class="text-white">Validation</strong> - Validate documents against your schema</li>
-            <li><strong class="text-white">Compilation</strong> - Compile queries for efficient execution</li>
+            <li><strong class="text-white">Compilation</strong> - Analyze queries up front (static analysis and complexity scoring) before graphql-js executes them</li>
             <li><strong class="text-white">Execution</strong> - Execute queries and resolve fields</li>
-            <li><strong class="text-white">Caching</strong> - Cache parsed documents and compiled queries</li>
+            <li><strong class="text-white">Caching</strong> - Cache parsed documents and compiled query plans</li>
           </ul>
         </div>
       </section>
@@ -60,7 +60,7 @@ import { SeoService } from '../services/seo.service';
       <!-- Caching -->
       <section class="mb-12">
         <h2 class="text-2xl font-semibold text-white mb-4">Document Caching</h2>
-        <p class="text-zinc-400 mb-4">Enable caching to reuse parsed documents and compiled queries:</p>
+        <p class="text-zinc-400 mb-4">Enable caching to reuse parsed documents and compiled query plans:</p>
         <app-code-block [code]="cachingCode" title="caching.ts" />
       </section>
 
@@ -134,7 +134,7 @@ export class ExecutorComponent implements OnInit {
   ngOnInit(): void {
     this.seoService.updatePageSEO({
       title: 'Executor',
-      description: 'The LeavenExecutor handles parsing, validation, compilation, caching, and execution of GraphQL operations on Bun.',
+      description: 'The LeavenExecutor handles parsing, validation, query analysis and complexity scoring, caching, and execution of GraphQL operations on Bun.',
       keywords: ['GraphQL executor', 'query execution', 'document caching', 'execution hooks', 'Leaven'],
       canonical: '/executor',
       ogType: 'article'
@@ -164,7 +164,7 @@ console.log(result.response.data);
     | boolean                         // enable/disable the default cache,
     | IDocumentCache;                 // or plug in a custom cache (e.g. Redis)
   parseOptions?: ParseOptions;        // Parser options
-  compilerOptions?: CompilerOptions;  // Enables query compilation
+  compilerOptions?: CompilerOptions;  // Enables query analysis and complexity scoring
   introspection?: boolean;            // Enable introspection queries (default: true)
   maxDepth?: number;                  // Query depth limit
   maxIntrospectionDepth?: number;     // Separate limit for __schema/__type paths
@@ -189,7 +189,7 @@ console.log(result.response.data);
 // Check cache stats (async - custom caches may be remote)
 const stats = await executor.getCacheStats();
 console.log(stats);
-// { document: { size: 42, hits: 156, ... }, compiled: { size: 12, maxSize: 1000, bytes: ..., maxBytes: 33554432 } }`;
+// { document: { size: 42, maxSize: 1000, hitRate: 3.7, totalHits: 156, entries: 42, bytes: ..., maxBytes: 33554432 }, compiled: { size: 12, maxSize: 1000, bytes: ..., maxBytes: 33554432 } }`;
 
   hooksCode = `const executor = new LeavenExecutor({
   schema,
@@ -210,6 +210,10 @@ console.log(stats);
     },
     onError(error) {
       console.error('Execution error:', error);
+    },
+    // A failed cache read (treated as a miss) or background write
+    onCacheError(error) {
+      console.warn('Document cache failure:', error);
     },
   },
 });`;

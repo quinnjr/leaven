@@ -7,6 +7,7 @@
 
 import { escapeLog } from '@leaven-graphql/core';
 import type { WebSocketLogger } from './logger';
+import { BoundedQueue } from './bounded-queue';
 
 /**
  * Subscribe function type
@@ -43,6 +44,9 @@ export interface PubSubConfig {
    * dropped to make room for the newest (drop-oldest policy), so a slow
    * consumer sees the most recent events rather than growing the queue
    * without bound. Unlimited by default.
+   *
+   * Must be an integer >= 1 or `Infinity`; the constructor throws a
+   * `TypeError` otherwise (`0` is rejected).
    */
   maxQueueSize?: number;
   /** Where subscriber callback errors are logged. Defaults to `console`. */
@@ -75,7 +79,13 @@ export class PubSub implements PubSubEngine {
     this.wildcardPatterns = new Map();
     this.maxSubscribersPerTopic = config.maxSubscribersPerTopic ?? 10000;
     this.wildcards = config.wildcards ?? false;
-    this.maxQueueSize = config.maxQueueSize ?? Infinity;
+    const maxQueueSize = config.maxQueueSize ?? Infinity;
+    if (maxQueueSize !== Infinity && !(Number.isInteger(maxQueueSize) && maxQueueSize >= 1)) {
+      throw new TypeError(
+        `maxQueueSize must be an integer >= 1 or Infinity, received: ${String(maxQueueSize)}`
+      );
+    }
+    this.maxQueueSize = maxQueueSize;
     this.logger = config.logger ?? console;
     this.nextId = 0;
   }
@@ -189,7 +199,7 @@ export class PubSub implements PubSubEngine {
    * Check if a pre-split topic pattern matches
    */
   private matchesWildcard(patternParts: string[], topicParts: string[]): boolean {
-    if (patternParts.length === 1 && (patternParts[0] === '*' || patternParts[0] === '#')) {
+    if (patternParts.length === 1 && patternParts[0] === '#') {
       return true;
     }
 
@@ -220,11 +230,10 @@ export class PubSub implements PubSubEngine {
   ): AsyncIterableIterator<T> {
     const topics = Array.isArray(topic) ? topic : [topic];
     const pullQueue: Array<(value: IteratorResult<T>) => void> = [];
-    const pushQueue: T[] = [];
+    const pushQueue = new BoundedQueue<T>(this.maxQueueSize);
     let done = false;
 
     const unsubscribes: Array<() => void> = [];
-    const maxQueueSize = this.maxQueueSize;
 
     const pushValue = (payload: T): void => {
       if (done) return;
@@ -235,16 +244,21 @@ export class PubSub implements PubSubEngine {
       } else {
         // Drop-oldest policy: when the buffer is full, evict the oldest
         // payload so the queue cannot grow without bound
-        if (pushQueue.length >= maxQueueSize) {
-          pushQueue.shift();
-        }
         pushQueue.push(payload);
       }
     };
 
     // Subscribe to all topics
-    for (const t of topics) {
-      unsubscribes.push(this.subscribe(t, pushValue));
+    try {
+      for (const t of topics) {
+        unsubscribes.push(this.subscribe(t, pushValue));
+      }
+    } catch (error) {
+      // Roll back the topics already subscribed, or they leak
+      for (const unsubscribe of unsubscribes) {
+        unsubscribe();
+      }
+      throw error;
     }
 
     return {
@@ -257,8 +271,8 @@ export class PubSub implements PubSubEngine {
           return { value: undefined, done: true };
         }
 
-        if (pushQueue.length > 0) {
-          return { value: pushQueue.shift()!, done: false };
+        if (pushQueue.size > 0) {
+          return { value: pushQueue.shift() as T, done: false };
         }
 
         return new Promise((resolve) => {
@@ -279,7 +293,7 @@ export class PubSub implements PubSubEngine {
         }
         pullQueue.forEach((resolve) => resolve({ value: undefined, done: true }));
         pullQueue.length = 0;
-        pushQueue.length = 0;
+        pushQueue.clear();
         return { value: undefined, done: true };
       },
 
@@ -294,7 +308,7 @@ export class PubSub implements PubSubEngine {
         // never run.
         pullQueue.forEach((resolve) => resolve({ value: undefined, done: true }));
         pullQueue.length = 0;
-        pushQueue.length = 0;
+        pushQueue.clear();
         throw error;
       },
     };

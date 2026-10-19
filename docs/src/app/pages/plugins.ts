@@ -205,7 +205,15 @@ export class PluginsComponent implements OnInit {
 const cachingPlugin = createCachingPlugin({
   maxSize: 100,   // LRU entries (default: 100)
   ttl: 60_000,    // Entry lifetime in ms (default: 60000)
-  keyFn: (ctx) => \`\${(ctx.context as AppContext).userId}:\${ctx.request.query}\`,
+  // keyFn REPLACES the whole default key (query + operationName + variables),
+  // so include operationName and variables yourself or distinct requests collide.
+  keyFn: (ctx) =>
+    JSON.stringify([
+      (ctx.context as AppContext).userId,
+      ctx.request.query,
+      ctx.request.operationName ?? null,
+      JSON.stringify(ctx.request.variables ?? null),
+    ]),
 });
 
 // Only for data that is identical for every caller (fully public content):
@@ -319,7 +327,9 @@ const metricsPlugin = createPlugin(
     },
 
     afterExecute: async (response, context) => {
-      const startTime = context.state.get('startTime') as number;
+      // beforeExecute is skipped when an earlier plugin short-circuits
+      const startTime = context.state.get('startTime') as number | undefined;
+      if (startTime === undefined) return response;
       const duration = performance.now() - startTime;
 
       // Record metrics
@@ -350,7 +360,8 @@ const metricsPlugin = createPlugin(
   createDepthLimitPlugin,
   createComplexityPlugin,
 } from '@leaven-graphql/plugins';
-import { LeavenExecutor } from '@leaven-graphql/core';
+import { LeavenExecutor, type GraphQLRequest } from '@leaven-graphql/core';
+import { parse } from 'graphql';
 
 // Combine multiple plugins into one: composePlugins(name, ...plugins)
 const combinedPlugin = composePlugins(
@@ -371,12 +382,24 @@ const manager = createPluginManager({
 const executor = new LeavenExecutor({ schema });
 
 // Run the plugin pipeline around execution
-const pluginContext = manager.createContext(graphqlRequest, contextValue);
+async function handle(graphqlRequest: GraphQLRequest, contextValue: unknown) {
+  const pluginContext = manager.createContext(graphqlRequest, contextValue);
 
-const query = await manager.beforeParse(graphqlRequest.query, pluginContext);
+  const query = await manager.beforeParse(graphqlRequest.query, pluginContext);
 
-// A beforeExecute hook may short-circuit (e.g. a cached response)
-const result = await executor.execute({ ...graphqlRequest, query }, contextValue);
+  // maxTokens bounds the parser so client input cannot be unbounded;
+  // afterParse runs the depth and complexity guardrails (they throw on violation)
+  const document = await manager.afterParse(parse(query, { maxTokens: 10_000 }), pluginContext);
 
-const response = await manager.afterExecute(result.response, pluginContext);`;
+  // A beforeExecute hook may short-circuit (e.g. a cached response)
+  const cached = await manager.beforeExecute(document, pluginContext);
+  if (cached) {
+    return manager.afterExecute(cached, pluginContext);
+  }
+
+  const result = await executor.execute({ ...graphqlRequest, query }, contextValue);
+
+  const response = await manager.afterExecute(result.response, pluginContext);
+  return response;
+}`;
 }

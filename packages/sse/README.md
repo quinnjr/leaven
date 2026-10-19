@@ -41,7 +41,8 @@ status code rather than as a stream: a result with no `data` that the executor
 itself rejected before running any resolver (a syntax error, a parser limit,
 validation, complexity, operation selection or variable coercion, or any
 other failure before execution starts: a throwing `onParse`, `onParsed`,
-`onValidate` or `onValidated` hook, or a document cache failure). The executor
+`onValidate` or `onValidated` hook; a document cache failure is a cache miss,
+not a failure). The executor
 marks those responses, and `isRequestError` checks the mark
 (`isRequestRejection` from `@leaven-graphql/core`), so the decision is
 structural rather than by error code. Everything else is streamed as `200`

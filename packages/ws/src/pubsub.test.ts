@@ -407,3 +407,74 @@ describe('PubSub logger', () => {
     }
   });
 });
+
+describe('PubSub wildcard matching and iterator cleanup', () => {
+  test("'*' should match exactly one segment", () => {
+    const ps = new PubSub({ wildcards: true });
+    const hits: string[] = [];
+    ps.subscribe('*', (p) => hits.push(p as string));
+    ps.publish('a', 'one');
+    ps.publish('a.b', 'two');
+    expect(hits).toEqual(['one']);
+  });
+
+  test("'events.*' should not match a deeper topic", () => {
+    const ps = new PubSub({ wildcards: true });
+    const hits: string[] = [];
+    ps.subscribe('events.*', (p) => hits.push(p as string));
+    ps.publish('events.a', 'one');
+    ps.publish('events.a.b', 'two');
+    expect(hits).toEqual(['one']);
+  });
+
+  test("'#' should still match every topic", () => {
+    const ps = new PubSub({ wildcards: true });
+    const hits: string[] = [];
+    ps.subscribe('#', (p) => hits.push(p as string));
+    ps.publish('a', 'one');
+    ps.publish('a.b.c', 'two');
+    expect(hits).toEqual(['one', 'two']);
+  });
+
+  test('asyncIterator should unsubscribe earlier topics when a later one throws', () => {
+    const ps = new PubSub({ maxSubscribersPerTopic: 1 });
+    ps.subscribe('full', () => {});
+    expect(() => ps.asyncIterator(['free', 'full'])).toThrow();
+    expect(ps.getSubscriberCount('free')).toBe(0);
+  });
+
+  test('drop-oldest should keep the newest payloads in order', async () => {
+    const ps = new PubSub({ maxQueueSize: 3 });
+    const it = ps.asyncIterator<number>('t');
+    for (let i = 1; i <= 5000; i++) ps.publish('t', i);
+    expect((await it.next()).value).toBe(4998);
+    expect((await it.next()).value).toBe(4999);
+    expect((await it.next()).value).toBe(5000);
+    await it.return?.();
+  });
+});
+
+describe('PubSub maxQueueSize validation', () => {
+  test.each([0, -1, 1.5, NaN])('should throw TypeError for %p', (value) => {
+    expect(() => new PubSub({ maxQueueSize: value })).toThrow(TypeError);
+  });
+
+  test('should accept Infinity and positive integers', () => {
+    expect(() => new PubSub({ maxQueueSize: Infinity })).not.toThrow();
+    expect(() => new PubSub({ maxQueueSize: 1 })).not.toThrow();
+  });
+});
+
+describe('PubSub asyncIterator lagging consumer', () => {
+  test('should deliver every payload in order when the consumer lags by one', async () => {
+    const ps = new PubSub();
+    const it = ps.asyncIterator<number>('t');
+    ps.publish('t', 0);
+    for (let i = 1; i <= 10_000; i++) {
+      ps.publish('t', i);
+      const r = await it.next();
+      expect(r.value).toBe(i - 1);
+    }
+    await it.return?.();
+  });
+});

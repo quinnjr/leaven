@@ -89,7 +89,7 @@ describe('isRequestError', () => {
     }
   );
 
-  test('should be true when the document cache read fails', async () => {
+  test('should be false when the document cache read fails (a cache miss)', async () => {
     const read = (): Promise<never> => Promise.reject(new Error('redis down'));
     const cached = new LeavenExecutor({
       schema,
@@ -106,6 +106,7 @@ describe('isRequestError', () => {
       } as unknown as ConstructorParameters<typeof LeavenExecutor>[0]['cache'],
     });
     const { response } = await cached.execute({ query: '{ hello }' });
-    expect(isRequestError(response)).toBe(true);
+    expect(response.data).toEqual({ hello: 'world' });
+    expect(isRequestError(response)).toBe(false);
   });
 });

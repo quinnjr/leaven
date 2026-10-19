@@ -9,6 +9,9 @@ import { GraphQLError, type GraphQLFormattedError, type SourceLocation } from 'g
 import { LeavenError } from './errors';
 import { ErrorCode, getErrorCode } from './codes';
 
+/** Default message substituted for masked, unexpected errors. */
+export const MASKED_ERROR_MESSAGE = 'An unexpected error occurred';
+
 /**
  * Custom error formatter function
  */
@@ -156,6 +159,67 @@ function shouldMaskError(
 }
 
 /**
+ * Apply the transports' masking default to user-supplied options.
+ *
+ * Errors thrown outside execution are masked unless the caller explicitly
+ * sets `maskErrors: false`. An omitted or `undefined` `maskErrors` still
+ * masks, and every other option is kept as given.
+ *
+ * @param options - The user's error formatting options, if any
+ * @returns The options with `maskErrors` defaulted to `true`
+ */
+export function withMaskingDefault(options?: ErrorMaskingOptions): ErrorMaskingOptions {
+  return { ...options, maskErrors: options?.maskErrors ?? true };
+}
+
+/**
+ * Build the generic masked response error for an unexpected failure.
+ *
+ * Carries the error's `locations` and `path` (when present) so clients can
+ * still correlate the failure, with the {@link MASKED_ERROR_MESSAGE} message
+ * and an `INTERNAL_ERROR` code.
+ *
+ * @param error - Anything exposing optional `path` and `locations`
+ * @param message - Message to show instead of {@link MASKED_ERROR_MESSAGE}
+ * @returns The masked, formatted error
+ */
+export function maskedErrorFor(
+  error: {
+    path?: readonly (string | number)[];
+    locations?: readonly SourceLocation[];
+  },
+  message: string = MASKED_ERROR_MESSAGE
+): GraphQLFormattedError {
+  const { path, locations } = error as { path?: unknown; locations?: unknown };
+  const safePath =
+    Array.isArray(path) &&
+    path.length > 0 &&
+    path.every(
+      (p: unknown) => typeof p === 'string' || (typeof p === 'number' && Number.isFinite(p))
+    )
+      ? (path as readonly (string | number)[])
+      : undefined;
+  const safeLocations: SourceLocation[] | undefined =
+    Array.isArray(locations) &&
+    locations.length > 0 &&
+    locations.every(
+      (l: unknown) =>
+        typeof l === 'object' &&
+        l !== null &&
+        typeof (l as SourceLocation).line === 'number' &&
+        typeof (l as SourceLocation).column === 'number'
+    )
+      ? (locations as SourceLocation[]).map(({ line, column }) => ({ line, column }))
+      : undefined;
+  return {
+    message,
+    ...(safeLocations ? { locations: safeLocations } : {}),
+    ...(safePath ? { path: safePath } : {}),
+    extensions: { code: ErrorCode.INTERNAL_ERROR },
+  };
+}
+
+/**
  * Mask sensitive error information
  */
 export function maskError(
@@ -170,12 +234,7 @@ export function maskError(
   }
 
   if (shouldMask) {
-    return {
-      message: options.maskedMessage ?? 'An unexpected error occurred',
-      extensions: {
-        code: ErrorCode.INTERNAL_ERROR,
-      },
-    };
+    return maskedErrorFor(error, options.maskedMessage);
   }
 
   // Build the formatted error using a mutable intermediate object

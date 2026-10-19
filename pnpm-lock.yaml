@@ -250,9 +250,6 @@ importers:
       '@graphql-tools/schema':
         specifier: ^10.1.5
         version: 10.1.5(graphql@17.0.2)
-      '@leaven-graphql/context':
-        specifier: workspace:*
-        version: link:../context
       '@leaven-graphql/core':
         specifier: workspace:*
         version: link:../core

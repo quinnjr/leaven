@@ -7,6 +7,7 @@
 
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import 'reflect-metadata';
+import { ForbiddenException } from '@nestjs/common';
 import type { ServerWebSocket } from 'bun';
 import {
   GraphQLError,
@@ -24,6 +25,7 @@ import {
   type SubscriptionSocket,
 } from './subscriptions';
 import { LeavenDriver } from './driver';
+import { withNodeEnv } from './test-utils/env';
 import { SubscriptionFilter, SUBSCRIPTION_FILTER_KEY } from './decorators';
 import { createPubSub } from '@leaven-graphql/ws';
 import { LEAVEN_PUBSUB, type LeavenModuleOptions } from './types';
@@ -115,7 +117,7 @@ describe('Subscription Decorator', () => {
     expect(metadata.options.filter).toBe(filterFn);
   });
 
-  test('records the filter under the same key as @SubscriptionFilter', () => {
+  test('should record the filter under the same key as @SubscriptionFilter', () => {
     const filterFn = (): boolean => true;
 
     class TestResolver {
@@ -388,7 +390,7 @@ describe('SubscriptionManager protocol errors (graphql-ws)', () => {
     await destroyHarness(harness);
   });
 
-  test('closes with 4400 on unparseable JSON', async () => {
+  test('should close with 4400 on unparseable JSON', async () => {
     const socket = createMockWebSocket();
     await harness.manager.handleConnection(socket as unknown as WebSocket);
 
@@ -398,7 +400,7 @@ describe('SubscriptionManager protocol errors (graphql-ws)', () => {
     expect(socket.closeCode).toBe(4400);
   });
 
-  test('closes with 4400 on a non-object message', async () => {
+  test('should close with 4400 on a non-object message', async () => {
     const socket = createMockWebSocket();
     await harness.manager.handleConnection(socket as unknown as WebSocket);
 
@@ -408,7 +410,7 @@ describe('SubscriptionManager protocol errors (graphql-ws)', () => {
     expect(socket.closeCode).toBe(4400);
   });
 
-  test('closes with 4400 on an unknown message type', async () => {
+  test('should close with 4400 on an unknown message type', async () => {
     const socket = createMockWebSocket();
     await harness.manager.handleConnection(socket as unknown as WebSocket);
 
@@ -419,7 +421,7 @@ describe('SubscriptionManager protocol errors (graphql-ws)', () => {
   });
 
   test.each(['evil\nINFO forged', 'x'.repeat(65), '', 'a b', 'del\u007f'])(
-    'closes with 4400 "Invalid message" for subscribe id %p',
+    'should close with 4400 "Invalid message" for subscribe id %p',
     async (id) => {
       const socket = await initConnection(harness.manager);
 
@@ -433,7 +435,7 @@ describe('SubscriptionManager protocol errors (graphql-ws)', () => {
     }
   );
 
-  test('closes with 4400 "Invalid message" for a malformed complete id', async () => {
+  test('should close with 4400 "Invalid message" for a malformed complete id', async () => {
     const socket = await initConnection(harness.manager);
 
     socket.simulateMessage(JSON.stringify({ type: 'complete', id: 'a\r\nb' }));
@@ -443,7 +445,7 @@ describe('SubscriptionManager protocol errors (graphql-ws)', () => {
     expect(socket.closeReason).toBe('Invalid message');
   });
 
-  test('closes with 4400 for a complete frame with a non-string id', async () => {
+  test('should close with 4400 for a complete frame with a non-string id', async () => {
     const socket = await initConnection(harness.manager);
 
     socket.simulateMessage(JSON.stringify({ type: 'complete', id: 7 }));
@@ -452,7 +454,7 @@ describe('SubscriptionManager protocol errors (graphql-ws)', () => {
     expect(socket.closeCode).toBe(4400);
   });
 
-  test('accepts a well-formed operation id', async () => {
+  test('should accept a well-formed operation id', async () => {
     const socket = await initConnection(harness.manager);
 
     socket.simulateMessage(
@@ -465,7 +467,7 @@ describe('SubscriptionManager protocol errors (graphql-ws)', () => {
     expect(socket.readyState).not.toBe(3);
   });
 
-  test('closes with 4409 when a subscribe reuses an active operation id', async () => {
+  test('should close with 4409 when a subscribe reuses an active operation id', async () => {
     const socket = await initConnection(harness.manager);
 
     expect(
@@ -480,7 +482,7 @@ describe('SubscriptionManager protocol errors (graphql-ws)', () => {
     expect(socket.closeCode).toBe(4409);
   });
 
-  test('sends an error frame when a subscription operation fails validation', async () => {
+  test('should send an error frame when a subscription operation fails validation', async () => {
     const socket = await initConnection(harness.manager);
 
     socket.simulateMessage(
@@ -501,7 +503,7 @@ describe('SubscriptionManager protocol errors (graphql-ws)', () => {
     expect(harness.manager.getSubscriptionCount()).toBe(0);
   });
 
-  test('emits an error frame and deregisters when a stream throws mid-flight', async () => {
+  test('should emit an error frame and deregister when a stream throws mid-flight', async () => {
     const socket = await initConnection(harness.manager);
 
     socket.simulateMessage(
@@ -532,7 +534,7 @@ describe('SubscriptionManager protocol errors (graphql-ws)', () => {
     await waitFor(() => harness.manager.getSubscriptionCount() === 0);
   });
 
-  test('rejects a subscribe frame past the per-connection limit without closing the socket', async () => {
+  test('should reject a subscribe frame past the per-connection limit without closing the socket', async () => {
     const limited = await createManager({ maxSubscriptionsPerConnection: 1 });
     const socket = await initConnection(limited.manager);
 
@@ -573,7 +575,7 @@ describe('SubscriptionManager protocol errors (graphql-ws)', () => {
     await destroyHarness(limited);
   });
 
-  test('sends an error frame when the driver has no schema', async () => {
+  test('should send an error frame when the driver has no schema', async () => {
     const schemaless = new SubscriptionManager(
       { schema: createTestSchema() },
       { getSchema: () => null } as unknown as LeavenDriver
@@ -600,7 +602,7 @@ describe('SubscriptionManager protocol errors (graphql-ws)', () => {
     await schemaless.onModuleDestroy();
   });
 
-  test('frees the operation id when the schema is unavailable, so it can be retried', async () => {
+  test('should free the operation id when the schema is unavailable, so it can be retried', async () => {
     const schemaless = new SubscriptionManager(
       { schema: createTestSchema() },
       { getSchema: () => null } as unknown as LeavenDriver
@@ -632,7 +634,7 @@ describe('SubscriptionManager protocol errors (graphql-ws)', () => {
     await schemaless.onModuleDestroy();
   });
 
-  test('closes 1011 (retryable) when a connection_init hook fails', async () => {
+  test('should close 1011 (retryable) when a connection_init hook fails', async () => {
     const failing = await createManager({
       onConnect: () => {
         throw new Error('auth service unavailable');
@@ -654,7 +656,7 @@ describe('SubscriptionManager protocol errors (graphql-ws)', () => {
 });
 
 describe('SubscriptionManager streaming', () => {
-  test('streams each subscription event as a next frame, then completes', async () => {
+  test('should stream each subscription event as a next frame, then completes', async () => {
     const harness = await createManager();
     const socket = await initConnection(harness.manager);
 
@@ -684,7 +686,7 @@ describe('SubscriptionManager streaming', () => {
     await destroyHarness(harness);
   });
 
-  test('stops producing events when the client sends complete', async () => {
+  test('should stop producing events when the client sends complete', async () => {
     const probe: StreamProbe = { cleanedUp: false };
     const harness = await createManager(undefined, probe);
     const socket = await initConnection(harness.manager);
@@ -711,7 +713,7 @@ describe('SubscriptionManager streaming', () => {
     await destroyHarness(harness);
   });
 
-  test('releases in-flight streams when the connection closes', async () => {
+  test('should release in-flight streams when the connection closes', async () => {
     const probe: StreamProbe = { cleanedUp: false };
     const harness = await createManager(undefined, probe);
     const socket = await initConnection(harness.manager);
@@ -738,7 +740,7 @@ describe('SubscriptionManager streaming', () => {
     await destroyHarness(harness);
   });
 
-  test('allows an operation id to be reused after the client completes it', async () => {
+  test('should allow an operation id to be reused after the client completes it', async () => {
     const probe: StreamProbe = { cleanedUp: false };
     const harness = await createManager(undefined, probe);
     const socket = await initConnection(harness.manager);
@@ -775,7 +777,7 @@ describe('SubscriptionManager streaming', () => {
     await destroyHarness(harness);
   });
 
-  test('streams filtered PubSub events end to end', async () => {
+  test('should stream filtered PubSub events end to end', async () => {
     const pubSub = createPubSub();
 
     // The shape a user writes: a subscribe resolver returning a PubSub
@@ -850,7 +852,7 @@ describe('SubscriptionManager streaming', () => {
     await driver.onModuleDestroy();
   });
 
-  test('resolves subscription payloads against the trusted context', async () => {
+  test('should resolve subscription payloads against the trusted context', async () => {
     const harness = await createManager({
       context: (ctx) => ({ ...ctx, user: { id: 'trusted-user' } }) as never,
     });
@@ -874,7 +876,7 @@ describe('SubscriptionManager streaming', () => {
     await destroyHarness(harness);
   });
 
-  test('a send that throws mid-stream settles the detached pump instead of rejecting', async () => {
+  test('should settle the detached pump instead of rejecting when a send throws mid-stream', async () => {
     const harness = await createManager();
     const socket = await initConnection(harness.manager);
 
@@ -903,7 +905,7 @@ describe('SubscriptionManager streaming', () => {
     await destroyHarness(harness);
   });
 
-  test('interleaves two concurrent subscriptions without cross-delivery', async () => {
+  test('should interleave two concurrent subscriptions without cross-delivery', async () => {
     const harness = await createManager();
     const socket = await initConnection(harness.manager);
 
@@ -949,15 +951,9 @@ describe('SubscriptionManager streaming', () => {
 
 describe('SubscriptionManager error formatting', () => {
   const MASKED = 'An unexpected error occurred';
-  let originalEnv: string | undefined;
   let harness: TestHarness | undefined;
 
-  beforeEach(() => {
-    originalEnv = process.env.NODE_ENV;
-  });
-
   afterEach(async () => {
-    process.env.NODE_ENV = originalEnv;
     if (harness) {
       await destroyHarness(harness);
       harness = undefined;
@@ -1026,143 +1022,167 @@ describe('SubscriptionManager error formatting', () => {
     return (frame?.payload as Array<{ message: string; extensions?: Record<string, unknown> }>)[0]!;
   }
 
-  test('masks a context factory failure in production', async () => {
-    process.env.NODE_ENV = 'production';
-    const socket = await subscribe(
-      {
-        context: () => {
-          throw new Error('postgres://u:p@h/db refused');
+  test('should mask a context factory failure in production', async () => {
+    await withNodeEnv('production', async () => {
+      const socket = await subscribe(
+        {
+          context: () => {
+            throw new Error('postgres://u:p@h/db refused');
+          },
         },
-      },
-      'subscription { forever }'
-    );
-    await waitFor(() => sentOfType(socket, 'error').length > 0);
+        'subscription { forever }'
+      );
+      await waitFor(() => sentOfType(socket, 'error').length > 0);
 
-    expect(firstError(socket).message).toBe(MASKED);
-    expect(firstError(socket).extensions?.code).toBe(ErrorCode.INTERNAL_ERROR);
-    expect(JSON.stringify(socket.sentMessages)).not.toContain('postgres://');
-    expect(socket.readyState).toBe(1);
+      expect(firstError(socket).message).toBe(MASKED);
+      expect(firstError(socket).extensions?.code).toBe(ErrorCode.INTERNAL_ERROR);
+      expect(JSON.stringify(socket.sentMessages)).not.toContain('postgres://');
+      expect(socket.readyState).toBe(1);
+    });
   });
 
-  test('sends a context factory failure with INTERNAL_ERROR outside production', async () => {
-    process.env.NODE_ENV = 'development';
-    const socket = await subscribe(
-      {
-        context: () => {
-          throw new Error('postgres://u:p@h/db refused');
+  test('should send a context factory failure with INTERNAL_ERROR outside production', async () => {
+    await withNodeEnv('development', async () => {
+      const socket = await subscribe(
+        {
+          context: () => {
+            throw new Error('postgres://u:p@h/db refused');
+          },
         },
-      },
-      'subscription { forever }'
-    );
-    await waitFor(() => sentOfType(socket, 'error').length > 0);
+        'subscription { forever }'
+      );
+      await waitFor(() => sentOfType(socket, 'error').length > 0);
 
-    expect(firstError(socket).message).toBe('postgres://u:p@h/db refused');
-    expect(firstError(socket).extensions?.code).toBe(ErrorCode.INTERNAL_ERROR);
+      expect(firstError(socket).message).toBe('postgres://u:p@h/db refused');
+      expect(firstError(socket).extensions?.code).toBe(ErrorCode.INTERNAL_ERROR);
+    });
   });
 
-  test('masks a failing onSubscribe hook on a single-result operation in production', async () => {
-    process.env.NODE_ENV = 'production';
-    const socket = await subscribe(
-      {
-        onSubscribe: () => {
-          throw new Error('ldap bind failed for cn=admin');
+  test('should mask a failing onSubscribe hook on a single-result operation in production', async () => {
+    await withNodeEnv('production', async () => {
+      const socket = await subscribe(
+        {
+          onSubscribe: () => {
+            throw new Error('ldap bind failed for cn=admin');
+          },
         },
-      },
-      '{ hello }'
-    );
-    await waitFor(() => sentOfType(socket, 'error').length > 0);
+        '{ hello }'
+      );
+      await waitFor(() => sentOfType(socket, 'error').length > 0);
 
-    expect(firstError(socket).message).toBe(MASKED);
+      expect(firstError(socket).message).toBe(MASKED);
+    });
   });
 
-  test('keeps a LeavenError message and code in production', async () => {
-    process.env.NODE_ENV = 'production';
-    const socket = await subscribe(
-      {
-        onSubscribe: () => {
-          throw new AuthenticationError('Token expired');
+  test('should keep a LeavenError message and code in production', async () => {
+    await withNodeEnv('production', async () => {
+      const socket = await subscribe(
+        {
+          onSubscribe: () => {
+            throw new AuthenticationError('Token expired');
+          },
         },
-      },
-      'subscription { forever }'
-    );
-    await waitFor(() => sentOfType(socket, 'error').length > 0);
+        'subscription { forever }'
+      );
+      await waitFor(() => sentOfType(socket, 'error').length > 0);
 
-    expect(firstError(socket).message).toBe('Token expired');
-    expect(firstError(socket).extensions?.code).toBe(ErrorCode.UNAUTHENTICATED);
+      expect(firstError(socket).message).toBe('Token expired');
+      expect(firstError(socket).extensions?.code).toBe(ErrorCode.UNAUTHENTICATED);
+    });
   });
 
-  test('keeps the code of a GraphQLError thrown by the source stream', async () => {
-    process.env.NODE_ENV = 'production';
-    const socket = await subscribe(undefined, 'subscription { forbidden }');
-    await waitFor(() => sentOfType(socket, 'error').length > 0);
+  test('should map an HttpException thrown by onSubscribe to its code in production', async () => {
+    await withNodeEnv('production', async () => {
+      const socket = await subscribe(
+        {
+          onSubscribe: () => {
+            throw new ForbiddenException('No access');
+          },
+        },
+        'subscription { forever }'
+      );
+      await waitFor(() => sentOfType(socket, 'error').length > 0);
 
-    expect(firstError(socket).message).toBe('Not allowed to watch this');
-    expect(firstError(socket).extensions?.code).toBe(ErrorCode.FORBIDDEN);
+      expect(firstError(socket).message).toBe('No access');
+      expect(firstError(socket).extensions?.code).toBe(ErrorCode.FORBIDDEN);
+    });
   });
 
-  test('masks a raw Error thrown by the source stream in production', async () => {
-    process.env.NODE_ENV = 'production';
-    const socket = await subscribe(undefined, 'subscription { crashing }');
-    await waitFor(() => sentOfType(socket, 'error').length > 0);
+  test('should keep the code of a GraphQLError thrown by the source stream', async () => {
+    await withNodeEnv('production', async () => {
+      const socket = await subscribe(undefined, 'subscription { forbidden }');
+      await waitFor(() => sentOfType(socket, 'error').length > 0);
 
-    expect(firstError(socket).message).toBe(MASKED);
-    expect(JSON.stringify(socket.sentMessages)).not.toContain('postgres://');
+      expect(firstError(socket).message).toBe('Not allowed to watch this');
+      expect(firstError(socket).extensions?.code).toBe(ErrorCode.FORBIDDEN);
+    });
   });
 
-  test('applies formatError to setup failures, stream failures and next payload errors', async () => {
-    process.env.NODE_ENV = 'development';
-    const seen: string[] = [];
-    harness = await createManager(
-      {
-        context: (ctx) => {
-          if (ctx.connectionParams?.['fail']) {
-            throw new Error('context failed');
-          }
-          return { req: undefined as unknown as Request, res: {} as Response };
+  test('should mask a raw Error thrown by the source stream in production', async () => {
+    await withNodeEnv('production', async () => {
+      const socket = await subscribe(undefined, 'subscription { crashing }');
+      await waitFor(() => sentOfType(socket, 'error').length > 0);
+
+      expect(firstError(socket).message).toBe(MASKED);
+      expect(JSON.stringify(socket.sentMessages)).not.toContain('postgres://');
+    });
+  });
+
+  test('should apply formatError to setup failures, stream failures and next payload errors', async () => {
+    await withNodeEnv('development', async () => {
+      const seen: string[] = [];
+      harness = await createManager(
+        {
+          context: (ctx) => {
+            if (ctx.connectionParams?.['fail']) {
+              throw new Error('context failed');
+            }
+            return { req: undefined as unknown as Request, res: {} as Response };
+          },
         },
-      },
-      undefined,
-      {
-        schema: failingSchema(),
-        formatError: (error) => {
-          seen.push(error.message);
-          return { message: 'formatted', extensions: { code: 'CUSTOM' } };
-        },
-      }
-    );
+        undefined,
+        {
+          schema: failingSchema(),
+          formatError: (error) => {
+            seen.push(error.message);
+            return { message: 'formatted', extensions: { code: 'CUSTOM' } };
+          },
+        }
+      );
 
-    const streaming = await initConnection(harness.manager);
-    streaming.simulateMessage(
-      JSON.stringify({ type: 'subscribe', id: 'p', payload: { query: 'subscription { poisoned }' } })
-    );
-    streaming.simulateMessage(
-      JSON.stringify({ type: 'subscribe', id: 'c', payload: { query: 'subscription { crashing }' } })
-    );
-    await waitFor(() => sentOfType(streaming, 'complete').length > 0);
-    await waitFor(() => sentOfType(streaming, 'error').length > 0);
+      const streaming = await initConnection(harness.manager);
+      streaming.simulateMessage(
+        JSON.stringify({ type: 'subscribe', id: 'p', payload: { query: 'subscription { poisoned }' } })
+      );
+      streaming.simulateMessage(
+        JSON.stringify({ type: 'subscribe', id: 'c', payload: { query: 'subscription { crashing }' } })
+      );
+      await waitFor(() => sentOfType(streaming, 'complete').length > 0);
+      await waitFor(() => sentOfType(streaming, 'error').length > 0);
 
-    const failing = await initConnection(harness.manager, { fail: true });
-    failing.simulateMessage(
-      JSON.stringify({ type: 'subscribe', id: 'f', payload: { query: 'subscription { forever }' } })
-    );
-    await waitFor(() => sentOfType(failing, 'error').length > 0);
+      const failing = await initConnection(harness.manager, { fail: true });
+      failing.simulateMessage(
+        JSON.stringify({ type: 'subscribe', id: 'f', payload: { query: 'subscription { forever }' } })
+      );
+      await waitFor(() => sentOfType(failing, 'error').length > 0);
 
-    expect(seen).toContain('decrypt failed with key sk_live_123');
-    expect(seen).toContain('postgres://u:p@h/db stream reset');
-    expect(seen).toContain('context failed');
+      expect(seen).toContain('decrypt failed with key sk_live_123');
+      expect(seen).toContain('postgres://u:p@h/db stream reset');
+      expect(seen).toContain('context failed');
 
-    const next = sentOfType(streaming, 'next').find((frame) => frame.id === 'p');
-    expect((next?.payload as { errors?: Array<{ message: string }> }).errors?.[0]?.message).toBe(
-      'formatted'
-    );
-    expect(firstError(streaming).message).toBe('formatted');
-    expect(firstError(failing).message).toBe('formatted');
-    expect(JSON.stringify(streaming.sentMessages)).not.toContain('sk_live_123');
+      const next = sentOfType(streaming, 'next').find((frame) => frame.id === 'p');
+      expect((next?.payload as { errors?: Array<{ message: string }> }).errors?.[0]?.message).toBe(
+        'formatted'
+      );
+      expect(firstError(streaming).message).toBe('formatted');
+      expect(firstError(failing).message).toBe('formatted');
+      expect(JSON.stringify(streaming.sentMessages)).not.toContain('sk_live_123');
+    });
   });
 });
 
 describe('SubscriptionManager security (connection params)', () => {
-  test('forged user in connection_init does not appear at context.user', async () => {
+  test('should not expose a forged connection_init user at context.user', async () => {
     const harness = await createManager();
     const socket = await initConnection(harness.manager, {
       user: { id: 'forged', roles: ['admin'] },
@@ -1181,7 +1201,7 @@ describe('SubscriptionManager security (connection params)', () => {
     await destroyHarness(harness);
   });
 
-  test('connection params are namespaced and cannot overwrite req/res', async () => {
+  test('should namespace connection params so they cannot overwrite req/res', async () => {
     const captured: Array<Record<string, unknown>> = [];
     const harness = await createManager({
       onOperation: (_ctx, _msg, args) => {
@@ -1217,13 +1237,17 @@ describe('SubscriptionManager security (connection params)', () => {
 });
 
 describe('SubscriptionManager parse limits (LeavenModuleOptions.parseOptions)', () => {
-  /** Payload of the single `next` frame answering operation `id` */
-  function nextErrors(socket: MockWebSocket, id: string): Array<{ message: string }> {
-    const next = sentOfType(socket, 'next').find((frame) => frame.id === id);
-    return ((next?.payload as { errors?: Array<{ message: string }> }) ?? {}).errors ?? [];
+  /**
+   * Payload of the `error` frame answering operation `id`: a document over
+   * the token budget fails before execution, which graphql-ws reports with
+   * `error` rather than `next`.
+   */
+  function requestErrors(socket: MockWebSocket, id: string): Array<{ message: string }> {
+    const error = sentOfType(socket, 'error').find((frame) => frame.id === id);
+    return (error?.payload as Array<{ message: string }> | undefined) ?? [];
   }
 
-  test('applies a default maxTokens of 10000 to operation-type detection and execution', async () => {
+  test('should apply a default maxTokens of 10000 to operation-type detection and execution', async () => {
     const harness = await createManager();
     const socket = await initConnection(harness.manager);
 
@@ -1234,17 +1258,17 @@ describe('SubscriptionManager parse limits (LeavenModuleOptions.parseOptions)', 
         payload: { query: `subscription { ${'countdown '.repeat(10_001)} }` },
       })
     );
-    await waitFor(() => sentOfType(socket, 'complete').length > 0);
+    await waitFor(() => sentOfType(socket, 'error').length > 0);
 
     // Reported through the executor's error path, not thrown out of the handler
-    expect(nextErrors(socket, '1')[0]?.message).toMatch(/tokens/i);
+    expect(requestErrors(socket, '1')[0]?.message).toMatch(/tokens/i);
     expect(socket.readyState).toBe(1);
     expect(harness.manager.getSubscriptionCount()).toBe(0);
 
     await destroyHarness(harness);
   });
 
-  test('honours a configured parseOptions.maxTokens', async () => {
+  test('should honour a configured parseOptions.maxTokens', async () => {
     const harness = await createManager(undefined, undefined, {
       parseOptions: { maxTokens: 5 },
     });
@@ -1257,9 +1281,9 @@ describe('SubscriptionManager parse limits (LeavenModuleOptions.parseOptions)', 
         payload: { query: 'subscription { countdown countdown countdown countdown }' },
       })
     );
-    await waitFor(() => sentOfType(socket, 'complete').length > 0);
+    await waitFor(() => sentOfType(socket, 'error').length > 0);
 
-    expect(nextErrors(socket, '1')[0]?.message).toMatch(/tokens/i);
+    expect(requestErrors(socket, '1')[0]?.message).toMatch(/tokens/i);
     expect(socket.readyState).toBe(1);
 
     // A document within the budget still runs
@@ -1275,7 +1299,7 @@ describe('SubscriptionManager parse limits (LeavenModuleOptions.parseOptions)', 
 });
 
 describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)', () => {
-  test('onConnect returning false closes the connection with 4401', async () => {
+  test('should close the connection with 4403 Forbidden when onConnect returns false', async () => {
     const harness = await createManager({ onConnect: () => false });
     const socket = createMockWebSocket();
     await harness.manager.handleConnection(socket as unknown as WebSocket);
@@ -1283,13 +1307,30 @@ describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)'
     socket.simulateMessage(JSON.stringify({ type: 'connection_init' }));
     await waitFor(() => socket.readyState === 3);
 
-    expect(socket.closeCode).toBe(4401);
+    expect(socket.closeCode).toBe(4403);
+    expect(socket.closeReason).toBe('Forbidden');
     expect(sentOfType(socket, 'connection_ack').length).toBe(0);
 
     await destroyHarness(harness);
   });
 
-  test('a second connection_init while onConnect is pending closes with 4429', async () => {
+  test('should still close with 4401 Unauthorized on a subscribe before connection_ack', async () => {
+    const harness = await createManager();
+    const socket = createMockWebSocket();
+    await harness.manager.handleConnection(socket as unknown as WebSocket);
+
+    socket.simulateMessage(
+      JSON.stringify({ type: 'subscribe', id: '1', payload: { query: '{ hello }' } })
+    );
+    await waitFor(() => socket.readyState === 3);
+
+    expect(socket.closeCode).toBe(4401);
+    expect(socket.closeReason).toBe('Unauthorized');
+
+    await destroyHarness(harness);
+  });
+
+  test('should close with 4429 on a second connection_init while onConnect is pending', async () => {
     let connects = 0;
     const harness = await createManager({
       keepAlive: 1000,
@@ -1315,7 +1356,7 @@ describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)'
     await destroyHarness(harness);
   });
 
-  test('a socket closed during onConnect is neither acknowledged nor kept alive', async () => {
+  test('should neither acknowledge nor keep alive a socket closed during onConnect', async () => {
     const harness = await createManager({
       keepAlive: 5,
       onConnect: async () => {
@@ -1344,7 +1385,7 @@ describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)'
     await destroyHarness(harness);
   });
 
-  test('onConnect returning true acknowledges the connection', async () => {
+  test('should acknowledge the connection when onConnect returns true', async () => {
     const harness = await createManager({ onConnect: () => true });
     const socket = await initConnection(harness.manager);
 
@@ -1354,7 +1395,7 @@ describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)'
     await destroyHarness(harness);
   });
 
-  test('context hook contributes to the resolver context', async () => {
+  test('should contribute the context hook to the resolver context', async () => {
     const harness = await createManager({
       context: () => ({
         req: {} as Request,
@@ -1377,7 +1418,7 @@ describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)'
     await destroyHarness(harness);
   });
 
-  test('onOperation can rewrite execution args before execution', async () => {
+  test('should let onOperation rewrite execution args before execution', async () => {
     const harness = await createManager({
       onOperation: (_ctx, _msg, args) => ({
         ...args,
@@ -1401,7 +1442,7 @@ describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)'
     await destroyHarness(harness);
   });
 
-  test('onComplete fires when an active subscription is completed', async () => {
+  test('should fire onComplete when an active subscription is completed', async () => {
     const completed: string[] = [];
     const harness = await createManager({
       onComplete: (_ctx, msg) => {
@@ -1424,7 +1465,7 @@ describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)'
     await destroyHarness(harness);
   });
 
-  test('onDisconnect fires when an initialized connection closes', async () => {
+  test('should fire onDisconnect when an initialized connection closes', async () => {
     let disconnected = false;
     const harness = await createManager({
       onDisconnect: () => {
@@ -1441,7 +1482,7 @@ describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)'
     await destroyHarness(harness);
   });
 
-  test('a throwing onDisconnect still releases streams and drops the connection', async () => {
+  test('should still release streams and drop the connection when onDisconnect throws', async () => {
     const probe: StreamProbe = { cleanedUp: false };
     const harness = await createManager(
       {
@@ -1473,7 +1514,7 @@ describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)'
     await destroyHarness(harness);
   });
 
-  test('closes with 4408 when connection_init never arrives', async () => {
+  test('should close with 4408 when connection_init never arrives', async () => {
     const harness = await createManager({ connectionInitWaitTimeout: 20 });
     const socket = createMockWebSocket();
     await harness.manager.handleConnection(socket as unknown as WebSocket);
@@ -1485,7 +1526,7 @@ describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)'
     await destroyHarness(harness);
   });
 
-  test('does not close a socket that initialised before the timeout', async () => {
+  test('should not close a socket that initialised before the timeout', async () => {
     const harness = await createManager({ connectionInitWaitTimeout: 20 });
     const socket = await initConnection(harness.manager);
 
@@ -1499,7 +1540,7 @@ describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)'
     await destroyHarness(harness);
   });
 
-  test('emits keep-alive pings on the configured interval', async () => {
+  test('should emit keep-alive pings on the configured interval', async () => {
     const harness = await createManager({ keepAlive: 10 });
     const socket = await initConnection(harness.manager);
 
@@ -1510,7 +1551,7 @@ describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)'
     await destroyHarness(harness);
   });
 
-  test('maxSubscriptionsPerConnection from module options is honored', async () => {
+  test('should honor maxSubscriptionsPerConnection from module options', async () => {
     const harness = await createManager({ maxSubscriptionsPerConnection: 1 });
     const socket = await initConnection(harness.manager);
 
@@ -1520,6 +1561,388 @@ describe('SubscriptionManager configuration (LeavenModuleOptions.subscriptions)'
     expect(
       harness.manager.registerSubscription(socket as unknown as WebSocket, '2', 'topic-b')
     ).toBe(false);
+
+    await destroyHarness(harness);
+  });
+});
+
+describe('SubscriptionManager single-result operations (graphql-ws)', () => {
+  /** onOperation hook that parks every operation until `open()` is called */
+  function gate(): { hook: SubscriptionConfig['onOperation']; open: () => void } {
+    let release: () => void = () => {};
+    const opened = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return {
+      hook: async (_ctx, _message, args) => {
+        await opened;
+        return args;
+      },
+      open: () => release(),
+    };
+  }
+
+  test('should answer a query that fails validation with one error frame, not next', async () => {
+    const harness = await createManager();
+    const socket = await initConnection(harness.manager);
+
+    socket.simulateMessage(
+      JSON.stringify({ type: 'subscribe', id: 'q', payload: { query: '{ nonexistentField }' } })
+    );
+    await waitFor(() => sentOfType(socket, 'error').length > 0);
+    // Absence wait: nothing else may follow the error frame.
+    await sleep(ABSENCE_WAIT_MS);
+
+    const errors = sentOfType(socket, 'error');
+    expect(errors.length).toBe(1);
+    expect(errors[0]?.id).toBe('q');
+    expect(
+      (errors[0]?.payload as Array<{ message: string }>)[0]?.message
+    ).toContain('nonexistentField');
+    expect(sentOfType(socket, 'next').length).toBe(0);
+    expect(sentOfType(socket, 'complete').length).toBe(0);
+    expect(socket.readyState).toBe(1);
+    expect(harness.manager.getSubscriptionCount()).toBe(0);
+
+    await destroyHarness(harness);
+  });
+
+  test('should close with 4409 when a subscribe reuses the id of an in-flight query', async () => {
+    const { hook, open } = gate();
+    const harness = await createManager({ onOperation: hook });
+    const socket = await initConnection(harness.manager);
+
+    const frame = JSON.stringify({ type: 'subscribe', id: 'q', payload: { query: '{ hello }' } });
+    socket.simulateMessage(frame);
+    await waitFor(() => harness.manager.getSubscriptionCount() === 1);
+
+    socket.simulateMessage(frame);
+    await waitFor(() => socket.readyState === 3);
+
+    expect(socket.closeCode).toBe(4409);
+    open();
+    await destroyHarness(harness);
+  });
+
+  test('should count an in-flight query against maxSubscriptionsPerConnection', async () => {
+    const { hook, open } = gate();
+    const harness = await createManager({ maxSubscriptionsPerConnection: 1, onOperation: hook });
+    const socket = await initConnection(harness.manager);
+
+    socket.simulateMessage(
+      JSON.stringify({ type: 'subscribe', id: '1', payload: { query: '{ hello }' } })
+    );
+    await waitFor(() => harness.manager.getSubscriptionCount() === 1);
+
+    socket.simulateMessage(
+      JSON.stringify({ type: 'subscribe', id: '2', payload: { query: '{ hello }' } })
+    );
+    await waitFor(() => sentOfType(socket, 'error').length > 0);
+
+    const errors = sentOfType(socket, 'error');
+    expect(errors[0]?.id).toBe('2');
+    expect((errors[0]?.payload as Array<{ message: string }>)[0]?.message).toBe(
+      'Too many subscriptions'
+    );
+
+    // Once the query answers, its slot is released.
+    open();
+    await waitFor(() => sentOfType(socket, 'complete').some((frame) => frame.id === '1'));
+    expect(harness.manager.getSubscriptionCount()).toBe(0);
+    expect(socket.readyState).toBe(1);
+
+    await destroyHarness(harness);
+  });
+
+  test('should detect the operation type through executor.parse', async () => {
+    const harness = await createManager();
+    const executor = harness.driver.getExecutor();
+    expect(executor).not.toBeNull();
+    const parseSpy = spyOn(executor!, 'parse');
+    const socket = await initConnection(harness.manager);
+
+    socket.simulateMessage(
+      JSON.stringify({ type: 'subscribe', id: 's', payload: { query: 'subscription { countdown }' } })
+    );
+    await waitFor(() => sentOfType(socket, 'complete').length > 0);
+
+    expect(parseSpy).toHaveBeenCalledWith('subscription { countdown }');
+    // Detected as a stream: one `next` per event.
+    expect(sentOfType(socket, 'next').length).toBe(3);
+
+    parseSpy.mockRestore();
+    await destroyHarness(harness);
+  });
+
+  test('should send nothing for a gated query the client completed while it was in flight', async () => {
+    const { hook, open } = gate();
+    const harness = await createManager({ onOperation: hook });
+    const socket = await initConnection(harness.manager);
+
+    socket.simulateMessage(
+      JSON.stringify({ type: 'subscribe', id: 'q', payload: { query: '{ hello }' } })
+    );
+    await waitFor(() => harness.manager.getSubscriptionCount() === 1);
+
+    socket.simulateMessage(JSON.stringify({ type: 'complete', id: 'q' }));
+    await waitFor(() => harness.manager.getSubscriptionCount() === 0);
+
+    open();
+    // Absence wait: the released run must not answer the completed id.
+    await sleep(ABSENCE_WAIT_MS);
+
+    const forQ = socket.sentMessages.filter((m) => (m as { id?: unknown }).id === 'q');
+    expect(forQ).toEqual([]);
+    expect(socket.readyState).toBe(1);
+
+    await destroyHarness(harness);
+  });
+
+  test('should not release the id reused by a newer subscribe when a stale gated run ends', async () => {
+    const first = gate();
+    const second = gate();
+    let calls = 0;
+    const harness = await createManager({
+      onOperation: (ctx, message, args) =>
+        (calls++ === 0 ? first.hook : second.hook)!(ctx, message, args),
+    });
+    const socket = await initConnection(harness.manager);
+    const frame = JSON.stringify({ type: 'subscribe', id: 'q', payload: { query: '{ hello }' } });
+
+    socket.simulateMessage(frame);
+    await waitFor(() => calls === 1);
+    socket.simulateMessage(JSON.stringify({ type: 'complete', id: 'q' }));
+    await waitFor(() => harness.manager.getSubscriptionCount() === 0);
+
+    // Reuse the id before the first run is released.
+    socket.simulateMessage(frame);
+    await waitFor(() => calls === 2);
+    expect(harness.manager.getSubscriptionCount()).toBe(1);
+
+    // The stale run finishes: it must neither answer nor free the new claim.
+    first.open();
+    await sleep(ABSENCE_WAIT_MS);
+    expect(harness.manager.getSubscriptionCount()).toBe(1);
+    expect(socket.sentMessages.filter((m) => (m as { id?: unknown }).id === 'q')).toEqual([]);
+
+    second.open();
+    await waitFor(() => sentOfType(socket, 'complete').some((m) => m.id === 'q'));
+    expect(sentOfType(socket, 'next').filter((m) => m.id === 'q').length).toBe(1);
+    expect(harness.manager.getSubscriptionCount()).toBe(0);
+    expect(socket.readyState).toBe(1);
+
+    await destroyHarness(harness);
+  });
+
+  test('should send no error frame for a reused id when the hook of a stale run throws', async () => {
+    let release: () => void = () => {};
+    const opened = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const second = gate();
+    let calls = 0;
+    const harness = await createManager({
+      onOperation: async (ctx, message, args) => {
+        if (calls++ === 0) {
+          await opened;
+          throw new Error('stale hook failure');
+        }
+        return second.hook!(ctx, message, args);
+      },
+    });
+    const socket = await initConnection(harness.manager);
+    const frame = JSON.stringify({ type: 'subscribe', id: 'q', payload: { query: '{ hello }' } });
+
+    socket.simulateMessage(frame);
+    await waitFor(() => calls === 1);
+    socket.simulateMessage(JSON.stringify({ type: 'complete', id: 'q' }));
+    await waitFor(() => harness.manager.getSubscriptionCount() === 0);
+    socket.simulateMessage(frame);
+    await waitFor(() => calls === 2);
+
+    // The first run now throws: it no longer owns the id, so it stays silent.
+    release();
+    await sleep(ABSENCE_WAIT_MS);
+    expect(sentOfType(socket, 'error')).toEqual([]);
+    expect(harness.manager.getSubscriptionCount()).toBe(1);
+
+    second.open();
+    await waitFor(() => sentOfType(socket, 'complete').some((m) => m.id === 'q'));
+    expect(sentOfType(socket, 'error')).toEqual([]);
+
+    await destroyHarness(harness);
+  });
+
+  test('should send no schema-unavailable error frame for a run completed during onSubscribe', async () => {
+    let release: () => void = () => {};
+    const opened = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const schemaless = new SubscriptionManager(
+      {
+        schema: createTestSchema(),
+        subscriptions: { onSubscribe: async () => opened },
+      },
+      { getSchema: () => null } as unknown as LeavenDriver
+    );
+    await schemaless.onModuleInit();
+    const socket = await initConnection(schemaless);
+
+    socket.simulateMessage(
+      JSON.stringify({ type: 'subscribe', id: 'q', payload: { query: '{ hello }' } })
+    );
+    await waitFor(() => schemaless.getSubscriptionCount() === 1);
+    socket.simulateMessage(JSON.stringify({ type: 'complete', id: 'q' }));
+    await waitFor(() => schemaless.getSubscriptionCount() === 0);
+
+    release();
+    await sleep(ABSENCE_WAIT_MS);
+    expect(sentOfType(socket, 'error')).toEqual([]);
+
+    await schemaless.onModuleDestroy();
+  });
+
+  test('should send no error frame when a stream fails validation after the client completed', async () => {
+    const first = gate();
+    const harness = await createManager({ onOperation: first.hook });
+    const socket = await initConnection(harness.manager);
+
+    socket.simulateMessage(
+      JSON.stringify({
+        type: 'subscribe',
+        id: 'q',
+        payload: { query: 'subscription { doesNotExist }' },
+      })
+    );
+    await waitFor(() => harness.manager.getSubscriptionCount() === 1);
+    socket.simulateMessage(JSON.stringify({ type: 'complete', id: 'q' }));
+    await waitFor(() => harness.manager.getSubscriptionCount() === 0);
+
+    first.open();
+    await sleep(ABSENCE_WAIT_MS);
+    expect(sentOfType(socket, 'error')).toEqual([]);
+
+    await destroyHarness(harness);
+  });
+
+  test('should detect a stream by parsing locally when the driver has no executor', async () => {
+    const harness = await createManager();
+    const executor = harness.driver.getExecutor();
+    expect(executor).not.toBeNull();
+    const parseSpy = spyOn(executor!, 'parse');
+    // Detection only: the driver still executes through its own executor.
+    const getExecutorSpy = spyOn(harness.driver, 'getExecutor').mockReturnValue(null);
+    const socket = await initConnection(harness.manager);
+
+    socket.simulateMessage(
+      JSON.stringify({ type: 'subscribe', id: 's', payload: { query: 'subscription { countdown }' } })
+    );
+    await waitFor(() => sentOfType(socket, 'complete').length > 0);
+
+    expect(getExecutorSpy).toHaveBeenCalled();
+    expect(parseSpy).not.toHaveBeenCalled();
+    // Still detected as a stream: one `next` per event.
+    expect(sentOfType(socket, 'next').length).toBe(3);
+
+    getExecutorSpy.mockRestore();
+    parseSpy.mockRestore();
+    await destroyHarness(harness);
+  });
+
+  test('should fall through to the normal error path on a rejecting executor parse', async () => {
+    const harness = await createManager();
+    const executor = harness.driver.getExecutor();
+    expect(executor).not.toBeNull();
+    const parseSpy = spyOn(executor!, 'parse').mockRejectedValueOnce(new Error('parse failed'));
+    const socket = await initConnection(harness.manager);
+
+    socket.simulateMessage(
+      JSON.stringify({ type: 'subscribe', id: 'q', payload: { query: '{ nonexistentField }' } })
+    );
+    await waitFor(() => sentOfType(socket, 'error').length > 0);
+    await sleep(ABSENCE_WAIT_MS);
+
+    expect(parseSpy).toHaveBeenCalled();
+    const errors = sentOfType(socket, 'error');
+    expect(errors.length).toBe(1);
+    expect(errors[0]?.id).toBe('q');
+    // The executor's own validation error, not the detection failure.
+    const messages = (errors[0]?.payload as Array<{ message: string }>).map((e) => e.message);
+    expect(messages.join(' ')).toContain('nonexistentField');
+    expect(messages.join(' ')).not.toContain('parse failed');
+    expect(sentOfType(socket, 'next').length).toBe(0);
+    expect(socket.readyState).toBe(1);
+
+    parseSpy.mockRestore();
+    await destroyHarness(harness);
+  });
+});
+
+describe('SubscriptionManager topic index', () => {
+  interface TopicIndexView {
+    subscribers(topic: string): ReadonlySet<unknown> | undefined;
+  }
+
+  function topicIndex(manager: SubscriptionManager): TopicIndexView {
+    return (manager as unknown as { topicIndex: TopicIndexView }).topicIndex;
+  }
+
+  test('should remove the topic entry when the subscription is completed or its socket closes', async () => {
+    const harness = await createManager();
+    const socketA = await initConnection(harness.manager);
+    const socketB = await initConnection(harness.manager);
+
+    expect(
+      harness.manager.registerSubscription(socketA as unknown as WebSocket, '1', 'news')
+    ).toBe(true);
+    expect(
+      harness.manager.registerSubscription(socketB as unknown as WebSocket, '1', 'sport')
+    ).toBe(true);
+    expect(topicIndex(harness.manager).subscribers('news')?.size).toBe(1);
+    expect(topicIndex(harness.manager).subscribers('sport')?.size).toBe(1);
+
+    // Client `complete`
+    socketA.simulateMessage(JSON.stringify({ type: 'complete', id: '1' }));
+    await waitFor(() => topicIndex(harness.manager).subscribers('news') === undefined);
+
+    // Connection close
+    await harness.manager.handleClose(socketB as unknown as WebSocket);
+    expect(topicIndex(harness.manager).subscribers('sport')).toBeUndefined();
+    expect(topicIndex(harness.manager).subscribers('news')).toBeUndefined();
+
+    // Nothing is delivered for a torn-down topic.
+    harness.manager.publishToTopic('news', { headline: 'late' });
+    expect(sentOfType(socketA, 'next').length).toBe(0);
+
+    await destroyHarness(harness);
+  });
+
+  test('should warn about and drop a stale entry whose removal bypassed the index', async () => {
+    const harness = await createManager();
+    const socket = await initConnection(harness.manager);
+    expect(
+      harness.manager.registerSubscription(socket as unknown as WebSocket, '1', 'news')
+    ).toBe(true);
+
+    // Simulate a bug: remove the registration without unindexing it.
+    const connections = (
+      harness.manager as unknown as {
+        connections: Map<unknown, { subscriptions: Map<string, unknown> }>;
+      }
+    ).connections;
+    connections.get(socket)!.subscriptions.delete('1');
+
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      harness.manager.publishToTopic('news', { headline: 'stale' });
+
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0]?.[0])).toContain('Stale topic index entry');
+      expect(sentOfType(socket, 'next').length).toBe(0);
+      expect(topicIndex(harness.manager).subscribers('news')).toBeUndefined();
+    } finally {
+      warnSpy.mockRestore();
+    }
 
     await destroyHarness(harness);
   });
@@ -1536,7 +1959,7 @@ describe('SubscriptionManager publishToTopic (topic-keyed delivery)', () => {
     await destroyHarness(harness);
   });
 
-  test('does not fan out across connections sharing a client id', async () => {
+  test('should not fan out across connections sharing a client id', async () => {
     const socketA = await initConnection(harness.manager);
     const socketB = await initConnection(harness.manager);
 
@@ -1559,7 +1982,7 @@ describe('SubscriptionManager publishToTopic (topic-keyed delivery)', () => {
     expect(sentOfType(socketB, 'next').length).toBe(0);
   });
 
-  test('addresses each topic subscriber by its own client id', async () => {
+  test('should address each topic subscriber by its own client id', async () => {
     const socketA = await initConnection(harness.manager);
     const socketB = await initConnection(harness.manager);
 
@@ -1580,7 +2003,7 @@ describe('SubscriptionManager publishToTopic (topic-keyed delivery)', () => {
     expect(nextB[0]?.id).toBe('42');
   });
 
-  test('the deprecated publish() still forwards to publishToTopic', async () => {
+  test('should still forward the deprecated publish() to publishToTopic', async () => {
     const socket = await initConnection(harness.manager);
 
     expect(
@@ -1595,7 +2018,7 @@ describe('SubscriptionManager publishToTopic (topic-keyed delivery)', () => {
     expect((next[0]?.payload as { data: { headline: string } }).data.headline).toBe('legacy');
   });
 
-  test('rejects registration for unknown or uninitialized sockets', async () => {
+  test('should reject registration for unknown or uninitialized sockets', async () => {
     const uninitialized = createMockWebSocket();
     await harness.manager.handleConnection(uninitialized as unknown as WebSocket);
     expect(
@@ -1609,8 +2032,142 @@ describe('SubscriptionManager publishToTopic (topic-keyed delivery)', () => {
   });
 });
 
+describe('SubscriptionManager origin check (subscriptions.allowedOrigins)', () => {
+  const upgrade = (headers: Record<string, string>): Request =>
+    new Request('http://api.example.com/graphql', { headers });
+
+  test.each([
+    ['the same origin', { origin: 'http://api.example.com', host: 'api.example.com' }],
+    ['the same origin, case and default port aside', { origin: 'HTTPS://API.Example.com:443', host: 'api.example.COM:443' }],
+    ['the same origin on a non-default port', { origin: 'http://localhost:3000', host: 'localhost:3000' }],
+    ['no Origin header', { host: 'api.example.com' }],
+  ])('should allow %s by default', async (_label, headers) => {
+    const harness = await createManager();
+    expect(harness.manager.isOriginAllowed(upgrade(headers))).toBe(true);
+    await destroyHarness(harness);
+  });
+
+  test.each([
+    ['a cross-site origin', { origin: 'https://evil.test', host: 'api.example.com' }],
+    ['a different port', { origin: 'http://localhost:4000', host: 'localhost:3000' }],
+    ['the opaque origin null', { origin: 'null', host: 'api.example.com' }],
+  ])('should reject %s by default', async (_label, headers) => {
+    const harness = await createManager();
+    expect(harness.manager.isOriginAllowed(upgrade(headers))).toBe(false);
+    await destroyHarness(harness);
+  });
+
+  test('should fall back to the request URL host when Host is absent', async () => {
+    const harness = await createManager();
+    expect(harness.manager.isOriginAllowed(upgrade({ origin: 'http://api.example.com' }))).toBe(true);
+    expect(harness.manager.isOriginAllowed(upgrade({ origin: 'http://evil.test' }))).toBe(false);
+    await destroyHarness(harness);
+  });
+
+  test('should accept a Node-style header map', async () => {
+    const harness = await createManager();
+    expect(
+      harness.manager.isOriginAllowed({ headers: { origin: 'https://evil.test', host: 'api.example.com' } })
+    ).toBe(false);
+    expect(
+      harness.manager.isOriginAllowed({ headers: { origin: 'http://api.example.com', host: 'api.example.com' } })
+    ).toBe(true);
+    await destroyHarness(harness);
+  });
+
+  test('should read capitalised keys in a Node-style header map', async () => {
+    const harness = await createManager();
+    expect(
+      harness.manager.isOriginAllowed({ headers: { Origin: 'https://evil.test', Host: 'api.example.com' } })
+    ).toBe(false);
+    expect(
+      harness.manager.isOriginAllowed({ headers: { Origin: 'http://api.example.com', Host: 'api.example.com' } })
+    ).toBe(true);
+    await destroyHarness(harness);
+  });
+
+  test('should refuse a repeated Origin unless its joined value is listed', async () => {
+    const pair = ['https://a.test', 'https://b.test'];
+    const harness = await createManager({ allowedOrigins: pair });
+    expect(harness.manager.isOriginAllowed({ headers: { origin: pair, host: 'a.test' } })).toBe(false);
+    await destroyHarness(harness);
+
+    const joined = await createManager({ allowedOrigins: [pair.join(',')] });
+    expect(joined.manager.isOriginAllowed({ headers: { origin: pair, host: 'api.example.com' } })).toBe(true);
+    await destroyHarness(joined);
+  });
+
+  test('should allow a listed origin, normalised, alongside the same origin', async () => {
+    const harness = await createManager({ allowedOrigins: ['https://App.Example.com:443', 'null'] });
+    const { manager } = harness;
+    expect(manager.isOriginAllowed(upgrade({ origin: 'https://app.example.com', host: 'api.example.com' }))).toBe(true);
+    expect(manager.isOriginAllowed(upgrade({ origin: 'null', host: 'api.example.com' }))).toBe(true);
+    expect(manager.isOriginAllowed(upgrade({ origin: 'http://api.example.com', host: 'api.example.com' }))).toBe(true);
+    // Scheme matters for a listed origin
+    expect(manager.isOriginAllowed(upgrade({ origin: 'http://app.example.com', host: 'api.example.com' }))).toBe(false);
+    expect(manager.isOriginAllowed(upgrade({ origin: 'https://evil.test', host: 'api.example.com' }))).toBe(false);
+    await destroyHarness(harness);
+  });
+
+  test("should allow every origin with '*'", async () => {
+    const harness = await createManager({ allowedOrigins: '*' });
+    expect(harness.manager.isOriginAllowed(upgrade({ origin: 'https://evil.test', host: 'api.example.com' }))).toBe(true);
+    expect(harness.manager.isOriginAllowed(upgrade({ origin: 'null' }))).toBe(true);
+    await destroyHarness(harness);
+  });
+
+  test('should close a cross-origin DOM socket with 4403 and never register it', async () => {
+    const harness = await createManager();
+    const socket = createMockWebSocket();
+    await harness.manager.handleConnection(
+      socket as unknown as WebSocket,
+      upgrade({ origin: 'https://evil.test', host: 'api.example.com' })
+    );
+
+    expect(socket.closeCode).toBe(4403);
+    expect(socket.closeReason).toBe('Forbidden');
+    expect(harness.manager.getConnectionCount()).toBe(0);
+
+    await destroyHarness(harness);
+  });
+
+  test('should close a cross-origin ServerWebSocket with 4403 and ignore its frames', async () => {
+    const harness = await createManager();
+    const socket = createMockServerWebSocket();
+    harness.manager.handleOpen(
+      asSocket(socket),
+      upgrade({ origin: 'https://evil.test', host: 'api.example.com' })
+    );
+
+    expect(socket.closeCode).toBe(4403);
+    expect(harness.manager.getConnectionCount()).toBe(0);
+    await harness.manager.handleMessage(asSocket(socket), JSON.stringify({ type: 'connection_init' }));
+    expect(sentOfType(socket, 'connection_ack').length).toBe(0);
+
+    await destroyHarness(harness);
+  });
+
+  test.each([
+    ['a same-origin request', {}, { origin: 'http://api.example.com', host: 'api.example.com' }],
+    ['a request with no Origin', {}, { host: 'api.example.com' }],
+    ['a listed origin', { allowedOrigins: ['https://app.example.com'] }, { origin: 'https://app.example.com', host: 'api.example.com' }],
+    ["any origin under '*'", { allowedOrigins: '*' as const }, { origin: 'https://evil.test', host: 'api.example.com' }],
+  ])('should open and acknowledge %s', async (_label, config, headers) => {
+    const harness = await createManager(config);
+    const socket = createMockWebSocket();
+    await harness.manager.handleConnection(socket as unknown as WebSocket, upgrade(headers));
+    socket.simulateMessage(JSON.stringify({ type: 'connection_init' }));
+    await waitFor(() => sentOfType(socket, 'connection_ack').length > 0);
+
+    expect(socket.closeCode).toBeUndefined();
+    expect(harness.manager.getConnectionCount()).toBe(1);
+
+    await destroyHarness(harness);
+  });
+});
+
 describe('SubscriptionManager Bun transport (ServerWebSocket)', () => {
-  test('runs a full graphql-ws lifecycle over the ServerWebSocket entry points', async () => {
+  test('should run a full graphql-ws lifecycle over the ServerWebSocket entry points', async () => {
     const harness = await createManager();
     const socket = createMockServerWebSocket();
 
@@ -1650,7 +2207,7 @@ describe('SubscriptionManager Bun transport (ServerWebSocket)', () => {
     await destroyHarness(harness);
   });
 
-  test('handleClose releases an in-flight stream on a ServerWebSocket', async () => {
+  test('should release an in-flight stream on handleClose for a ServerWebSocket', async () => {
     const probe: StreamProbe = { cleanedUp: false };
     const harness = await createManager(undefined, probe);
     const socket = createMockServerWebSocket();
@@ -1686,7 +2243,7 @@ describe('SubscriptionManager Bun transport (ServerWebSocket)', () => {
     await destroyHarness(harness);
   });
 
-  test('getWebSocketConfig() handlers drive the same protocol end to end', async () => {
+  test('should drive the same protocol end to end through getWebSocketConfig() handlers', async () => {
     const harness = await createManager();
     const websocket = harness.manager.getWebSocketConfig();
     const socket = createMockServerWebSocket();
@@ -1715,7 +2272,7 @@ describe('SubscriptionManager Bun transport (ServerWebSocket)', () => {
     await destroyHarness(harness);
   });
 
-  test('decodes binary frames, which is how Bun delivers a Buffer', async () => {
+  test('should decode binary frames, which is how Bun delivers a Buffer', async () => {
     const harness = await createManager();
     const socket = createMockServerWebSocket();
 
@@ -1731,7 +2288,7 @@ describe('SubscriptionManager Bun transport (ServerWebSocket)', () => {
     await destroyHarness(harness);
   });
 
-  test('ignores frames for a socket that was never opened', async () => {
+  test('should ignore frames for a socket that was never opened', async () => {
     const harness = await createManager();
     const stranger = createMockServerWebSocket();
 
@@ -1749,7 +2306,7 @@ describe('SubscriptionManager Bun transport (ServerWebSocket)', () => {
     await destroyHarness(harness);
   });
 
-  test('getPath() reports where the upgrade route belongs', async () => {
+  test('should report where the upgrade route belongs from getPath()', async () => {
     const fallback = await createManager();
     expect(fallback.manager.getPath()).toBe('/graphql');
     await destroyHarness(fallback);
@@ -1773,7 +2330,7 @@ describe('SubscriptionManager Bun transport (ServerWebSocket)', () => {
 });
 
 describe('SubscriptionManager shutdown (onModuleDestroy)', () => {
-  test('releases in-flight streams even though close events fire asynchronously', async () => {
+  test('should release in-flight streams even though close events fire asynchronously', async () => {
     const probe: StreamProbe = { cleanedUp: false };
     const harness = await createManager({ keepAlive: 5 }, probe);
 
@@ -1814,7 +2371,7 @@ describe('SubscriptionManager shutdown (onModuleDestroy)', () => {
     await harness.driver.onModuleDestroy();
   });
 
-  test('fires onDisconnect for every live connection during shutdown', async () => {
+  test('should fire onDisconnect for every live connection during shutdown', async () => {
     const disconnected: number[] = [];
     const harness = await createManager({
       onDisconnect: () => {
@@ -1834,7 +2391,7 @@ describe('SubscriptionManager shutdown (onModuleDestroy)', () => {
     await harness.driver.onModuleDestroy();
   });
 
-  test('does not hang when a resolver cannot be resumed by cancellation', async () => {
+  test('should not hang when a resolver cannot be resumed by cancellation', async () => {
     // A generator parked on a promise that never settles cannot run its
     // `return()`: the cancellation is queued behind the await. Shutdown must
     // give up on it rather than block the process forever.

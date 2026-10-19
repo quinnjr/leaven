@@ -504,7 +504,7 @@ describe('Guard integration with LeavenDriver', () => {
     });
   }
 
-  test('ComplexityGuard rejects an over-limit query run through the driver', async () => {
+  test('should reject an over-limit query run through the driver with ComplexityGuard', async () => {
     const guard = new ComplexityGuard(1);
     // The module option is what makes the driver measure each request; the
     // guard's own limit is the stricter one under test, so the driver's is
@@ -531,7 +531,7 @@ describe('Guard integration with LeavenDriver', () => {
     await driver.onModuleDestroy();
   });
 
-  test('ComplexityGuard allows a query within the limit populated by the driver', async () => {
+  test('should allow a query within the limit populated by the driver with ComplexityGuard', async () => {
     const guard = new ComplexityGuard(100);
     const driver = new LeavenDriver({
       schema: buildFlatSchema(guard),
@@ -551,7 +551,7 @@ describe('Guard integration with LeavenDriver', () => {
     await driver.onModuleDestroy();
   });
 
-  test('an unlimited ComplexityGuard admits a request the driver never measured', async () => {
+  test('should admit a request the driver never measured with an unlimited ComplexityGuard', async () => {
     // No `maxComplexity` option: the module would inject Infinity and the
     // driver skips analysis, so the guard must not fail closed.
     const guard = new ComplexityGuard(Number.POSITIVE_INFINITY);
@@ -568,7 +568,7 @@ describe('Guard integration with LeavenDriver', () => {
     await driver.onModuleDestroy();
   });
 
-  test('DepthGuard rejects an over-limit query run through the driver', async () => {
+  test('should reject an over-limit query run through the driver with DepthGuard', async () => {
     const guard = new DepthGuard(2);
     // As above: the option enables measurement, the guard enforces the
     // stricter limit under test.
@@ -595,7 +595,7 @@ describe('Guard integration with LeavenDriver', () => {
     await driver.onModuleDestroy();
   });
 
-  test('DepthGuard allows a query within the limit', async () => {
+  test('should allow a query within the limit with DepthGuard', async () => {
     const guard = new DepthGuard(5);
     const driver = new LeavenDriver({
       schema: buildNestedSchema(guard),
