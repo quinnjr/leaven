@@ -47,7 +47,7 @@
   "devDependencies": {
     "@types/bun": "^1.4.3",
     "graphql": "^17.0.2",
-    "typescript": "^6.0.3"
+    "typescript": "^7.0.2"
   },
   "peerDependencies": {
     "graphql": "^16.0.0 || ^17.0.0"
