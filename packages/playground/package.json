@@ -46,7 +46,7 @@
     "directory": "packages/playground"
   },
   "devDependencies": {
-    "@types/bun": "^1.4.3",
+    "@types/bun": "^1.4.4",
     "typescript": "^6.0.3"
   }
 }
