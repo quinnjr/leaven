@@ -51,7 +51,7 @@
     "@leaven-graphql/errors": "workspace:*"
   },
   "devDependencies": {
-    "@types/bun": "^1.4.3",
+    "@types/bun": "^1.4.4",
     "graphql": "^17.0.2",
     "typescript": "^6.0.3"
   },
